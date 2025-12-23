@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+
+# Data / outputs (按需调整)
+*.tif
+*.nc
+*.hdf
+*.npy
+*.npz
+*.csv
+*.xlsx
+output/
+outputs/
+result/
+results/
+cache/

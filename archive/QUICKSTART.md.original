@@ -1,0 +1,262 @@
+# 快速开始指南
+
+本指南帮助您在10分钟内运行第一个分析。
+
+## 第一步：检查数据（2分钟）
+
+```bash
+# 进入项目目录
+cd /mnt/d/claude-project/Wang2025_Replication
+
+# 运行配置检查
+python config.py
+```
+
+**预期输出**:
+```
+========================================
+当前配置信息
+========================================
+
+数据路径:
+  根目录: I:\F\Data4
+  TR数据: I:\F\Data4\Meteorological Data\GLEAM\Daily_0p5deg_TIF\Et
+  物候数据: I:\F\Data4\Phenology_Output_1\SIF_phenology
+  输出目录: I:\F\Data4\Wang2025_Analysis
+
+✓ 配置验证通过
+```
+
+**如果出现错误**，请编辑 `config.py` 修改数据路径。
+
+---
+
+## 第二步：安装依赖（3分钟）
+
+```bash
+# 创建Python环境
+conda create -n wang2025 python=3.9 -y
+conda activate wang2025
+
+# 安装依赖包
+pip install -r requirements.txt
+```
+
+**测试安装**:
+```bash
+python -c "import numpy, rasterio, matplotlib; print('✓ 依赖安装成功')"
+```
+
+---
+
+## 第三步：运行测试（5分钟）
+
+### 方案A: 完整测试（推荐新手）
+
+```bash
+# 仅测试2000-2005年（6年数据）
+# 编辑 config.py，修改:
+YEAR_START = 2000
+YEAR_END = 2005
+
+# 运行数据准备
+python 00_data_preparation.py
+
+# 运行TRc计算（如已有物候数据）
+python 02_TRc_calculation.py
+```
+
+**预期输出**:
+```
+=== 计算TRc: 2000 ===
+处理日期: 2000-04-15 (DOY 106)
+...
+✓ TRc_2000.tif 已保存
+有效像元数: 1234567
+```
+
+### 方案B: 快速验证（推荐有经验用户）
+
+```bash
+# 直接运行主流程（跳过改进方法）
+python 00_master_pipeline.py --only 0 2 3
+
+# 查看日志
+tail -f I:/F/Data4/Wang2025_Analysis/Logs/pipeline_*.log
+```
+
+---
+
+## 第四步：查看结果
+
+### 检查输出文件
+
+```bash
+# Windows
+explorer I:\F\Data4\Wang2025_Analysis
+
+# Linux/WSL
+ls -lh /mnt/i/F/Data4/Wang2025_Analysis/
+```
+
+**应包含**:
+```
+Wang2025_Analysis/
+├── masks/              # 掩膜数据
+├── TRc_annual/         # TRc结果
+└── Logs/               # 运行日志
+```
+
+### 读取结果（Python）
+
+```python
+import rasterio
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 读取TRc
+with rasterio.open("I:/F/Data4/Wang2025_Analysis/TRc_annual/TRc_2000.tif") as src:
+    trc = src.read(1)
+    trc_masked = np.ma.masked_equal(trc, -9999)
+
+# 快速绘图
+plt.figure(figsize=(10, 6))
+plt.imshow(trc_masked, cmap='Blues', vmin=0, vmax=500)
+plt.colorbar(label='TRc (mm)')
+plt.title('Cumulative Transpiration 2000')
+plt.savefig('test_TRc_2000.png', dpi=150)
+print("✓ 图片已保存: test_TRc_2000.png")
+```
+
+---
+
+## 常见问题快速修复
+
+### 问题1: 找不到TR文件
+
+**症状**: `FileNotFoundError: Et_20000101.tif`
+
+**修复**:
+```bash
+# 检查您的文件命名格式
+ls I:/F/Data4/Meteorological\ Data/GLEAM/Daily_0p5deg_TIF/Et/ | head
+
+# 如果是 Et_2000_001.tif 格式，无需修改
+# 如果是其他格式，编辑 config.py 中的 get_TR_file_path() 函数
+```
+
+### 问题2: 内存不足
+
+**症状**: `MemoryError`
+
+**修复**:
+```python
+# 编辑 config.py
+BLOCK_SIZE = 64      # 从128改为64
+MAX_WORKERS = 1      # 从2改为1
+```
+
+### 问题3: SIF数据缺失
+
+**症状**: `找不到SIF文件`
+
+**修复**:
+```python
+# 编辑 config.py，使用现有GPP物候
+PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
+
+# 跳过Module 01（物候提取）
+python 00_master_pipeline.py --skip 1
+```
+
+### 问题4: R包缺失（SEM分析）
+
+**症状**: `Error: package 'lavaan' not found`
+
+**修复**:
+```R
+# 打开R
+R
+
+# 安装包
+install.packages(c("lavaan", "semPlot", "raster", "tidyverse"))
+quit()
+```
+
+---
+
+## 下一步
+
+### 完整运行（~12小时）
+
+```bash
+# 恢复完整年份范围
+# 编辑 config.py
+YEAR_START = 1982
+YEAR_END = 2018
+
+# 运行完整流程
+python 00_master_pipeline.py
+
+# 或者后台运行
+nohup python 00_master_pipeline.py > run.log 2>&1 &
+```
+
+### 自定义分析
+
+```python
+# 修改 config.py 中的参数
+LAT_MIN = 40.0                    # 改为≥40°N
+FOREST_CLASSES = [1, 4]           # 仅针叶林和落叶阔叶林
+MOVING_WINDOW_SIZE = 10           # 10年滑动窗口
+```
+
+### 生成论文图表
+
+```bash
+# 运行完整分析后
+python 07_plotting_functions.py
+
+# 查看图表
+ls -lh I:/F/Data4/Wang2025_Analysis/Figures/
+```
+
+---
+
+## 获取帮助
+
+**查看详细文档**: [README.md](README.md)
+
+**检查日志**:
+```bash
+tail -n 100 I:/F/Data4/Wang2025_Analysis/Logs/pipeline_*.log
+```
+
+**验证环境**:
+```bash
+python 00_master_pipeline.py --help
+```
+
+**调试单个模块**:
+```bash
+# 单独运行有问题的模块
+python 03_decomposition_original.py
+```
+
+---
+
+## 成功标志
+
+✓ 配置验证通过
+✓ 所有依赖包已安装
+✓ TRc文件成功生成
+✓ 分解结果质量检查通过（残差 < 1e-3）
+✓ 趋势图成功绘制
+
+**恭喜！您已经完成了Wang (2025)分析流程的基本运行。**
+
+现在可以：
+1. 查看 [README.md](README.md) 了解详细模块说明
+2. 运行完整年份范围的分析
+3. 尝试改进方法（Module 04）
+4. 生成所有论文图表
