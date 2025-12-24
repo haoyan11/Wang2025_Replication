@@ -7,7 +7,7 @@
 ## 🚀 快速入门
 
 ### 新手必读
-1. **[项目说明](00_README/README.md)** - 项目概述、背景和主要功能
+1. **[项目说明](../README.md)** - 项目概述、背景和主要功能（根目录）
 2. **[快速开始](00_README/START_HERE.md)** - 5分钟快速上手指南
 3. **[依赖安装](00_README/requirements.txt)** - Python环境配置
 
@@ -30,9 +30,11 @@
   - 创建T物候版本
   - 添加Trate分析
   - 16页详细记录
-- **[TRc计算优化说明.md](02_changelogs/TRc计算优化说明.md)** - v1.3.1性能优化（18倍提速）
-- **[dSOS符号修正说明.md](02_changelogs/dSOS符号修正说明.md)** - ΔSOS标准异常定义修正
-- **[土壤水分格式修正说明.md](02_changelogs/土壤水分格式修正说明.md)** - 土壤湿度数据格式兼容性修复
+- **[技术修正记录.md](02_changelogs/技术修正记录.md)** ⭐ **整合文档**
+  - TRc计算v1.3.1性能优化（18倍提速）
+  - ΔSOS标准异常定义修正
+  - 土壤湿度数据格式兼容性修复
+  - 3个技术修正整合到一个文档
 
 ---
 
@@ -46,8 +48,7 @@
 ## 🎯 阶段总结
 
 ### [04_summaries/](04_summaries/)
-- **[完成总结.md](04_summaries/完成总结.md)** - 项目整体完成情况
-- **[整理完成.md](04_summaries/整理完成.md)** - 文档整理历史记录
+- **[完成总结.md](04_summaries/完成总结.md)** - 项目整体完成情况、操作指南
 
 ---
 
@@ -118,14 +119,14 @@ Wang2025_Analysis/
 ## 🎯 推荐阅读顺序
 
 ### 第一次使用
-1. [项目说明](00_README/README.md)
+1. [项目说明](../README.md) - 从根目录README开始
 2. [快速开始](00_README/START_HERE.md)
 3. [数据配置](01_guides/数据配置说明.md)
 4. [今日修改总结](02_changelogs/今日修改总结_20251224.md) - 了解最新功能
 
 ### 了解方法
 1. [CHANGELOG](02_changelogs/CHANGELOG.md) - 完整版本历史
-2. [TRc优化说明](02_changelogs/TRc计算优化说明.md) - 性能优化细节
+2. [技术修正记录](02_changelogs/技术修正记录.md) - 性能优化、符号修正、格式修复
 3. [今日修改总结](02_changelogs/今日修改总结_20251224.md) - Timing/Shape新方法
 
 ### 结果分析
