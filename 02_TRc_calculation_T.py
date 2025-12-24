@@ -18,9 +18,9 @@ warnings.filterwarnings('ignore')
 
 # ==================== 全局配置 ====================
 ROOT = Path(r"I:\F\Data4")
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"  # GPP物候（与config.py一致）
+PHENO_DIR = ROOT / "Phenology_Output_1" / "T_phenology"  # T物候
 TR_DAILY_DIR = ROOT / "Meteorological Data" / "ERA5_Land" / "ET_components" / "ET_transp" / "ET_transp_Daily" / "ET_transp_Daily_2"  # ERA5-Land TR数据
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual"
+OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual_T"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 YEAR_START = 1982
@@ -71,8 +71,8 @@ def calculate_TRc_for_year(year, mask):
     print(f"\n=== 计算TRc: {year} ===")
 
     # 读取物候数据（物候代码输出格式：小写sos_gpp）
-    sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
-    pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"  # 注意是pos_doy
+    sos_file = PHENO_DIR / f"sos_t_{year}.tif"
+    pos_file = PHENO_DIR / f"pos_doy_t_{year}.tif"  # 注意是pos_doy
 
     if not sos_file.exists() or not pos_file.exists():
         print(f"  ✗ 错误：缺少物候数据")
@@ -182,8 +182,8 @@ def calculate_TRc_block_optimized(year, mask):
     print(f"\n=== 计算TRc（块处理-加速版）: {year} ===")
 
     # 读取物候数据（物候代码输出格式）
-    sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
-    pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"
+    sos_file = PHENO_DIR / f"sos_t_{year}.tif"
+    pos_file = PHENO_DIR / f"pos_doy_t_{year}.tif"
 
     if not sos_file.exists() or not pos_file.exists():
         print(f"  ✗ 错误：缺少物候数据")
@@ -435,8 +435,8 @@ def calculate_phenology_climatology(years):
     pos_stack = []
 
     for year in tqdm(years, desc="读取物候数据"):
-        sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
-        pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"
+        sos_file = PHENO_DIR / f"sos_t_{year}.tif"
+        pos_file = PHENO_DIR / f"pos_doy_t_{year}.tif"
 
         if not sos_file.exists() or not pos_file.exists():
             print(f"  ⚠ 跳过 {year}：缺少物候数据")
@@ -507,7 +507,7 @@ def save_climatology_data():
     print("="*70)
 
     # 创建输出目录
-    climatology_dir = ROOT / "Wang2025_Analysis" / "Climatology"
+    climatology_dir = ROOT / "Wang2025_Analysis" / "Climatology_T"
     climatology_dir.mkdir(parents=True, exist_ok=True)
 
     years = list(range(YEAR_START, YEAR_END + 1))

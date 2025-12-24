@@ -4,20 +4,17 @@
 > 基于 Wang et al. (2025) 论文方法
 > **已更新**: 适配ERA5-Land TR数据、GPP物候、SMrz深层土壤水分
 
-📚 **完整文档**: [docs/INDEX.md](docs/INDEX.md) | **最新修改**: [今日修改总结 2024-12-24](docs/02_changelogs/今日修改总结_20251224.md)
-
 ---
 
 ## 📍 快速导航
 
 | 我想... | 查看文档 | 运行命令 |
 |--------|---------|---------|
-| 🚀 **立即开始** | [START_HERE.md](docs/00_README/START_HERE.md) | `python verify_data.py` |
-| ✅ **运行前检查** | [CHECKLIST.md](docs/01_guides/CHECKLIST.md) | - |
-| 📖 **详细操作指南** | [完成总结.md](docs/04_summaries/完成总结.md) | - |
-| 🔧 **修改配置** | [数据配置说明.md](docs/01_guides/数据配置说明.md) | 编辑 `config.py` |
-| 📝 **查看修改记录** | [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md) | - |
-| 📚 **完整文档索引** | [docs/INDEX.md](docs/INDEX.md) | - |
+| 🚀 **立即开始** | [START_HERE.md](START_HERE.md) | `python verify_data.py` |
+| ✅ **运行前检查** | [CHECKLIST.md](CHECKLIST.md) | - |
+| 📖 **详细操作指南** | [完成总结.md](完成总结.md) | - |
+| 🔧 **修改配置** | [数据配置说明.md](数据配置说明.md) | 编辑 `config.py` |
+| 📝 **查看修改记录** | [CHANGELOG.md](CHANGELOG.md) | - |
 
 ---
 
@@ -34,7 +31,7 @@ python 00_data_preparation.py
 python 00_master_pipeline.py
 ```
 
-**详细步骤**: 请查看 [CHECKLIST.md](docs/01_guides/CHECKLIST.md)
+**详细步骤**: 请查看 [CHECKLIST.md](CHECKLIST.md)
 
 ---
 
@@ -87,11 +84,11 @@ TR数据: ERA5-Land格式 (I:\F\Data4\Meteorological Data\ERA5_Land\...)
 - **[00_master_pipeline.py](00_master_pipeline.py)** - 一键运行所有模块
 
 ### 📄 文档（已整理）
-- **[START_HERE.md](docs/00_README/START_HERE.md)** - 导航页（从这里开始）
-- **[CHECKLIST.md](docs/01_guides/CHECKLIST.md)** - 快速检查清单
-- **[完成总结.md](docs/04_summaries/完成总结.md)** - 详细操作指南
-- **[数据配置说明.md](docs/01_guides/数据配置说明.md)** - 配置详解
-- **[CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)** - 修改记录
+- **[START_HERE.md](START_HERE.md)** - 导航页（从这里开始）
+- **[CHECKLIST.md](CHECKLIST.md)** - 快速检查清单
+- **[完成总结.md](完成总结.md)** - 详细操作指南
+- **[数据配置说明.md](数据配置说明.md)** - 配置详解
+- **[CHANGELOG.md](CHANGELOG.md)** - 修改记录
 - **[README.md](README.md)** - 本文档
 
 ---
@@ -147,7 +144,7 @@ USE_FOREST_MASK = False  # 全局分析（当前）
 # USE_FOREST_MASK = True  # 仅森林
 ```
 
-详细说明请查看 [数据配置说明.md](docs/01_guides/数据配置说明.md)
+详细说明请查看 [数据配置说明.md](数据配置说明.md)
 
 ---
 
@@ -189,7 +186,7 @@ high_quality_mask = (quality_flags == 7)  # 7项检查都通过
 | UnicodeEncodeError | Windows控制台编码问题，不影响功能，可忽略 |
 | 验证脚本报错 | 查看详细输出，检查缺失的文件和目录 |
 
-详细排错请查看 [完成总结.md](docs/04_summaries/完成总结.md) 的"故障排除"章节
+详细排错请查看 [完成总结.md](完成总结.md) 的"故障排除"章节
 
 ---
 
@@ -211,7 +208,7 @@ install.packages(c("lavaan", "semPlot", "raster", "tidyverse"))
 
 ## 🔄 更新记录
 
-查看详细修改记录: [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)
+查看详细修改记录: [CHANGELOG.md](CHANGELOG.md)
 
 **最新更新** (2025-12-23):
 - ✅ 适配ERA5-Land TR数据格式
@@ -225,10 +222,10 @@ install.packages(c("lavaan", "semPlot", "raster", "tidyverse"))
 
 ## 📞 获取帮助
 
-1. **运行前**: 查看 [CHECKLIST.md](docs/01_guides/CHECKLIST.md)
-2. **修改配置**: 查看 [数据配置说明.md](docs/01_guides/数据配置说明.md)
-3. **遇到错误**: 查看 [完成总结.md](docs/04_summaries/完成总结.md) 的故障排除章节
-4. **了解修改**: 查看 [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)
+1. **运行前**: 查看 [CHECKLIST.md](CHECKLIST.md)
+2. **修改配置**: 查看 [数据配置说明.md](数据配置说明.md)
+3. **遇到错误**: 查看 [完成总结.md](完成总结.md) 的故障排除章节
+4. **了解修改**: 查看 [CHANGELOG.md](CHANGELOG.md)
 
 ---
 

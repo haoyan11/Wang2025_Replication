@@ -51,13 +51,13 @@ except ImportError:
 # ==================== 全局配置 ====================
 ROOT = Path(r"I:\F\Data4")
 ANALYSIS_DIR = ROOT / "Wang2025_Analysis"
-DECOMP_DIR = ANALYSIS_DIR / "Decomposition"
-TRC_DIR = ANALYSIS_DIR / "TRc_annual"
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
-GPP_DAILY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_daily_interpolated"
+DECOMP_DIR = ANALYSIS_DIR / "Decomposition_T"
+TRC_DIR = ANALYSIS_DIR / "TRc_annual_T"
+PHENO_DIR = ROOT / "Phenology_Output_1" / "T_phenology"
+GPP_DAILY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_daily_interpolated"  # 保持不变，用于SIF代理
 GPP_DAILY_FORMAT = "GPP_{date}.tif"  # {date} = YYYYMMDD
 METEO_DIR = ROOT / "Meteorological Data"
-OUTPUT_DIR = ANALYSIS_DIR / "Statistical_Analysis"
+OUTPUT_DIR = ANALYSIS_DIR / "Statistical_Analysis_T"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 YEAR_START = 1982
@@ -710,8 +710,8 @@ def section_3_2_phenology_impact(mask):
     pos_stack = []
 
     for year in tqdm(years, desc="读取SOS/POS"):
-        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
+        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_t_{year}.tif")
+        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_t_{year}.tif")
         sos_valid = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
         pos_valid = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
         sos_stack.append(sos_valid)
@@ -881,8 +881,8 @@ def section_3_3_driver_analysis(mask):
 
     for year in tqdm(years, desc="预计算自变量"):
         # 读取SOS和POS
-        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
+        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_t_{year}.tif")
+        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_t_{year}.tif")
 
         sos_map = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
         pos_map = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
@@ -1168,7 +1168,10 @@ def main():
     print("  │   ├── TRpheno_vs_deltaSOS_R2.tif")
     print("  │   ├── TRproduct_vs_deltaSOS_slope.tif")
     print("  │   ├── TRproduct_vs_deltaSOS_pvalue.tif")
-    print("  │   └── TRproduct_vs_deltaSOS_R2.tif")
+    print("  │   ├── TRproduct_vs_deltaSOS_R2.tif")
+    print("  │   ├── Trate_vs_deltaSOS_slope.tif")
+    print("  │   ├── Trate_vs_deltaSOS_pvalue.tif")
+    print("  │   └── Trate_vs_deltaSOS_R2.tif")
     print("  ├── Section_3.3_Drivers/")
     print("  │   ├── Full_Period/")
     print("  │   │   ├── TRc/")

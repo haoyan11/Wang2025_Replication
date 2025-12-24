@@ -31,10 +31,10 @@ from tqdm import tqdm
 
 # ==================== 全局配置 ====================
 ROOT = Path(r"I:\F\Data4")
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"  # GPP物候（物候代码输出）
-TRC_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual"
-CLIMATOLOGY_DIR = ROOT / "Wang2025_Analysis" / "Climatology"  # 气候态数据
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "Decomposition"
+PHENO_DIR = ROOT / "Phenology_Output_1" / "T_phenology"  # T物候
+TRC_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual_T"
+CLIMATOLOGY_DIR = ROOT / "Wang2025_Analysis" / "Climatology_T"  # 气候态数据（T物候版）
+OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "Decomposition_T"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 YEAR_START = 1982
@@ -258,7 +258,7 @@ def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_val
     """
     # 读取当年数据（使用更新后的read_geotiff，返回3个值）
     TRc_y, _, nodata_trc = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
-    sos_y, _, nodata_sos_y = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
+    sos_y, _, nodata_sos_y = read_geotiff(PHENO_DIR / f"sos_t_{year}.tif")
 
     height, width = TRc_y.shape
 
@@ -295,8 +295,7 @@ def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_val
     )
 
     start_raw = np.where(sos_y_raw < sos_av_raw, sos_y_raw, sos_av_raw)
-    # 端点包含（与论文“Σ[SOS_y 到 SOSav] / Σ[SOSav 到 SOS_y]”一致）
-    end_raw = np.where(sos_y_raw < sos_av_raw, sos_av_raw, sos_y_raw)
+    end_raw = np.where(sos_y_raw < sos_av_raw, sos_av_raw - 1, sos_y_raw - 1)
 
     valid_range = (
         (start_raw >= 1) & (end_raw >= start_raw) &
