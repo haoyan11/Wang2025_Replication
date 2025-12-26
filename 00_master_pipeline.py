@@ -50,33 +50,39 @@ MODULES = [
         'description': '计算SOS-POS窗口内累积蒸腾'
     },
     {
-        'name': 'Module 03: 原版分解',
-        'script': '03_decomposition_original.py',
+        'name': 'Module 03a: Wang 2025分解（GPP物候）',
+        'script': '03a_decomposition_wang2025.py',
         'required': True,
-        'description': 'TRpheno + TRproduct 分解（原文方法）'
+        'description': 'TRpheno + TRproduct 分解（Wang 2025原始方法）'
     },
     {
-        'name': 'Module 04: 改进分解',
-        'script': '04_decomposition_improved.py',
+        'name': 'Module 03b: Timing/Shape分解（可选）',
+        'script': '03b_decomposition_timing_shape.py',
         'required': False,
-        'description': '端点法、速率法、SIF窗口替代'
+        'description': 'TRtiming + TRshape 分解（新方法）'
     },
     {
-        'name': 'Module 05: 统计分析',
-        'script': '05_statistical_analysis.py',
+        'name': 'Module 04a: 统计分析（Wang 2025方法）',
+        'script': '04a_statistical_wang2025.py',
         'required': True,
-        'description': 'Sen趋势、归因分析、滑动窗口'
+        'description': 'ΔSOS回归分析（对应03a分解）'
     },
     {
-        'name': 'Module 06: SEM分析',
-        'script': '06_SEM_analysis.R',
-        'required': True,
+        'name': 'Module 04b: 统计分析（Timing/Shape）',
+        'script': '04b_statistical_timing_shape.py',
+        'required': False,
+        'description': 'Timing/Shape回归分析（对应03b分解）'
+    },
+    {
+        'name': 'Module 05: SEM分析',
+        'script': '05_SEM_analysis.R',
+        'required': False,
         'description': '结构方程模型（需要R环境）',
         'interpreter': 'Rscript'
     },
     {
-        'name': 'Module 07: 绘图',
-        'script': '07_plotting_functions.py',
+        'name': 'Module 06: 绘图',
+        'script': '06_plotting.py',
         'required': True,
         'description': '生成所有图表'
     }

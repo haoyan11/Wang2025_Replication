@@ -15,7 +15,7 @@ warnings.filterwarnings('ignore')
 
 # 导入配置
 try:
-    from config import ROOT, LANDCOVER_FILE, NODATA_OUT
+    from _config import ROOT, LANDCOVER_FILE, NODATA_OUT
 except ImportError:
     ROOT = Path(r"I:\F\Data4")
     LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"

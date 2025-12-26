@@ -7,9 +7,9 @@
 ## 🚀 快速入门
 
 ### 新手必读
-1. **[项目说明](../README.md)** - 项目概述、背景和主要功能（根目录）
-2. **[快速开始](00_README/START_HERE.md)** - 5分钟快速上手指南
-3. **[依赖安装](00_README/requirements.txt)** - Python环境配置
+1. **[README.md](../README.md)** - 项目概述、快速开始、完整指南 ⭐ 从这里开始
+2. **[CHECKLIST.md](01_guides/CHECKLIST.md)** - 快速检查清单（5分钟了解流程）
+3. **[requirements.txt](../requirements.txt)** - Python环境依赖
 
 ---
 
@@ -21,20 +21,18 @@
 
 ---
 
-## 📝 变更记录
+## 📝 修改总结
+
+### ⭐⭐ 推荐阅读
+- **[项目修改总结汇编.md](项目修改总结汇编.md)** - **所有修改的完整汇总（25页）**
+  - 项目完成总结
+  - 今日修改总结 (2024-12-24)
+  - 技术修正记录（3个重要修正）
+  - 闰年DOY处理修复
+  - TRpheno符号关系说明
 
 ### [02_changelogs/](02_changelogs/)
 - **[CHANGELOG.md](02_changelogs/CHANGELOG.md)** - 完整版本历史（v1.0.0 → v2.0.0）
-- **[今日修改总结_20251224.md](02_changelogs/今日修改总结_20251224.md)** ⭐ **最新**
-  - 新增Timing/Shape分解方法
-  - 创建T物候版本
-  - 添加Trate分析
-  - 16页详细记录
-- **[技术修正记录.md](02_changelogs/技术修正记录.md)** ⭐ **整合文档**
-  - TRc计算v1.3.1性能优化（18倍提速）
-  - ΔSOS标准异常定义修正
-  - 土壤湿度数据格式兼容性修复
-  - 3个技术修正整合到一个文档
 
 ---
 
@@ -42,13 +40,6 @@
 
 ### [03_analysis/](03_analysis/)
 - **[检查统计结果差异.md](03_analysis/检查统计结果差异.md)** - 回归结果与Wang 2025论文对比诊断
-
----
-
-## 🎯 阶段总结
-
-### [04_summaries/](04_summaries/)
-- **[完成总结.md](04_summaries/完成总结.md)** - 项目整体完成情况、操作指南
 
 ---
 
@@ -66,34 +57,33 @@
 | `02_TRc_calculation.py` | GPP物候 | TRc_annual/, Climatology/ |
 | `02_TRc_calculation_T.py` ⭐ | T物候 | TRc_annual_T/, Climatology_T/ |
 
-### TRc分解方法（三种）
+### TRc分解方法（按方法分组）
 | 脚本 | 方法 | 物候源 | 输出组分 |
 |------|------|--------|---------|
-| `03_decomposition_original.py` | Wang 2025原始 | GPP | TRpheno, TRproduct |
-| `03_decomposition_original_T.py` ⭐ | Wang 2025原始 | T | TRpheno, TRproduct |
-| `03_decomposition_timing_shape.py` ⭐⭐ | Timing/Shape新方法 | GPP | TRtiming, TRshape, TRsos, TRpos |
-| `04_decomposition_improved.py` | 改进方法 | GPP | （开发中） |
+| `03a_decomposition_wang2025.py` | 方法A: Wang 2025原始 | GPP | TRpheno, TRproduct |
+| `03a_decomposition_wang2025_T.py` ⭐ | 方法A: Wang 2025原始 | T | TRpheno, TRproduct |
+| `03b_decomposition_timing_shape.py` ⭐⭐ | 方法B: Timing/Shape新方法 | GPP | TRtiming, TRshape, TRsos, TRpos |
 
-### 统计分析（ΔSOS回归）
-| 脚本 | 分解方法 | 物候源 | 响应变量 |
+### 统计分析（对应各分解方法）
+| 脚本 | 对应方法 | 物候源 | 响应变量 |
 |------|---------|--------|---------|
-| `05_statistical_analysis.py` | 原始分解 | GPP | TRc, TRpheno, TRproduct, Trate |
-| `05_statistical_analysis_T.py` | 原始分解 | T | TRc, TRpheno, TRproduct, Trate |
-| `05_statistical_analysis_timing_shape.py` ⭐⭐ | Timing/Shape | GPP | TRtiming, TRshape, TRsos, TRpos, Trate |
+| `04a_statistical_wang2025.py` | 方法A: Wang 2025 | GPP | TRc, TRpheno, TRproduct, Trate |
+| `04a_statistical_wang2025_T.py` ⭐ | 方法A: Wang 2025 | T | TRc, TRpheno, TRproduct, Trate |
+| `04b_statistical_timing_shape.py` ⭐⭐ | 方法B: Timing/Shape | GPP | TRtiming, TRshape, TRsos, TRpos, Trate |
 
 ### 高级分析
 | 脚本 | 功能 | 语言 |
 |------|------|------|
-| `06_SEM_analysis.R` | 结构方程模型 | R |
-| `07_plotting_functions.py` | 可视化绘图 | Python |
+| `05_SEM_analysis.R` | 结构方程模型（SEM） | R |
+| `06_plotting.py` | 可视化绘图 | Python |
 
 ### 工具脚本
 | 脚本 | 功能 |
 |------|------|
-| `config.py` | 全局路径配置 |
-| `verify_data.py` | 数据完整性验证 |
-| `utils_climatology.py` | 气候态计算工具 |
-| `utils_vegetation_stratification.py` | 植被分层工具 |
+| `_config.py` | 全局路径配置 |
+| `_verify_data.py` | 数据完整性验证 |
+| `_utils_climatology.py` | 气候态计算工具 |
+| `_utils_vegetation_stratification.py` | 植被分层工具 |
 
 ---
 
@@ -119,19 +109,20 @@ Wang2025_Analysis/
 ## 🎯 推荐阅读顺序
 
 ### 第一次使用
-1. [项目说明](../README.md) - 从根目录README开始
-2. [快速开始](00_README/START_HERE.md)
-3. [数据配置](01_guides/数据配置说明.md)
-4. [今日修改总结](02_changelogs/今日修改总结_20251224.md) - 了解最新功能
+1. **[README.md](../README.md)** - 项目主页，从这里开始 ⭐
+2. **[CHECKLIST.md](01_guides/CHECKLIST.md)** - 5分钟快速检查清单
+3. **[数据配置说明.md](01_guides/数据配置说明.md)** - 数据准备和路径配置
 
-### 了解方法
-1. [CHANGELOG](02_changelogs/CHANGELOG.md) - 完整版本历史
-2. [技术修正记录](02_changelogs/技术修正记录.md) - 性能优化、符号修正、格式修复
-3. [今日修改总结](02_changelogs/今日修改总结_20251224.md) - Timing/Shape新方法
+### 了解所有修改 ⭐⭐
+1. **[项目修改总结汇编](项目修改总结汇编.md)** - 一站式查看所有修改（推荐）
+   - 包含完成总结、今日修改、技术修正、闰年处理、TRpheno符号说明
+   - 25页完整汇总
 
-### 结果分析
-1. [检查统计结果差异](03_analysis/检查统计结果差异.md) - 诊断结果差异
-2. [完成总结](04_summaries/完成总结.md) - 整体完成情况
+### 查看详细历史
+1. [CHANGELOG](02_changelogs/CHANGELOG.md) - 按版本组织的完整变更历史
+
+### 结果诊断
+1. [检查统计结果差异](03_analysis/检查统计结果差异.md) - 与Wang 2025论文对比
 
 ---
 
@@ -145,4 +136,5 @@ Wang2025_Analysis/
 ---
 
 **文档生成**: 2025-12-24
-**项目版本**: v2.0.0
+**最后整理**: 2025-12-24 15:30
+**项目版本**: v2.1.0 (文档整合版)

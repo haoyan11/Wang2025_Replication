@@ -8,7 +8,7 @@
 import sys
 from pathlib import Path
 from datetime import datetime
-from config import (
+from _config import (
     ROOT, TR_DAILY_DIR, PHENO_DIR, GPP_DAILY_DIR, SM_DAILY_DIR,
     LANDCOVER_FILE, YEAR_START, YEAR_END, USE_FOREST_MASK, get_TR_file_path
 )

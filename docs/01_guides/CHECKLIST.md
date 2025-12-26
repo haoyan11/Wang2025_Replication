@@ -3,12 +3,12 @@
 ## 📋 快速检查清单
 
 ### 准备阶段
-- [ ] 已阅读 [完成总结.md](完成总结.md)
+- [ ] 已阅读 [README.md](../../README.md) 项目说明
 - [ ] 已安装Python依赖: `pip install -r requirements.txt`
-- [ ] 确认 `config.py` 配置正确（特别是 `USE_FOREST_MASK = False`）
+- [ ] 确认 `_config.py` 配置正确（特别是 `USE_FOREST_MASK = False`）
 
 ### 数据验证（必须）
-- [ ] 运行 `python verify_data.py`
+- [ ] 运行 `python _verify_data.py`
 - [ ] 所有检查项通过（10/10）
 - [ ] 特别确认：
   - [ ] 物候数据: 37/37年份完整
@@ -42,7 +42,7 @@
   - [ ] `Figures/` 包含生成的图表
 
 ### 植被分层（可选）
-- [ ] 运行 `python utils_vegetation_stratification.py`
+- [ ] 运行 `python _utils_vegetation_stratification.py`
 - [ ] 检查输出:
   - [ ] `Vegetation_Stratification/TRc_av_by_vegetation.csv`
   - [ ] `Vegetation_Stratification/vegetation_masks/` 包含各植被类型掩膜
@@ -55,7 +55,7 @@
 |------|---------|
 | "找不到物候数据" | 检查 `I:\F\Data4\Phenology_Output_1\GPP_phenology` 是否存在，文件名是否为小写 `sos_gpp_*.tif` |
 | "找不到TR数据" | 检查 TR目录路径，文件名格式是否为 `ERA5L_ET_transp_Daily_mm_YYYYMMDD.tif` |
-| "内存不足" | 编辑 `config.py`: `BLOCK_SIZE=64`, `MAX_WORKERS=1` |
+| "内存不足" | 编辑 `_config.py`: `BLOCK_SIZE=64`, `MAX_WORKERS=1` |
 | UnicodeEncodeError | 不影响功能，可忽略 |
 | 验证脚本报错 | 查看详细输出，检查缺失的文件和目录 |
 
@@ -64,8 +64,9 @@
 ## 📞 获取帮助
 
 - 详细配置: [数据配置说明.md](数据配置说明.md)
-- 工作流程: [WORKFLOW_NO_FOREST_MASK.md](WORKFLOW_NO_FOREST_MASK.md)
-- 修改总结: [完成总结.md](完成总结.md)
+- 所有修改: [项目修改总结汇编.md](../项目修改总结汇编.md) ⭐ (25页完整汇总)
+- 版本历史: [CHANGELOG.md](../02_changelogs/CHANGELOG.md)
+- 文档导航: [INDEX.md](../INDEX.md)
 
 ---
 

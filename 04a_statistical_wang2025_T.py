@@ -625,8 +625,12 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
         np.isfinite(sos_map) & np.isfinite(pos_map) &
         (sos_int > 0) & (pos_int > 0) &
         (pos_int >= sos_int) &
-        (sos_int <= 365) & (pos_int <= 365)
+        (sos_int <= 366) & (pos_int <= 366)  # 允许闰年DOY=366
     )
+
+    # Clip到365以匹配365天气候态（闰年2月29日已归并到2月28日）
+    sos_int = np.clip(sos_int, 1, 365)
+    pos_int = np.clip(pos_int, 1, 365)
 
     if not np.any(valid):
         return np.full((height, width), np.nan, dtype=np.float32)

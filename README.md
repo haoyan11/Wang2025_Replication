@@ -4,7 +4,7 @@
 > 基于 Wang et al. (2025) 论文方法
 > **已更新**: 适配ERA5-Land TR数据、GPP物候、SMrz深层土壤水分
 
-📚 **完整文档**: [docs/INDEX.md](docs/INDEX.md) | **最新修改**: [今日修改总结 2024-12-24](docs/02_changelogs/今日修改总结_20251224.md)
+📚 **完整文档**: [docs/INDEX.md](docs/INDEX.md) | **最新修改**: [项目修改总结汇编](docs/项目修改总结汇编.md) ⭐ 25页完整汇总
 
 ---
 
@@ -12,11 +12,11 @@
 
 | 我想... | 查看文档 | 运行命令 |
 |--------|---------|---------|
-| 🚀 **立即开始** | [START_HERE.md](docs/00_README/START_HERE.md) | `python verify_data.py` |
+| 🚀 **立即开始** | [CHECKLIST.md](docs/01_guides/CHECKLIST.md) | `python _verify_data.py` |
 | ✅ **运行前检查** | [CHECKLIST.md](docs/01_guides/CHECKLIST.md) | - |
-| 📖 **详细操作指南** | [完成总结.md](docs/04_summaries/完成总结.md) | - |
-| 🔧 **修改配置** | [数据配置说明.md](docs/01_guides/数据配置说明.md) | 编辑 `config.py` |
-| 📝 **查看修改记录** | [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md) | - |
+| 📖 **查看所有修改** | [项目修改总结汇编](docs/项目修改总结汇编.md) ⭐ | - |
+| 🔧 **修改配置** | [数据配置说明.md](docs/01_guides/数据配置说明.md) | 编辑 `_config.py` |
+| 📝 **查看版本历史** | [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md) | - |
 | 📚 **完整文档索引** | [docs/INDEX.md](docs/INDEX.md) | - |
 
 ---
@@ -25,7 +25,7 @@
 
 ```bash
 # 1. 验证数据（2-5分钟）
-python verify_data.py
+python _verify_data.py
 
 # 2. 准备掩膜（5-10分钟）
 python 00_data_preparation.py
@@ -65,34 +65,38 @@ TR数据: ERA5-Land格式 (I:\F\Data4\Meteorological Data\ERA5_Land\...)
 ## 📂 核心文件说明
 
 ### 🔧 配置文件
-- **[config.py](config.py)** - 所有路径和参数配置（已更新）
+- **[_config.py](_config.py)** - 所有路径和参数配置（已更新）
 
 ### 🐍 代码文件（按运行顺序）
 
 | 模块 | 文件 | 功能 | 运行时间 | 必需？ |
 |------|------|------|---------|-------|
-| 00 | [00_data_preparation.py](00_data_preparation.py) | 创建掩膜、检查数据 | 5-10分钟 | ✅ 必需 |
-| 01 | [01_phenology_extraction.py](01_phenology_extraction.py) | 提取物候 | ~2小时 | ⚠️ 您已有GPP物候，跳过 |
-| 02 | [02_TRc_calculation.py](02_TRc_calculation.py) | 计算累积蒸腾 | 6-8小时 | ✅ 必需 |
-| 03 | [03_decomposition_original.py](03_decomposition_original.py) | 原版分解方法 | ~1小时 | ✅ 必需 |
-| 04 | [04_decomposition_improved.py](04_decomposition_improved.py) | 改进分解方法 | ~2小时 | ⚠️ 可选 |
-| 05 | [05_statistical_analysis.py](05_statistical_analysis.py) | 统计分析 | 2-3小时 | ✅ 必需 |
-| 06 | [06_SEM_analysis.R](06_SEM_analysis.R) | SEM路径分析 | ~10分钟 | ⚠️ 需R环境 |
-| 07 | [07_plotting_functions.py](07_plotting_functions.py) | 绘图 | ~20分钟 | ✅ 必需 |
+| **00** | [00_data_preparation.py](00_data_preparation.py) | 创建掩膜、检查数据 | 5-10分钟 | ✅ 必需 |
+| **01** | [01_phenology_extraction.py](01_phenology_extraction.py) | 提取物候 | ~2小时 | ⚠️ 您已有GPP物候，跳过 |
+| **02** | [02_TRc_calculation.py](02_TRc_calculation.py) | 计算累积蒸腾（GPP物候） | 6-8小时 | ✅ 必需 |
+| | [02_TRc_calculation_T.py](02_TRc_calculation_T.py) | 计算累积蒸腾（T物候） | 6-8小时 | ⭐ 对比分析 |
+| **03a** | [03a_decomposition_wang2025.py](03a_decomposition_wang2025.py) | Wang 2025原始分解（GPP） | ~1小时 | ✅ 必需 |
+| | [03a_decomposition_wang2025_T.py](03a_decomposition_wang2025_T.py) | Wang 2025原始分解（T物候） | ~1小时 | ⭐ 对比分析 |
+| **03b** | [03b_decomposition_timing_shape.py](03b_decomposition_timing_shape.py) | Timing/Shape新方法 | ~1小时 | ⭐⭐ 新方法 |
+| **04a** | [04a_statistical_wang2025.py](04a_statistical_wang2025.py) | ΔSOS回归（对应03a） | 2-3小时 | ✅ 必需 |
+| | [04a_statistical_wang2025_T.py](04a_statistical_wang2025_T.py) | ΔSOS回归（T物候版本） | 2-3小时 | ⭐ 对比分析 |
+| **04b** | [04b_statistical_timing_shape.py](04b_statistical_timing_shape.py) | Timing/Shape统计（对应03b） | 2-3小时 | ⭐⭐ 新方法 |
+| **05** | [05_SEM_analysis.R](05_SEM_analysis.R) | 结构方程模型（SEM） | ~10分钟 | ⚠️ 需R环境 |
+| **06** | [06_plotting.py](06_plotting.py) | 绘图与可视化 | ~20分钟 | ✅ 必需 |
 
 ### 🛠️ 辅助工具
-- **[verify_data.py](verify_data.py)** - 数据验证脚本（运行前必须用）
-- **[utils_vegetation_stratification.py](utils_vegetation_stratification.py)** - 植被分层分析
-- **[utils_climatology.py](utils_climatology.py)** - 气候平均态计算（改进方法需要）
+- **[_verify_data.py](_verify_data.py)** - 数据验证脚本（运行前必须用）
+- **[_utils_vegetation_stratification.py](_utils_vegetation_stratification.py)** - 植被分层分析
+- **[_utils_climatology.py](_utils_climatology.py)** - 气候平均态计算（改进方法需要）
 - **[00_master_pipeline.py](00_master_pipeline.py)** - 一键运行所有模块
 
 ### 📄 文档（已整理）
-- **[START_HERE.md](docs/00_README/START_HERE.md)** - 导航页（从这里开始）
+- **[README.md](README.md)** - 项目主页（从这里开始）
 - **[CHECKLIST.md](docs/01_guides/CHECKLIST.md)** - 快速检查清单
-- **[完成总结.md](docs/04_summaries/完成总结.md)** - 详细操作指南
+- **[项目修改总结汇编.md](docs/项目修改总结汇编.md)** - 所有修改汇总（25页） ⭐
 - **[数据配置说明.md](docs/01_guides/数据配置说明.md)** - 配置详解
-- **[CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)** - 修改记录
-- **[README.md](README.md)** - 本文档
+- **[CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)** - 完整版本历史
+- **[docs/INDEX.md](docs/INDEX.md)** - 文档导航索引
 
 ---
 
@@ -128,21 +132,21 @@ Wang2025_Analysis/
 
 **GPP物候 ⇄ T物候**:
 ```python
-# 编辑 config.py
+# 编辑 _config.py
 PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"  # 当前
 # PHENO_DIR = ROOT / "Phenology_Output_1" / "T_phenology"  # 切换
 ```
 
 **深层土壤水分 ⇄ 表层土壤水分**:
 ```python
-# 编辑 config.py
+# 编辑 _config.py
 SM_DAILY_DIR = GLEAM_ROOT / "SMrz" / "SMrz_Daily"  # 深层（推荐）
 # SM_DAILY_DIR = GLEAM_ROOT / "SMs" / "SMs_Daily"  # 表层（备选）
 ```
 
 **全局分析 ⇄ 仅森林**:
 ```python
-# 编辑 config.py
+# 编辑 _config.py
 USE_FOREST_MASK = False  # 全局分析（当前）
 # USE_FOREST_MASK = True  # 仅森林
 ```
@@ -183,13 +187,13 @@ high_quality_mask = (quality_flags == 7)  # 7项检查都通过
 
 | 问题 | 解决方案 |
 |------|---------|
-| "找不到物候数据" | 检查 `I:\F\Data4\Phenology_Output_1\GPP_phenology` 是否存在，运行 `python verify_data.py` |
+| "找不到物候数据" | 检查 `I:\F\Data4\Phenology_Output_1\GPP_phenology` 是否存在，运行 `python _verify_data.py` |
 | "找不到TR数据" | 确认文件格式为 `ERA5L_ET_transp_Daily_mm_YYYYMMDD.tif` |
-| 内存不足 | 编辑 `config.py`: `BLOCK_SIZE=64`, `MAX_WORKERS=1` |
+| 内存不足 | 编辑 `_config.py`: `BLOCK_SIZE=64`, `MAX_WORKERS=1` |
 | UnicodeEncodeError | Windows控制台编码问题，不影响功能，可忽略 |
 | 验证脚本报错 | 查看详细输出，检查缺失的文件和目录 |
 
-详细排错请查看 [完成总结.md](docs/04_summaries/完成总结.md) 的"故障排除"章节
+详细排错请查看 [项目修改总结汇编.md](docs/项目修改总结汇编.md) 或提交issue
 
 ---
 
@@ -227,8 +231,9 @@ install.packages(c("lavaan", "semPlot", "raster", "tidyverse"))
 
 1. **运行前**: 查看 [CHECKLIST.md](docs/01_guides/CHECKLIST.md)
 2. **修改配置**: 查看 [数据配置说明.md](docs/01_guides/数据配置说明.md)
-3. **遇到错误**: 查看 [完成总结.md](docs/04_summaries/完成总结.md) 的故障排除章节
-4. **了解修改**: 查看 [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)
+3. **了解所有修改**: 查看 [项目修改总结汇编.md](docs/项目修改总结汇编.md) ⭐ (25页完整汇总)
+4. **查看版本历史**: 查看 [CHANGELOG.md](docs/02_changelogs/CHANGELOG.md)
+5. **文档导航**: 查看 [docs/INDEX.md](docs/INDEX.md)
 
 ---
 
@@ -243,4 +248,4 @@ on forest transpiration. [期刊名称], [卷期页码].
 
 ---
 
-**开始分析**: 请先运行 `python verify_data.py` 验证数据 🚀
+**开始分析**: 请先运行 `python _verify_data.py` 验证数据 🚀

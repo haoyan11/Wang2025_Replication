@@ -204,8 +204,8 @@ def calculate_TRc_av_from_climatology(TR_cum, SOSav, POSav, nodata_sos, nodata_p
     valid = (
         _is_valid_value(SOSav, nodata_sos) &
         _is_valid_value(POSav, nodata_pos) &
-        (SOSav > 0) & (SOSav <= 366) &
-        (POSav > 0) & (POSav <= 366) &
+        (SOSav > 0) & (SOSav <= 366) &  # 允许闰年DOY=366
+        (POSav > 0) & (POSav <= 366) &  # 允许闰年DOY=366
         (POSav >= SOSav) &
         mask &
         tr_valid
@@ -218,6 +218,7 @@ def calculate_TRc_av_from_climatology(TR_cum, SOSav, POSav, nodata_sos, nodata_p
 
     sos_av_raw = np.rint(SOSav).astype(np.int32)
     pos_av_raw = np.rint(POSav).astype(np.int32)
+    # Clip到365以匹配365天气候态（闰年2月29日已归并到2月28日）
     sos_av = np.clip(sos_av_raw, 1, 365)
     pos_av = np.clip(pos_av_raw, 1, 365)
 
@@ -268,8 +269,8 @@ def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_val
         (TRc_av != NODATA_OUT) &
         _is_valid_value(sos_y, nodata_sos_y) &
         _is_valid_value(SOSav, nodata_sos) &
-        (sos_y > 0) & (sos_y <= 366) &
-        (SOSav > 0) & (SOSav <= 366) &
+        (sos_y > 0) & (sos_y <= 366) &  # 允许闰年DOY=366
+        (SOSav > 0) & (SOSav <= 366) &  # 允许闰年DOY=366
         mask &
         tr_valid
     )
@@ -300,9 +301,10 @@ def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_val
 
     valid_range = (
         (start_raw >= 1) & (end_raw >= start_raw) &
-        (start_raw <= 366) & (end_raw <= 366)
+        (start_raw <= 366) & (end_raw <= 366)  # 允许闰年DOY=366
     )
 
+    # Clip到365以匹配365天气候态（闰年2月29日已归并到2月28日）
     start = np.clip(start_raw, 1, 365)
     end = np.clip(end_raw, 1, 365)
 
