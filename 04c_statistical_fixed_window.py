@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module 04A: 统计分析 - Wang (2025) Sections 3.2 & 3.3
+Module 04C: 统计分析 - Fixed Window Decomposition (Sections 3.2 & 3.3)
 
-Section 3.2: Increasing TRpheno but decreasing TRproduct with earlier spring phenology
-    - 像元级线性回归: TRc/TRpheno/TRproduct vs dSOS (advance)
+Section 3.2: ΔSOS regression for fixed-window decomposition outputs
+    - 固定窗口速率 vs ΔSOS
+    - Regressions (pixel-wise):
+      - TR_fixed_window ~ ΔSOS  (固定窗口累积差异)
+      - Fixed_Trate ~ ΔSOS      (固定窗口速率差异) [CORE METRIC]
+      - TR_window_change ~ ΔSOS (窗口变化累积)
+      - TR_sos_change ~ ΔSOS    (SOS变化贡献)
+      - TR_pos_change ~ ΔSOS    (POS变化贡献)
 
-Section 3.3: Drivers of TRproduct decrease with spring phenology change
+Section 3.3: Drivers of TR_fixed_window decrease with spring phenology change
     - 偏相关归因分析（控制其他变量）
     - 15年滑动窗口偏相关演变
     - Theil-Sen趋势 + Mann-Kendall检验
 
-Version: 2.0.0
-Author: Wang2025 Replication Project
+核心优势：
+  - Fixed_Trate = TR_fixed_window / Fixed_Window_Length
+  - 在固定窗口[SOSav, POSav]内计算，剥离窗口选择效应
+  - 直接回答："蒸腾速率是否真的变高变低？"
 
 核心方法：
 - ΔSOS = SOS_year - SOSav (标准异常定义，advance < 0)
@@ -48,16 +56,17 @@ except ImportError:
         return decorator
     prange = range
 
-# ==================== 全局配置 ====================
+# ==================== Global config ====================
 ROOT = Path(r"I:\F\Data4")
 ANALYSIS_DIR = ROOT / "Wang2025_Analysis"
-DECOMP_DIR = ANALYSIS_DIR / "Decomposition"
+DECOMP_DIR = ANALYSIS_DIR / "Decomposition_FixedWindow"
 TRC_DIR = ANALYSIS_DIR / "TRc_annual"
 PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
 GPP_DAILY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_daily_interpolated"
 GPP_DAILY_FORMAT = "GPP_{date}.tif"  # {date} = YYYYMMDD
 METEO_DIR = ROOT / "Meteorological Data"
-OUTPUT_DIR = ANALYSIS_DIR / "Statistical_Analysis"
+CLIM_DIR = ANALYSIS_DIR / "Climatology"
+OUTPUT_DIR = ANALYSIS_DIR / "Statistical_Analysis_FixedWindow"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 YEAR_START = 1982
@@ -95,7 +104,7 @@ DAILY_VAR_SPECS = {
     }
 }
 
-# ==================== 辅助函数 ====================
+
 def _is_valid_value(value, nodata):
     """检查值是否有效（非NODATA）"""
     if nodata is None:
@@ -233,34 +242,16 @@ def mann_kendall_test(y):
 
     return z, p_value
 
-def _sum_cum_range(cum_arr, start_doy, end_doy):
-    """
-    使用累积和快速计算区间和（1-based DOY，区间为 [start, end]）
-    start_doy/end_doy 为二维数组
-    """
-    flat = cum_arr.reshape(cum_arr.shape[0], -1)
-    start = start_doy.ravel()
-    end = end_doy.ravel()
-    idx = np.arange(start.size)
-
-    end_vals = flat[end - 1, idx]
-    start_vals = np.where(start > 1, flat[start - 2, idx], 0)
-    return (end_vals - start_vals).reshape(start_doy.shape)
 
 def linear_regression_maps(x_stack, y_stack, min_frac=0.6):
     """
-    向量化线性回归：y ~ x
-
-    Parameters:
-    -----------
-    x_stack, y_stack : ndarray
-        形状 (n_years, H, W)
-    min_frac : float
-        最低有效样本比例
+    Pixel-wise linear regression y ~ x
 
     Returns:
     --------
-    slope_map, pvalue_map, r2_map : ndarray
+    slope_map : 回归斜率
+    pvalue_map : p值
+    r_squared_map : R²
     """
     n_years = x_stack.shape[0]
     valid = np.isfinite(x_stack) & np.isfinite(y_stack)
@@ -271,7 +262,6 @@ def linear_regression_maps(x_stack, y_stack, min_frac=0.6):
 
     mean_x = np.nanmean(x, axis=0)
     mean_y = np.nanmean(y, axis=0)
-
     dx = x - mean_x
     dy = y - mean_y
 
@@ -283,7 +273,6 @@ def linear_regression_maps(x_stack, y_stack, min_frac=0.6):
         slope = cov_xy / var_x
         r = cov_xy / np.sqrt(var_x * var_y)
         r2 = r ** 2
-
         df = n_valid - 2
         t_stat = r * np.sqrt(df / (1 - r2))
         p_val = 2 * (1 - stats.t.cdf(np.abs(t_stat), df=df))
@@ -670,145 +659,11 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
 
     return lsp_avg
 
-# ==================== Section 3.2: ΔSOS回归分析 ====================
-def section_3_2_phenology_impact(mask):
-    """
-    Section 3.2: Increasing TRpheno but decreasing TRproduct with earlier spring phenology
-
-    方法：
-    1. 计算 ΔSOS = SOS_year - SOSav (标准异常定义，advance < 0)
-    2. 像元级线性回归：
-       - TRc ~ ΔSOS
-       - TRpheno ~ ΔSOS
-       - TRproduct ~ ΔSOS
-    3. 输出回归斜率和显著性
-
-    预期结果（论文 Figure 4，advance < 0）：
-    - TRc: -0.76 ± 0.97 mm/day per day of ΔSOS (负值表示SOS提前时TRc增加)
-    - TRpheno: -1.80 ± 0.44 mm/day per day of ΔSOS (负值表示SOS提前时TRpheno增加)
-    - TRproduct: +1.04 ± 0.80 mm/day per day of ΔSOS (正值表示SOS提前时TRproduct减少)
-
-    Parameters:
-    -----------
-    mask : ndarray
-        有效掩膜 (H, W)
-
-    Returns:
-    --------
-    None (结果保存到文件)
-    """
-    print("\n" + "="*70)
-    print("Section 3.2: TRc Components vs ΔSOS 回归分析")
-    print("="*70)
-
-    years = list(range(YEAR_START, YEAR_END + 1))
-    n_years = len(years)
-
-    # 读取模板
-    data_first, profile, _ = read_geotiff(TRC_DIR / f"TRc_{years[0]}.tif")
-    height, width = data_first.shape
-
-    # Step 1: 计算多年平均SOS（SOSav），同步读取POS用于Trate
-    print("\n[Step 1] 计算多年平均 SOS (SOSav)...")
-    sos_stack = []
-    pos_stack = []
-
-    for year in tqdm(years, desc="读取SOS/POS"):
-        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
-        sos_valid = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
-        pos_valid = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
-        sos_stack.append(sos_valid)
-        pos_stack.append(pos_valid)
-
-    sos_stack = np.stack(sos_stack, axis=0)  # (n_years, H, W)
-    sos_av = np.nanmean(sos_stack, axis=0)  # (H, W)
-
-    # Step 2: 计算ΔSOS（标准异常定义，advance < 0）
-    print("\n[Step 2] 计算 ΔSOS = SOS_year - SOSav (标准异常定义)...")
-    delta_sos_stack = sos_stack - sos_av  # (n_years, H, W)
-
-    # Step 2b: 计算GLS（用于Trate）
-    print("\n[Step 2b] 计算 GLS = POS - SOS + 1（用于Trate）...")
-    gls_stack = np.full_like(sos_stack, np.nan, dtype=np.float32)
-    for idx in range(n_years):
-        sos_y = sos_stack[idx]
-        pos_y = pos_stack[idx]
-        sos_int = np.rint(sos_y).astype(np.int32)
-        pos_int = np.rint(pos_y).astype(np.int32)
-        valid = (
-            np.isfinite(sos_y) & np.isfinite(pos_y) &
-            (sos_int > 0) & (pos_int > 0) &
-            (pos_int >= sos_int)
-        )
-        gls = np.full((height, width), np.nan, dtype=np.float32)
-        gls[valid] = (pos_int[valid] - sos_int[valid] + 1).astype(np.float32)
-        gls_stack[idx] = gls
-
-    # Step 3: 读取响应变量（TRc, TRpheno, TRproduct, Trate）
-    print("\n[Step 3] 读取响应变量...")
-    response_vars = ['TRc', 'TRpheno', 'TRproduct', 'Trate']
-    response_data = {}
-
-    for resp_var in ['TRc', 'TRpheno', 'TRproduct']:
-        data_stack = []
-        for year in tqdm(years, desc=f"读取{resp_var}", leave=False):
-            if resp_var == 'TRc':
-                data, _, nodata = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
-            else:
-                data, _, nodata = read_geotiff(DECOMP_DIR / f"{resp_var}_{year}.tif")
-
-            data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan))
-
-        response_data[resp_var] = np.stack(data_stack, axis=0)  # (n_years, H, W)
-
-    # 计算 Trate = TRc / GLS（mm/day）
-    print("\n  计算 Trate = TRc / GLS...")
-    trc_stack = response_data['TRc']
-    trate_stack = np.full_like(trc_stack, np.nan, dtype=np.float32)
-    valid_trate = np.isfinite(trc_stack) & np.isfinite(gls_stack) & (gls_stack > 0)
-    trate_stack[valid_trate] = trc_stack[valid_trate] / gls_stack[valid_trate]
-    response_data['Trate'] = trate_stack
-
-    # Step 4: 像元级线性回归
-    print("\n[Step 4] 像元级线性回归: Response ~ ΔSOS...")
-
-    output_dir = OUTPUT_DIR / "Section_3.2_Phenology_Impact"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for resp_var in response_vars:
-        print(f"\n  分析: {resp_var} ~ ΔSOS")
-
-        slope_map, pvalue_map, r_squared_map = linear_regression_maps(
-            delta_sos_stack, response_data[resp_var], min_frac=0.6
-        )
-
-        if mask is not None:
-            slope_map[~mask] = NODATA_OUT
-            pvalue_map[~mask] = NODATA_OUT
-            r_squared_map[~mask] = NODATA_OUT
-
-        # 保存结果
-        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_slope.tif", slope_map, profile)
-        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_pvalue.tif", pvalue_map, profile)
-        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_R2.tif", r_squared_map, profile)
-
-        # 统计显著像元（p < 0.05）
-        sig_mask = (pvalue_map < 0.05) & (pvalue_map != NODATA_OUT)
-        n_sig = np.sum(sig_mask)
-        mean_slope = np.nanmean(slope_map[sig_mask]) if n_sig > 0 else np.nan
-        std_slope = np.nanstd(slope_map[sig_mask]) if n_sig > 0 else np.nan
-
-        print(f"    显著像元数 (p<0.05): {n_sig}")
-        print(f"    平均斜率: {mean_slope:.3f} ± {std_slope:.3f} mm/day per day ΔSOS")
-
-    print("\n  ✓ Section 3.2 分析完成")
-    print(f"  输出目录: {output_dir}")
 
 # ==================== Section 3.3: 驱动因子分析 ====================
 def section_3_3_driver_analysis(mask):
     """
-    Section 3.3: Drivers of TRproduct decrease with spring phenology change
+    Section 3.3: Drivers of TR_fixed_window decrease with spring phenology change
 
     方法：
     1. 全时段（1982-2018）偏相关分析 + VIF过滤
@@ -831,7 +686,7 @@ def section_3_3_driver_analysis(mask):
     None (结果保存到文件)
     """
     print("\n" + "="*70)
-    print("Section 3.3: TRproduct 驱动因子分析")
+    print("Section 3.3: TR_fixed_window 驱动因子分析")
     print("="*70)
 
     years = list(range(YEAR_START, YEAR_END + 1))
@@ -842,7 +697,7 @@ def section_3_3_driver_analysis(mask):
     height, width = data_first.shape
 
     # 定义变量（Wang 2025 Eq. 3）
-    response_vars = ['TRc', 'TRpheno', 'TRproduct']
+    response_vars = ['TRc', 'TR_fixed_window', 'Fixed_Trate']  # 修改：使用TR_fixed_window和Fixed_Trate
     # 注意：SIFspr/SIFsum 实际使用日尺度 GPP 的季节均值作为代理
     predictor_vars = ['LSP', 'SMroot', 'Ta', 'Rs', 'P', 'SIFspr', 'SIFsum']
     available_vars = []
@@ -919,6 +774,9 @@ def section_3_3_driver_analysis(mask):
     for var in predictor_vars:
         X_all_years[var] = np.stack(X_all_years[var], axis=0)  # (n_years, H, W)
 
+    # 读取Fixed_Window_Length（用于计算Fixed_Trate）
+    fixed_window_length, _, _ = read_geotiff(DECOMP_DIR / "Fixed_Window_Length.tif")
+
     # 对每个响应变量进行归因分析
     for response_var in response_vars:
         print(f"\n  响应变量: {response_var}")
@@ -928,10 +786,18 @@ def section_3_3_driver_analysis(mask):
         for year in years:
             if response_var == 'TRc':
                 data, _, nodata = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
+            elif response_var == 'Fixed_Trate':
+                # 计算Fixed_Trate = TR_fixed_window / Fixed_Window_Length
+                tr_fixed, _, nodata = read_geotiff(DECOMP_DIR / f"TR_fixed_window_{year}.tif")
+                tr_fixed_valid = np.where(_is_valid_value(tr_fixed, nodata), tr_fixed, np.nan)
+                valid_trate = np.isfinite(tr_fixed_valid) & np.isfinite(fixed_window_length) & (fixed_window_length > 0)
+                data = np.full_like(tr_fixed_valid, np.nan, dtype=np.float32)
+                data[valid_trate] = tr_fixed_valid[valid_trate] / fixed_window_length[valid_trate]
             else:
                 data, _, nodata = read_geotiff(DECOMP_DIR / f"{response_var}_{year}.tif")
+                data = np.where(_is_valid_value(data, nodata), data, np.nan)
 
-            Y_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan))
+            Y_stack.append(data if response_var == 'Fixed_Trate' else np.where(_is_valid_value(data, nodata), data, np.nan))
 
         Y_stack = np.stack(Y_stack, axis=0)  # (n_years, H, W)
 
@@ -1008,8 +874,8 @@ def section_3_3_driver_analysis(mask):
         print("  ⚠ 警告：窗口数不足，跳过滑动窗口分析")
         return
 
-    # 对TRproduct进行滑动窗口分析（论文重点关注）
-    response_var = 'TRproduct'
+    # 对TR_fixed_window进行滑动窗口分析（论文重点关注，修改为TR_fixed_window）
+    response_var = 'TR_fixed_window'
     print(f"\n  响应变量: {response_var}")
 
     # 读取响应变量
@@ -1123,35 +989,218 @@ def section_3_3_driver_analysis(mask):
     print("\n  ✓ Section 3.3 分析完成")
     print(f"  输出目录: {OUTPUT_DIR / 'Section_3.3_Drivers'}")
 
-# ==================== 主程序 ====================
+
 def main():
-    print("\n" + "="*70)
-    print("统计分析模块 - Wang (2025) Sections 3.2 & 3.3")
-    print("="*70)
+    print("\n" + "=" * 80)
+    print("Fixed-Window Method: Statistical Analysis (Sections 3.2 & 3.3)")
+    print("=" * 80)
+    print("\n核心指标：")
+    print("  - Fixed_Trate = TR_fixed_window / Fixed_Window_Length")
+    print("  - 在固定窗口[SOSav, POSav]内，剥离窗口选择效应")
+    print("  - 直接评估速率是否真的变高变低\n")
 
-    # 读取掩膜
-    print("\n[0] 读取掩膜...")
+    years = list(range(YEAR_START, YEAR_END + 1))
+    n_years = len(years)
+
+    # Read template (从分解数据读取profile，与04b逻辑一致)
+    data_first, profile, _ = read_geotiff(DECOMP_DIR / f"TR_fixed_window_{years[0]}.tif")
+    height, width = data_first.shape
+
+    # 读取掩膜（与04a/04b一致）
     mask_file = ANALYSIS_DIR / "masks" / "combined_mask.tif"
-
     if not mask_file.exists():
-        print(f"  ⚠ 警告：掩膜文件不存在: {mask_file}")
+        print(f"  [WARNING] 掩膜文件不存在: {mask_file}")
         print("  使用默认掩膜（全部有效）")
-        data_sample, profile_sample, _ = read_geotiff(TRC_DIR / f"TRc_{YEAR_START}.tif")
-        mask = np.ones(data_sample.shape, dtype=bool)
+        mask = np.ones(data_first.shape, dtype=bool)
     else:
-        mask_data, profile, mask_nodata = read_geotiff(mask_file)
+        mask_data, _, mask_nodata = read_geotiff(mask_file)
         mask = _is_valid_value(mask_data, mask_nodata) & (mask_data > 0)
-        print(f"  ✓ 掩膜读取成功，有效像元数: {np.sum(mask)}")
+        print(f"  [OK] 掩膜读取成功，有效像元数: {np.sum(mask)}")
 
-    # Section 3.2: TRc组分 vs dSOS 回归分析
-    try:
-        section_3_2_phenology_impact(mask)
-    except Exception as e:
-        print(f"\n  ✗ Section 3.2 分析失败: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    # Step 1: 计算 ΔSOS（现场计算SOSav以确保与04a一致）
+    print("\n[Step 1] 计算多年平均 SOS (SOSav) 和 ΔSOS...")
+    sos_stack = []
+    for year in tqdm(years, desc="读取SOS"):
+        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
+        sos_valid = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
+        sos_stack.append(sos_valid)
 
-    # Section 3.3: TRproduct驱动因子分析
+    sos_stack = np.stack(sos_stack, axis=0)  # (n_years, H, W)
+    sos_av = np.nanmean(sos_stack, axis=0)   # 现场计算（与04a一致）✅
+    delta_sos_stack = sos_stack - sos_av  # (n_years, H, W)
+
+    # Step 2: 读取固定窗口长度和POS
+    print("\n[Step 2] 读取固定窗口长度和POS...")
+    fixed_window_length, _, _ = read_geotiff(DECOMP_DIR / "Fixed_Window_Length.tif")
+
+    # 读取POS（用于计算变化窗口GLS）
+    pos_stack = []
+    for year in tqdm(years, desc="读取POS", leave=False):
+        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
+        pos_valid = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
+        pos_stack.append(pos_valid)
+    pos_stack = np.stack(pos_stack, axis=0)  # (n_years, H, W)
+
+    # Step 3: 读取分解组分和TRc
+    print("\n[Step 3] 读取固定窗口分解组分和TRc...")
+    decomp_vars = ['TR_fixed_window', 'TR_window_change', 'TR_sos_change', 'TR_pos_change']
+    response_data = {}
+
+    for resp_var in decomp_vars:
+        data_stack = []
+        for year in tqdm(years, desc=f"读取{resp_var}", leave=False):
+            data, _, nodata = read_geotiff(DECOMP_DIR / f"{resp_var}_{year}.tif")
+            data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan))
+        response_data[resp_var] = np.stack(data_stack, axis=0)  # (n_years, H, W)
+
+    # 读取TRc（用于对比和计算Trate）
+    print("\n  读取 TRc...")
+    trc_stack = []
+    for year in tqdm(years, desc="读取TRc", leave=False):
+        data, _, nodata = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
+        trc_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan))
+    trc_stack = np.stack(trc_stack, axis=0)
+    response_data['TRc'] = trc_stack
+
+    # Step 4: 计算速率指标
+    print("\n[Step 4] 计算速率指标...")
+
+    # 4a. 固定窗口速率（核心指标）
+    print("\n  计算 Fixed_Trate = TR_fixed_window / Fixed_Window_Length（固定窗口）...")
+    fixed_trate_stack = np.full_like(response_data['TR_fixed_window'], np.nan, dtype=np.float32)
+
+    for i in range(n_years):
+        valid_trate = (
+            np.isfinite(response_data['TR_fixed_window'][i]) &
+            np.isfinite(fixed_window_length) &
+            (fixed_window_length > 0)
+        )
+        fixed_trate_stack[i, valid_trate] = (
+            response_data['TR_fixed_window'][i, valid_trate] /
+            fixed_window_length[valid_trate]
+        )
+
+    response_data['Fixed_Trate'] = fixed_trate_stack
+
+    # 4b. 变化窗口速率（用于对比）
+    print("\n  计算 Trate = TRc / GLS（变化窗口，用于对比）...")
+    # 计算GLS = POS - SOS + 1
+    gls_stack = np.full_like(sos_stack, np.nan, dtype=np.float32)
+    for i in range(n_years):
+        sos_y = sos_stack[i]
+        pos_y = pos_stack[i]
+        sos_int = np.rint(sos_y).astype(np.int32)
+        pos_int = np.rint(pos_y).astype(np.int32)
+        valid = (
+            np.isfinite(sos_y) & np.isfinite(pos_y) &
+            (sos_int > 0) & (pos_int > 0) &
+            (pos_int >= sos_int)
+        )
+        gls = np.full(sos_y.shape, np.nan, dtype=np.float32)
+        gls[valid] = (pos_int[valid] - sos_int[valid] + 1).astype(np.float32)
+        gls_stack[i] = gls
+
+    trate_stack = np.full_like(trc_stack, np.nan, dtype=np.float32)
+    valid_trate = np.isfinite(trc_stack) & np.isfinite(gls_stack) & (gls_stack > 0)
+    trate_stack[valid_trate] = trc_stack[valid_trate] / gls_stack[valid_trate]
+    response_data['Trate'] = trate_stack
+
+    # Step 5: 像元级线性回归
+    print("\n[Step 5] 像元级线性回归: Response ~ ΔSOS...")
+
+    # 完整的响应变量列表（按重要性排序）
+    all_response_vars = ['TRc', 'TR_fixed_window', 'TR_window_change', 'TR_sos_change', 'TR_pos_change', 'Fixed_Trate', 'Trate']
+
+    for resp_var in all_response_vars:
+        print(f"\n  分析: {resp_var} ~ ΔSOS")
+
+        slope_map, pvalue_map, r_squared_map = linear_regression_maps(
+            delta_sos_stack, response_data[resp_var], min_frac=0.6
+        )
+
+        # 应用掩膜（与04a/04b一致）✅
+        if mask is not None:
+            slope_map[~mask] = NODATA_OUT
+            pvalue_map[~mask] = NODATA_OUT
+            r_squared_map[~mask] = NODATA_OUT
+
+        # 保存结果
+        write_geotiff(OUTPUT_DIR / f"{resp_var}_slope.tif", slope_map, profile)
+        write_geotiff(OUTPUT_DIR / f"{resp_var}_pvalue.tif", pvalue_map, profile)
+        write_geotiff(OUTPUT_DIR / f"{resp_var}_r2.tif", r_squared_map, profile)
+
+        # 统计摘要（仅统计显著像元，与04a/04b一致）✅
+        sig_mask = (pvalue_map < 0.05) & (pvalue_map != NODATA_OUT)
+        sig_pixels = np.sum(sig_mask)
+        mean_slope = np.nanmean(slope_map[sig_mask]) if sig_pixels > 0 else np.nan
+        std_slope = np.nanstd(slope_map[sig_mask]) if sig_pixels > 0 else np.nan
+
+        if sig_pixels > 0:
+
+            print(f"    显著像元数 (p<0.05): {sig_pixels}")
+
+            # 特殊格式化输出
+            if resp_var == 'TRc':
+                print(f"    平均斜率: {mean_slope:.3f} ± {std_slope:.3f} mm per day ΔSOS")
+            elif resp_var == 'Fixed_Trate':
+                print(f"    平均斜率: {mean_slope:.4f} ± {std_slope:.4f} mm/day per day ΔSOS [CORE METRIC]")
+                # 注意：斜率为负意味着SOS提前（ΔSOS=-1）时速率提高（Fixed_Trate增加）
+                slope_effect_on_advance = -mean_slope  # SOS提前1天的效应
+                print(f"    -> 固定窗口内，SOS提前1天时速率变化 {slope_effect_on_advance:+.4f} mm/day")
+                if mean_slope < 0:
+                    print(f"    -> 速率提高（春季提前时，固定窗口内蒸腾速率增加）[与Wang2025预期相反]")
+                elif mean_slope > 0:
+                    print(f"    -> 速率降低（春季提前时，固定窗口内蒸腾速率减少）[Wang2025预期]")
+                else:
+                    print(f"    -> 速率几乎不变")
+            elif resp_var == 'Trate':
+                print(f"    平均斜率: {mean_slope:.4f} ± {std_slope:.4f} mm/day per day ΔSOS")
+                slope_effect_on_advance = -mean_slope
+                print(f"    -> 变化窗口内，SOS提前1天时速率变化 {slope_effect_on_advance:+.4f} mm/day")
+                if abs(mean_slope) < 0.005:
+                    print(f"    -> 速率几乎不变（窗口效应掩盖了真实速率变化）")
+            else:
+                print(f"    平均斜率: {mean_slope:.3f} ± {std_slope:.3f} mm per day ΔSOS")
+
+    # Step 6: 分解平衡性检验
+    print("\n[Step 6] 分解平衡性检验...")
+    print("\n理论上应该满足：")
+    print("  TR_window_change + TR_fixed_window = TRc - TRc_av")
+    print("  TR_sos_change + TR_pos_change ≈ TR_window_change\n")
+
+    # TRc已在Step 3读取
+    trc_stack = response_data['TRc']
+
+    trc_av, _, _ = read_geotiff(DECOMP_DIR / "TRc_av.tif")
+    trc_av_valid = np.where(_is_valid_value(trc_av, NODATA_OUT), trc_av, np.nan)
+
+    # 检验1：总分解平衡
+    trc_diff = trc_stack - trc_av_valid
+    decomp_sum = response_data['TR_window_change'] + response_data['TR_fixed_window']
+    balance_error = trc_diff - decomp_sum
+
+    valid_balance = np.isfinite(balance_error)
+    if np.any(valid_balance):
+        mean_error = np.nanmean(balance_error[valid_balance])
+        mean_trc_diff = np.nanmean(trc_diff[valid_balance])
+        rel_error = (mean_error / mean_trc_diff * 100) if mean_trc_diff != 0 else 0
+        print(f"  总分解平衡误差: {mean_error:.3f} mm ({rel_error:.1f}%)")
+
+    # 检验2：窗口分解平衡
+    window_decomp_sum = response_data['TR_sos_change'] + response_data['TR_pos_change']
+    window_balance_error = response_data['TR_window_change'] - window_decomp_sum
+
+    valid_window = np.isfinite(window_balance_error)
+    if np.any(valid_window):
+        mean_window_error = np.nanmean(window_balance_error[valid_window])
+        mean_window_change = np.nanmean(response_data['TR_window_change'][valid_window])
+        rel_window_error = (mean_window_error / mean_window_change * 100) if mean_window_change != 0 else 0
+        print(f"  窗口分解平衡误差: {mean_window_error:.3f} mm ({rel_window_error:.1f}%)")
+
+    print("\n[DONE] Section 3.2 Fixed-Window regression analysis complete.")
+
+    # Section 3.3: TR_fixed_window驱动因子分析
+    print("\n" + "=" * 80)
     try:
         section_3_3_driver_analysis(mask)
     except Exception as e:
@@ -1159,37 +1208,44 @@ def main():
         import traceback
         traceback.print_exc()
 
-    print("\n" + "="*70)
+    print("\n" + "="*80)
     print("✓ 统计分析模块执行完成！")
     print(f"输出目录: {OUTPUT_DIR}")
     print("\n输出文件结构：")
-    print("  ├── Section_3.2_Phenology_Impact/")
-    print("  │   ├── TRc_vs_deltaSOS_slope.tif")
-    print("  │   ├── TRc_vs_deltaSOS_pvalue.tif")
-    print("  │   ├── TRc_vs_deltaSOS_R2.tif")
-    print("  │   ├── TRpheno_vs_deltaSOS_slope.tif")
-    print("  │   ├── TRpheno_vs_deltaSOS_pvalue.tif")
-    print("  │   ├── TRpheno_vs_deltaSOS_R2.tif")
-    print("  │   ├── TRproduct_vs_deltaSOS_slope.tif")
-    print("  │   ├── TRproduct_vs_deltaSOS_pvalue.tif")
-    print("  │   └── TRproduct_vs_deltaSOS_R2.tif")
+    print("  ├── Section_3.2_Results/ (default)")
+    print("  │   ├── TRc_slope.tif")
+    print("  │   ├── TR_fixed_window_slope.tif")
+    print("  │   ├── TR_window_change_slope.tif")
+    print("  │   ├── TR_sos_change_slope.tif")
+    print("  │   ├── TR_pos_change_slope.tif")
+    print("  │   ├── Fixed_Trate_slope.tif [MOST IMPORTANT]")
+    print("  │   └── Trate_slope.tif")
     print("  ├── Section_3.3_Drivers/")
     print("  │   ├── Full_Period/")
     print("  │   │   ├── TRc/")
-    print("  │   │   ├── TRpheno/")
-    print("  │   │   └── TRproduct/")
+    print("  │   │   ├── TR_fixed_window/")
+    print("  │   │   └── Fixed_Trate/")
     print("  │   │       ├── partial_r_{var}.tif (LSP, SMroot, Ta, Rs, P, SIFspr, SIFsum; SIF=GPP proxy)")
     print("  │   │       ├── partial_p_{var}.tif")
     print("  │   │       ├── vif_retained_{var}.tif")
     print("  │   │       └── R_squared.tif")
     print("  │   ├── Moving_Window/")
-    print("  │   │   └── TRproduct/")
+    print("  │   │   └── TR_fixed_window/")
     print("  │   │       └── partial_r_{var}_{start}-{end}.tif")
     print("  │   └── Sensitivity_Trends/")
-    print("  │       └── TRproduct/")
+    print("  │       └── TR_fixed_window/")
     print("  │           ├── {var}_trend_slope.tif")
     print("  │           └── {var}_trend_pvalue.tif")
-    print("="*70)
+    print("\n核心结果解读：")
+    print("  Section 3.2:")
+    print("    - Fixed_Trate_slope < 0: 春季提前时，固定窗口内速率降低（符合Wang 2025假设）")
+    print("    - Fixed_Trate_slope > 0: 春季提前时，固定窗口内速率提高（与Wang 2025不符）")
+    print("    - Fixed_Trate_slope ≈ 0: 春季提前不改变速率，TRc增加纯粹来自窗口延长")
+    print("  Section 3.3:")
+    print("    - 识别驱动TR_fixed_window变化的主要因子（|R| > 0.1）")
+    print("    - 分析驱动因子的时间演变趋势")
+    print("="*80)
+
 
 if __name__ == "__main__":
     main()

@@ -33,7 +33,7 @@ from tqdm import tqdm
 ROOT = Path(r"I:\F\Data4")
 PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"  # GPP物候（物候代码输出）
 TRC_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual"
-CLIMATOLOGY_DIR = ROOT / "Wang2025_Analysis" / "Climatology"  # 气候态数据
+CLIM_DIR = ROOT / "Wang2025_Analysis" / "Climatology"  # 气候态数据（与03b/03c一致）
 OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "Decomposition"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -76,8 +76,8 @@ def read_geotiff(file_path):
 
 def write_geotiff(file_path, data, profile):
     """写入单波段GeoTIFF"""
-    profile.update(dtype=rasterio.float32, count=1, compress='lzw', nodata=NODATA_OUT)
-    with rasterio.open(file_path, 'w', **profile) as dst:
+    profile.update(dtype=rasterio.float32, count=1, compress="lzw", nodata=NODATA_OUT)
+    with rasterio.open(file_path, "w", **profile) as dst:
         dst.write(data.astype(np.float32), 1)
 
 def _sum_cum_range(cum_arr, start_doy, end_doy):
@@ -95,17 +95,19 @@ def _sum_cum_range(cum_arr, start_doy, end_doy):
     return (end_vals - start_vals).reshape(start_doy.shape)
 
 # ==================== 核心函数 ====================
-def load_climatology_data():
+def load_climatology():
     """
     加载气候态数据（TR日气候态、SOSav、POSav）
 
+    统一函数名（与03b/03c一致）
+
     Returns:
     --------
-    TR_daily_av : ndarray, shape (365, H, W)
+    tr_daily_av : ndarray, shape (365, H, W)
         365天的多年平均日TR
-    SOSav : ndarray, shape (H, W)
+    sos_av : ndarray, shape (H, W)
         多年平均SOS
-    POSav : ndarray, shape (H, W)
+    pos_av : ndarray, shape (H, W)
         多年平均POS
     nodata_sos : float or None
         SOSav的真实nodata值
@@ -117,7 +119,7 @@ def load_climatology_data():
     print("\n=== 加载气候态数据 ===")
 
     # 加载TR日气候态（365波段）
-    tr_clim_file = CLIMATOLOGY_DIR / "TR_daily_climatology.tif"
+    tr_clim_file = CLIM_DIR / "TR_daily_climatology.tif"
     if not tr_clim_file.exists():
         raise FileNotFoundError(
             f"找不到TR日气候态文件: {tr_clim_file}\n"
@@ -126,47 +128,33 @@ def load_climatology_data():
 
     with rasterio.open(tr_clim_file) as src:
         # 读取所有365个波段
-        TR_daily_av = src.read().astype(np.float32)  # shape: (365, H, W)
+        tr_daily_av = src.read().astype(np.float32)  # shape: (365, H, W)
         profile = src.profile.copy()
         nodata_tr = src.nodata
-        if nodata_tr is None:
-            nodata_tr = NODATA_OUT
-        if np.isnan(nodata_tr):
-            TR_daily_av[~np.isfinite(TR_daily_av)] = np.nan
-        else:
-            TR_daily_av[TR_daily_av == nodata_tr] = np.nan
-        TR_daily_av[TR_daily_av < 0] = np.nan
-        print(f"  ✓ TR日气候态: {tr_clim_file.name}, 形状={TR_daily_av.shape}")
 
-    # 加载SOSav
-    sos_av_file = CLIMATOLOGY_DIR / "SOSav.tif"
+    # 统一的nodata处理（与03b/03c一致）
+    if nodata_tr is None or np.isnan(nodata_tr):
+        tr_daily_av[~np.isfinite(tr_daily_av)] = np.nan
+    else:
+        tr_daily_av[tr_daily_av == nodata_tr] = np.nan
+    tr_daily_av[tr_daily_av < 0] = np.nan
+    print(f"  ✓ TR日气候态: {tr_clim_file.name}, 形状={tr_daily_av.shape}")
+
+    # 加载SOSav（使用统一的read_geotiff，与03b/03c一致）
+    sos_av_file = CLIM_DIR / "SOSav.tif"
     if not sos_av_file.exists():
-        raise FileNotFoundError(
-            f"找不到SOSav文件: {sos_av_file}\n"
-            f"请先运行 02_TRc_calculation.py 中的 save_climatology_data() 函数"
-        )
+        raise FileNotFoundError(f"Missing SOSav: {sos_av_file}")
+    sos_av, _, nodata_sos = read_geotiff(sos_av_file)
+    print(f"  ✓ SOSav: {sos_av_file.name}")
 
-    with rasterio.open(sos_av_file) as src:
-        SOSav = src.read(1)
-        nodata_sos = src.nodata
-        valid_count = np.sum(_is_valid_value(SOSav, nodata_sos))
-        print(f"  ✓ SOSav: {sos_av_file.name}, nodata={nodata_sos}, 有效像元={valid_count}")
-
-    # 加载POSav
-    pos_av_file = CLIMATOLOGY_DIR / "POSav.tif"
+    # 加载POSav（使用统一的read_geotiff，与03b/03c一致）
+    pos_av_file = CLIM_DIR / "POSav.tif"
     if not pos_av_file.exists():
-        raise FileNotFoundError(
-            f"找不到POSav文件: {pos_av_file}\n"
-            f"请先运行 02_TRc_calculation.py 中的 save_climatology_data() 函数"
-        )
+        raise FileNotFoundError(f"Missing POSav: {pos_av_file}")
+    pos_av, _, nodata_pos = read_geotiff(pos_av_file)
+    print(f"  ✓ POSav: {pos_av_file.name}")
 
-    with rasterio.open(pos_av_file) as src:
-        POSav = src.read(1)
-        nodata_pos = src.nodata
-        valid_count = np.sum(_is_valid_value(POSav, nodata_pos))
-        print(f"  ✓ POSav: {pos_av_file.name}, nodata={nodata_pos}, 有效像元={valid_count}")
-
-    return TR_daily_av, SOSav, POSav, nodata_sos, nodata_pos, profile
+    return tr_daily_av, sos_av, pos_av, nodata_sos, nodata_pos, profile
 
 def calculate_TRc_av_from_climatology(TR_cum, SOSav, POSav, nodata_sos, nodata_pos, mask, tr_valid):
     """
@@ -332,7 +320,7 @@ def process_all_years():
 
     # Step 2: 加载气候态数据
     print("\n[2/5] 加载气候态数据...")
-    TR_daily_av, SOSav, POSav, nodata_sos, nodata_pos, profile = load_climatology_data()
+    TR_daily_av, SOSav, POSav, nodata_sos, nodata_pos, profile = load_climatology()
 
     tr_valid = np.any(np.isfinite(TR_daily_av), axis=0)
     TR_cum = np.nancumsum(TR_daily_av, axis=0).astype(np.float32)
