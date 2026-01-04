@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module 04C: 统计分析 - Fixed Window Decomposition (Sections 3.2 & 3.3)
+Module 04C-No-Climate: 统计分析 - Fixed Window (无气候因子版本)
+
+[TEST VERSION] 诊断测试：去掉所有气候因子，只保留SOS和SIF
+
+目的：验证气候因子是否稀释了SOS的偏相关系数
+- 原版（含Ta/Rs/P/SMroot）：SOS系数 = +0.062 (10.8%显著)
+- 本版（无气候因子）：预期SOS系数应显著增大
+
+预测变量（3个）：
+  - SOS (物候)
+  - SIFspr, SIFsum (SIF变量)
+  - 去掉：Ta, Rs, P, SMroot (气候因子)
 
 Section 3.2: ΔSOS regression for fixed-window decomposition outputs
-    - 固定窗口速率 vs ΔSOS
-    - Regressions (pixel-wise):
-      - TR_fixed_window ~ ΔSOS  (固定窗口累积差异)
-      - Fixed_Trate ~ ΔSOS      (固定窗口速率差异) [CORE METRIC]
-      - TR_window_change ~ ΔSOS (窗口变化累积)
-      - TR_sos_change ~ ΔSOS    (SOS变化贡献)
-      - TR_pos_change ~ ΔSOS    (POS变化贡献)
+Section 3.3: Drivers of Fixed_Trate (partial correlation analysis)
 
-Section 3.3: Drivers of TR_fixed_window decrease with spring phenology change
-    - 偏相关归因分析（控制其他变量）
-    - 15年滑动窗口偏相关演变
-    - Theil-Sen趋势 + Mann-Kendall检验
-
-核心优势：
-  - Fixed_Trate = TR_fixed_window / Fixed_Window_Length
-  - 在固定窗口[SOSav, POSav]内计算，剥离窗口选择效应
-  - 直接回答："蒸腾速率是否真的变高变低？"
-
-核心方法：
-- ΔSOS = SOS_year - SOSav (标准异常定义，advance < 0)
-- 偏相关（控制其他变量，Z-score，Wang 2025 Eq. 3）
-- VIF > 10 的变量剔除
-- 主驱动因子判定: |R| > 0.1
+预期结果：
+  - 如果SOS系数显著增大（>0.2）→ 气候因子稀释效应被证实
+  - 如果SOS系数仍然很小（<0.1）→ SIF变量也在稀释SOS
 """
 
 import os
@@ -63,7 +56,8 @@ from _config import (
     YEAR_START, YEAR_END, NODATA_OUT
 )
 
-# 确保输出目录存在
+# [NO-CLIMATE VERSION] 修改输出目录（避免与其他版本冲突）
+STATISTICAL_FIXED_DIR = STATISTICAL_FIXED_DIR.parent / "Statistical_Analysis_FixedWindow_NoClimate"
 STATISTICAL_FIXED_DIR.mkdir(parents=True, exist_ok=True)
 
 # 向后兼容：保留旧变量名
@@ -1373,7 +1367,12 @@ def section_3_3_driver_analysis(mask):
     # 统一因变量：移除TR_fixed_window（固定窗口累积差异），仅保留TRc和Fixed_Trate（固定窗口速率异常）
     response_vars = ['TRc', 'Fixed_Trate']
     # 注意：SIFspr/SIFsum 实际使用日尺度 GPP 的季节均值作为代理
-    predictor_vars = ['SOS', 'SMroot', 'Ta', 'Rs', 'P', 'SIFspr', 'SIFsum']
+    # [TEST] 3变量测试：只保留非气象变量
+    predictor_vars = ['SOS', 'SIFspr', 'SIFsum']
+    print(f"\n======== 3 Variables Test Mode ========")
+    print(f"  Removed: Ta, Rs, P, SMroot")
+    print(f"  Kept: {', '.join(predictor_vars)}")
+    print(f"  Purpose: Test if SOS coefficient is diluted by meteorological factors\n")
     available_vars = []
     missing_vars = []
     for var in predictor_vars:
@@ -1793,9 +1792,9 @@ def main():
 
     # 性能优化状态
     if NUMBA_AVAILABLE:
-        print("\n⚡ Numba JIT加速已启用（VIF + 偏相关计算约10-50x加速）")
+        print("\n[Numba] JIT acceleration enabled (VIF + partial correlation ~10-50x speedup)")
     else:
-        print("\n⚠️  Numba未安装，使用NumPy/SciPy版本（较慢）")
+        print("\n[Warning] Numba not installed, using NumPy/SciPy version (slower)")
         print("   建议安装以获得10-50x性能提升: pip install numba")
 
     print("\n核心指标：")
@@ -1968,6 +1967,89 @@ def main():
             print_percentiles=True,
             print_sign_split=True
         )
+
+    # ========== 诊断验证：简单Pearson相关系数 vs 回归系数 ==========
+    print("\n" + "=" * 80)
+    print("[诊断验证] 计算SOS与Fixed_Trate的简单Pearson相关系数")
+    print("=" * 80)
+    print("目的：如果相关系数显著性远低于回归系数显著性(71.7%)，则说明回归计算有问题\n")
+
+    # 计算每个像元的Pearson相关系数
+    y_data = response_data['Fixed_Trate']
+    x_data = delta_sos_stack
+
+    n_years = x_data.shape[0]
+    H, W = x_data.shape[1], x_data.shape[2]
+
+    pearson_r = np.full((H, W), np.nan, dtype=np.float32)
+    pearson_p = np.full((H, W), np.nan, dtype=np.float32)
+
+    # 逐像元计算
+    for i in range(H):
+        for j in range(W):
+            x_pixel = x_data[:, i, j]
+            y_pixel = y_data[:, i, j]
+
+            # 有效数据掩膜
+            valid = np.isfinite(x_pixel) & np.isfinite(y_pixel)
+            n_valid = np.sum(valid)
+
+            if n_valid >= max(3, int(n_years * 0.6)):
+                x_v = x_pixel[valid]
+                y_v = y_pixel[valid]
+
+                # Pearson相关系数
+                mean_x = np.mean(x_v)
+                mean_y = np.mean(y_v)
+                dx = x_v - mean_x
+                dy = y_v - mean_y
+
+                cov_xy = np.mean(dx * dy)
+                var_x = np.mean(dx * dx)
+                var_y = np.mean(dy * dy)
+
+                if var_x > 0 and var_y > 0:
+                    r = cov_xy / np.sqrt(var_x * var_y)
+                    pearson_r[i, j] = r
+
+                    # t检验
+                    df = n_valid - 2
+                    if df > 0 and abs(r) < 0.999999:
+                        t_stat = r * np.sqrt(df / (1 - r**2))
+                        from scipy import stats as sp_stats
+                        p_val = 2 * (1 - sp_stats.t.cdf(np.abs(t_stat), df=df))
+                        pearson_p[i, j] = p_val
+
+    # 统计结果
+    valid_mask_pearson = np.isfinite(pearson_r) & np.isfinite(pearson_p) & mask
+    if np.sum(valid_mask_pearson) > 0:
+        r_valid = pearson_r[valid_mask_pearson]
+        p_valid = pearson_p[valid_mask_pearson]
+
+        sig_mask = p_valid < 0.05
+        n_sig = np.sum(sig_mask)
+        pct_sig = n_sig / len(p_valid) * 100
+
+        print(f"  === Pearson相关系数统计（SOS vs Fixed_Trate）===\n")
+        print(f"    有效像元数: {len(r_valid)}")
+        print(f"    平均相关系数: {np.mean(r_valid):.4f} ± {np.std(r_valid):.4f}")
+        print(f"    中位相关系数: {np.median(r_valid):.4f}")
+        print(f"    显著性像元 (p<0.05): {n_sig} ({pct_sig:.1f}%)")
+
+        if n_sig > 0:
+            r_sig = r_valid[sig_mask]
+            print(f"    显著像元平均r: {np.mean(r_sig):.4f} ± {np.std(r_sig):.4f}")
+
+        print(f"\n  对比：回归系数显著性比例 = 71.7%")
+        print(f"        相关系数显著性比例 = {pct_sig:.1f}%")
+
+        diff = abs(pct_sig - 71.7)
+        if diff < 5:
+            print(f"  [OK] 两者接近（差异{diff:.1f}%），回归计算正确")
+        else:
+            print(f"  [WARNING] 两者差异较大（差异{diff:.1f}%），需要检查计算逻辑")
+
+    print("=" * 80 + "\n")
 
     # Step 6: 分解平衡性检验
     print("\n[Step 6] 分解平衡性检验...")

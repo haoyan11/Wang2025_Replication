@@ -29,7 +29,7 @@ from tqdm import tqdm
 from scipy import stats
 from datetime import datetime, timedelta
 from functools import lru_cache
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -48,25 +48,70 @@ except ImportError:
         return decorator
     prange = range
 
-# ==================== 全局配置 ====================
-ROOT = Path(r"I:\F\Data4")
-ANALYSIS_DIR = ROOT / "Wang2025_Analysis"
-DECOMP_DIR = ANALYSIS_DIR / "Decomposition"
-TRC_DIR = ANALYSIS_DIR / "TRc_annual"
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
-GPP_DAILY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_daily_interpolated"
+# 导入配置
+from _config import (
+    ROOT, OUTPUT_ROOT, PHENO_DIR, TRC_ANNUAL_DIR, DECOMPOSITION_DIR,
+    GPP_DAILY_DIR, STATISTICAL_DIR, YEAR_START, YEAR_END, NODATA_OUT
+)
+
+# 确保输出目录存在
+STATISTICAL_DIR.mkdir(parents=True, exist_ok=True)
+
+# 向后兼容：保留旧变量名
+ANALYSIS_DIR = OUTPUT_ROOT
+DECOMP_DIR = DECOMPOSITION_DIR
+TRC_DIR = TRC_ANNUAL_DIR
+OUTPUT_DIR = STATISTICAL_DIR
+
+# 脚本特定配置
 GPP_DAILY_FORMAT = "GPP_{date}.tif"  # {date} = YYYYMMDD
 METEO_DIR = ROOT / "Meteorological Data"
-OUTPUT_DIR = ANALYSIS_DIR / "Statistical_Analysis"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-YEAR_START = 1982
-YEAR_END = 2018
-NODATA_OUT = -9999.0
 NODATA_ABS_MAX = 1e20
-BLOCK_SIZE_3_3 = 64
-USE_BLOCK_PARALLEL = True
-MAX_WORKERS_3_3 = min(4, os.cpu_count() or 1)
+BLOCK_SIZE_3_3 = 128  # 优化：增大块减少进程创建次数（原64->128）
+
+# ==================== 并行配置（性能优化）====================
+# 性能优化策略（2-3x加速）：
+#   1. BLOCK_SIZE增大（128）减少块数量和进程创建开销
+#   2. MAX_WORKERS提升（8）充分利用多核CPU
+#   3. MAX_IO_WORKERS提升（16）加速文件读取
+#
+# Windows注意事项：
+#   - 如遇内存不足：降低MAX_WORKERS_3_3到4
+#   - 如遇进程启动慢：设USE_BLOCK_PARALLEL = False
+#   - WSL/Linux推荐（fork模式比spawn快）
+# ==================================================================
+USE_BLOCK_PARALLEL = True  # 块级并行（推荐保持开启）
+MAX_WORKERS_3_3 = min(8, os.cpu_count() or 1)  # 优化：从4提升到8
+
+# ==================== 偏相关计算优化配置 ====================
+# 选择偏相关计算模式：
+#   True  - 批量向量化模式（性能优先，10-50x加速，无VIF过滤）
+#   False - 原版VIF过滤模式（统计严谨性优先，逐像元VIF过滤）
+#
+# 建议：
+#   - 对于探索性分析和大规模数据，使用 True（快速）
+#   - 对于最终发表结果，使用 False（统计严谨）
+USE_BATCH_VECTORIZED = True  # 测试批量向量化模式的R²修复
+
+# ==================== I/O优化配置 ====================
+# 1. 多线程并行读取（治本方案）
+#    - I/O密集型任务，线程池能显著加速文件读取
+#    - Windows/Linux均有效，无spawn模式序列化开销
+MAX_IO_WORKERS = min(16, os.cpu_count() or 1)  # 优化：从8提升到16加速文件读取
+
+# 2. 缓存配置（辅助方案）
+#    - LSP/GPP计算需要读取大量小文件（每年数百个日尺度文件）
+#    - 启用缓存可显著加速重复运行（首次运行会慢，后续快）
+#
+# 注意事项：
+#   - 缓存文件存储在 ANALYSIS_DIR / "Cache_Statistical"
+#   - 如果输入数据更新，需手动删除缓存目录
+#   - 缓存文件较大（每个变量/年约几MB），注意磁盘空间
+USE_LSP_CACHE = False   # 启用LSP期间气象变量均值缓存（推荐开启）
+USE_GPP_CACHE = False   # 启用季节GPP均值缓存（推荐开启）
+CACHE_DIR = ANALYSIS_DIR / "Cache_Statistical"
+if USE_LSP_CACHE or USE_GPP_CACHE:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 季节定义
 SPRING_MONTHS = [3, 4, 5]  # 3-5月
@@ -322,6 +367,15 @@ def partial_corr_from_std(y_std, X_std):
     if p == 0:
         return None, None
 
+    # 优先使用Numba加速版本（约5-20x加速）
+    if NUMBA_AVAILABLE:
+        # 检查数据有效性
+        if not np.isfinite(y_std).all() or not np.isfinite(X_std).all():
+            return None, None
+        r, p_vals = partial_corr_from_std_numba(y_std, X_std)
+        return r.astype(np.float32), p_vals.astype(np.float32)
+
+    # 原版NumPy/SciPy实现
     data = np.column_stack([y_std, X_std])
     if not np.isfinite(data).all():
         return None, None
@@ -451,6 +505,21 @@ def _partial_corr_window_block_worker(args):
 
     return r0, r1, c0, c1, partial_r_block
 
+
+def _partial_corr_window_block_worker_batch(args):
+    """
+    批量向量化版本的滑动窗口块处理器
+
+    与 _partial_corr_window_block_worker 接口兼容，使用批量向量化计算
+    """
+    (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows) = args
+
+    # 调用批量向量化函数（只需要partial_r）
+    partial_r_block, _, _, _ = \
+        partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False)
+
+    return r0, r1, c0, c1, partial_r_block
+
 def _trend_block_worker(args):
     """
     处理一个块的趋势分析（Theil-Sen + MK）
@@ -501,6 +570,579 @@ def standardize(data):
     std[std == 0] = 1  # 避免除零
     return (data - mean) / std
 
+
+def filter_statistical_outliers(slope_map, r2_map=None, pvalue_map=None, mask=None,
+                                 slope_threshold=100.0, print_details=True):
+    """
+    过滤统计结果异常值并打印详细信息
+
+    Parameters:
+    -----------
+    slope_map : ndarray (H, W)
+        回归斜率地图
+    r2_map : ndarray (H, W), optional
+        R²地图
+    pvalue_map : ndarray (H, W), optional
+        p值地图
+    mask : ndarray (H, W), optional
+        空间掩膜
+    slope_threshold : float
+        斜率绝对值阈值（默认100）
+    print_details : bool
+        是否打印详细异常值信息（默认True）
+
+    Returns:
+    --------
+    n_filtered : int
+        被过滤的像元数量
+    valid_mask : ndarray (H, W)
+        过滤后的有效像元掩膜
+    outlier_info : dict
+        异常值详细信息字典
+    """
+    # 确定有效像元总数
+    if mask is not None:
+        base_mask = mask
+        n_total = np.sum(mask)
+    else:
+        base_mask = np.ones_like(slope_map, dtype=bool)
+        n_total = slope_map.size
+
+    # 初始化异常值统计
+    outlier_info = {
+        'n_total': n_total,
+        'n_valid': 0,
+        'n_filtered': 0,
+        'pct_filtered': 0.0,
+        'slope_nan_inf': 0,
+        'slope_extreme': 0,
+        'r2_invalid': 0,
+        'pvalue_invalid': 0,
+        'outlier_values': {}
+    }
+
+    # 从base_mask开始，逐步应用过滤条件
+    valid = base_mask.copy()
+
+    # 1. 斜率异常值过滤
+    # 1a. NaN/Inf值
+    slope_finite = np.isfinite(slope_map)
+    slope_nan_inf_mask = base_mask & ~slope_finite
+    outlier_info['slope_nan_inf'] = np.sum(slope_nan_inf_mask)
+
+    # 1b. 极端值
+    slope_extreme_mask = base_mask & slope_finite & (np.abs(slope_map) >= slope_threshold)
+    outlier_info['slope_extreme'] = np.sum(slope_extreme_mask)
+    if outlier_info['slope_extreme'] > 0:
+        extreme_values = slope_map[slope_extreme_mask]
+        outlier_info['outlier_values']['slope_range'] = (
+            f"[{np.min(extreme_values):.2f}, {np.max(extreme_values):.2f}]"
+        )
+
+    # 应用斜率过滤
+    valid &= slope_finite & (np.abs(slope_map) < slope_threshold)
+
+    # 2. R²范围检查（0到1）
+    if r2_map is not None:
+        r2_invalid_mask = base_mask & valid & (
+            ~np.isfinite(r2_map) | (r2_map < 0) | (r2_map > 1)
+        )
+        outlier_info['r2_invalid'] = np.sum(r2_invalid_mask)
+        if outlier_info['r2_invalid'] > 0:
+            invalid_r2 = r2_map[r2_invalid_mask]
+            outlier_info['outlier_values']['r2_range'] = (
+                f"[{np.nanmin(invalid_r2):.3f}, {np.nanmax(invalid_r2):.3f}]"
+            )
+        valid &= np.isfinite(r2_map) & (r2_map >= 0) & (r2_map <= 1)
+
+    # 3. p值范围检查（0到1）
+    if pvalue_map is not None:
+        pvalue_invalid_mask = base_mask & valid & (
+            ~np.isfinite(pvalue_map) | (pvalue_map < 0) | (pvalue_map > 1)
+        )
+        outlier_info['pvalue_invalid'] = np.sum(pvalue_invalid_mask)
+        if outlier_info['pvalue_invalid'] > 0:
+            invalid_p = pvalue_map[pvalue_invalid_mask]
+            outlier_info['outlier_values']['pvalue_range'] = (
+                f"[{np.nanmin(invalid_p):.3e}, {np.nanmax(invalid_p):.3e}]"
+            )
+        valid &= np.isfinite(pvalue_map) & (pvalue_map >= 0) & (pvalue_map <= 1)
+
+    # 统计最终结果
+    outlier_info['n_valid'] = np.sum(valid)
+    outlier_info['n_filtered'] = n_total - outlier_info['n_valid']
+    outlier_info['pct_filtered'] = outlier_info['n_filtered'] / n_total * 100 if n_total > 0 else 0
+
+    # 打印详细信息
+    if print_details and outlier_info['n_filtered'] > 0:
+        print(f"\n    === 异常值过滤详情 ===")
+        print(f"      总像元数: {n_total}")
+        print(f"      有效像元: {outlier_info['n_valid']} ({100-outlier_info['pct_filtered']:.1f}%)")
+        print(f"      过滤像元: {outlier_info['n_filtered']} ({outlier_info['pct_filtered']:.1f}%)")
+        print(f"\n      过滤原因分解:")
+
+        if outlier_info['slope_nan_inf'] > 0:
+            print(f"        斜率NaN/Inf:   {outlier_info['slope_nan_inf']:>6} "
+                  f"({outlier_info['slope_nan_inf']/n_total*100:>5.1f}%)")
+
+        if outlier_info['slope_extreme'] > 0:
+            print(f"        斜率极端值:    {outlier_info['slope_extreme']:>6} "
+                  f"({outlier_info['slope_extreme']/n_total*100:>5.1f}%) "
+                  f"[|slope| > {slope_threshold}]")
+            if 'slope_range' in outlier_info['outlier_values']:
+                print(f"          极端值范围: {outlier_info['outlier_values']['slope_range']}")
+
+        if outlier_info['r2_invalid'] > 0:
+            print(f"        R²异常值:      {outlier_info['r2_invalid']:>6} "
+                  f"({outlier_info['r2_invalid']/n_total*100:>5.1f}%) "
+                  f"[R²<0 或 R²>1 或 NaN]")
+            if 'r2_range' in outlier_info['outlier_values']:
+                print(f"          异常R²范围: {outlier_info['outlier_values']['r2_range']}")
+
+        if outlier_info['pvalue_invalid'] > 0:
+            print(f"        p值异常值:     {outlier_info['pvalue_invalid']:>6} "
+                  f"({outlier_info['pvalue_invalid']/n_total*100:>5.1f}%) "
+                  f"[p<0 或 p>1 或 NaN]")
+            if 'pvalue_range' in outlier_info['outlier_values']:
+                print(f"          异常p值范围: {outlier_info['outlier_values']['pvalue_range']}")
+
+        print()
+
+    elif print_details and outlier_info['n_filtered'] == 0:
+        print(f"    ✓ 无异常值（全部{n_total}个像元均有效）")
+
+    return outlier_info['n_filtered'], valid, outlier_info
+
+
+def print_comprehensive_statistics(data_map, pvalue_map=None, mask=None,
+                                   var_name="", unit="",
+                                   print_percentiles=True, print_sign_split=True):
+    """
+    打印全面统计（全部有效像元 + 显著性像元）
+
+    Parameters:
+    -----------
+    data_map : ndarray (H, W)
+        统计量地图（如slope, R, R²）
+    pvalue_map : ndarray (H, W), optional
+        p值地图（用于显著性筛选），如为None则不区分显著性
+    mask : ndarray (H, W), optional
+        有效像元掩膜
+    var_name : str
+        变量名
+    unit : str
+        单位
+    print_percentiles : bool
+        是否打印百分位数（默认True）
+    print_sign_split : bool
+        是否打印正负值统计（默认True）
+
+    Returns:
+    --------
+    stats_dict : dict
+        包含统计量的字典
+    """
+    # 提取所有有效像元
+    if mask is not None:
+        valid_all = mask & np.isfinite(data_map)
+    else:
+        valid_all = np.isfinite(data_map)
+
+    values_all = data_map[valid_all]
+    n_all = len(values_all)
+
+    if n_all == 0:
+        print(f"\n  === {var_name} 统计 ===")
+        print(f"    ⚠️ 无有效数据")
+        return {}
+
+    # 计算全部有效像元统计量
+    stats_all = {
+        'mean': np.mean(values_all),
+        'std': np.std(values_all),
+        'median': np.median(values_all),
+        'n': n_all
+    }
+
+    if print_percentiles:
+        stats_all.update({
+            'p5': np.percentile(values_all, 5),
+            'p25': np.percentile(values_all, 25),
+            'p75': np.percentile(values_all, 75),
+            'p95': np.percentile(values_all, 95)
+        })
+
+    if print_sign_split:
+        n_pos = np.sum(values_all > 0)
+        n_neg = np.sum(values_all < 0)
+        n_zero = np.sum(values_all == 0)
+        stats_all.update({
+            'n_pos': n_pos,
+            'n_neg': n_neg,
+            'n_zero': n_zero,
+            'pct_pos': n_pos / n_all * 100 if n_all > 0 else 0,
+            'pct_neg': n_neg / n_all * 100 if n_all > 0 else 0
+        })
+
+    # 打印全部有效像元统计
+    print(f"\n  === {var_name} 统计 ===")
+    print(f"\n    全部有效像元（N={n_all}）:")
+    print(f"      平均值: {stats_all['mean']:+.4f} ± {stats_all['std']:.4f} {unit}")
+    print(f"      中位数: {stats_all['median']:+.4f} {unit}")
+
+    if print_percentiles:
+        print(f"      百分位: [P5: {stats_all['p5']:+.4f}, P25: {stats_all['p25']:+.4f}, "
+              f"P75: {stats_all['p75']:+.4f}, P95: {stats_all['p95']:+.4f}] {unit}")
+
+    if print_sign_split:
+        print(f"      正值像元: {stats_all['n_pos']} ({stats_all['pct_pos']:.1f}%)")
+        print(f"      负值像元: {stats_all['n_neg']} ({stats_all['pct_neg']:.1f}%)")
+
+    # 如果提供了p值地图，计算显著性像元统计
+    stats_sig = None
+    if pvalue_map is not None:
+        valid_sig = valid_all & (pvalue_map < 0.05)
+        values_sig = data_map[valid_sig]
+        n_sig = len(values_sig)
+
+        if n_sig > 0:
+            sig_pct = n_sig / n_all * 100
+
+            stats_sig = {
+                'mean': np.mean(values_sig),
+                'std': np.std(values_sig),
+                'median': np.median(values_sig),
+                'n': n_sig,
+                'pct': sig_pct
+            }
+
+            if print_percentiles:
+                stats_sig.update({
+                    'p5': np.percentile(values_sig, 5),
+                    'p25': np.percentile(values_sig, 25),
+                    'p75': np.percentile(values_sig, 75),
+                    'p95': np.percentile(values_sig, 95)
+                })
+
+            # 打印显著性像元统计
+            print(f"\n    显著性像元（p<0.05, N={n_sig}, {sig_pct:.1f}%）:")
+            print(f"      平均值: {stats_sig['mean']:+.4f} ± {stats_sig['std']:.4f} {unit}")
+            print(f"      中位数: {stats_sig['median']:+.4f} {unit}")
+
+            if print_percentiles:
+                print(f"      百分位: [P5: {stats_sig['p5']:+.4f}, P25: {stats_sig['p25']:+.4f}, "
+                      f"P75: {stats_sig['p75']:+.4f}, P95: {stats_sig['p95']:+.4f}] {unit}")
+
+    return {'all': stats_all, 'significant': stats_sig}
+
+
+# ==================== Numba加速版本（性能优化）====================
+if NUMBA_AVAILABLE:
+    @jit(nopython=True, cache=True)
+    def _lstsq_simple_numba(X, y):
+        """Numba优化的简单最小二乘求解（用于VIF计算）"""
+        # X^T X
+        XtX = X.T @ X
+        # X^T y
+        Xty = X.T @ y
+        # 求解 beta = (X^T X)^{-1} X^T y
+        try:
+            beta = np.linalg.solve(XtX, Xty)
+            return beta, True
+        except:
+            return np.zeros(X.shape[1], dtype=X.dtype), False
+
+    @jit(nopython=True, cache=True)
+    def calculate_vif_numba(X):
+        """
+        Numba加速的VIF计算
+
+        Parameters:
+        -----------
+        X : ndarray
+            设计矩阵 (n_samples, n_features), 已标准化
+
+        Returns:
+        --------
+        vif : ndarray (n_features,)
+        """
+        n_samples, n_features = X.shape
+        vif = np.zeros(n_features, dtype=X.dtype)
+
+        for i in range(n_features):
+            # 提取第i个特征作为因变量
+            y = X[:, i]
+
+            # 构建其他特征矩阵（确保dtype与X一致）
+            X_others = np.empty((n_samples, n_features - 1), dtype=X.dtype)
+            col = 0
+            for j in range(n_features):
+                if j != i:
+                    X_others[:, col] = X[:, j]
+                    col += 1
+
+            # 最小二乘求解
+            beta, success = _lstsq_simple_numba(X_others, y)
+            if not success:
+                vif[i] = np.inf
+                continue
+
+            # 计算R²
+            y_pred = X_others @ beta
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+
+            if ss_tot > 0:
+                r_squared = 1.0 - (ss_res / ss_tot)
+                # VIF = 1 / (1 - R²)
+                if r_squared < 0.9999:
+                    vif[i] = 1.0 / (1.0 - r_squared)
+                else:
+                    vif[i] = np.inf
+            else:
+                vif[i] = np.inf
+
+        return vif
+
+    @jit(nopython=True, cache=True)
+    def partial_corr_from_std_numba(y_std, X_std):
+        """
+        Numba加速的偏相关系数计算（基于精度矩阵）
+
+        Parameters:
+        -----------
+        y_std : ndarray (n_samples,)
+            标准化的因变量
+        X_std : ndarray (n_samples, p)
+            标准化的自变量矩阵
+
+        Returns:
+        --------
+        r : ndarray (p,) - 偏相关系数
+        p_vals : ndarray (p,) - p值
+        """
+        n = len(y_std)
+        p = X_std.shape[1]
+
+        # 构建数据矩阵 [y, X]
+        data = np.empty((n, p + 1), dtype=y_std.dtype)
+        data[:, 0] = y_std
+        data[:, 1:] = X_std
+
+        # 计算相关矩阵（手动实现以支持Numba）
+        corr = np.zeros((p + 1, p + 1), dtype=y_std.dtype)
+        for i in range(p + 1):
+            for j in range(i, p + 1):
+                c = np.mean(data[:, i] * data[:, j])
+                corr[i, j] = c
+                corr[j, i] = c
+
+        # 精度矩阵（逆相关矩阵）
+        try:
+            prec = np.linalg.inv(corr)
+        except:
+            return np.full(p, np.nan, dtype=y_std.dtype), np.full(p, np.nan, dtype=y_std.dtype)
+
+        # 偏相关系数: r_ij = -prec_ij / sqrt(prec_ii * prec_jj)
+        r = np.empty(p, dtype=y_std.dtype)
+        for i in range(p):
+            denom = np.sqrt(prec[0, 0] * prec[i + 1, i + 1])
+            if denom > 0:
+                r[i] = -prec[0, i + 1] / denom
+            else:
+                r[i] = np.nan
+
+        # Clip到合理范围
+        r = np.clip(r, -0.999999, 0.999999)
+
+        # t检验计算p值
+        df = n - p - 1
+        p_vals = np.empty(p, dtype=y_std.dtype)
+        if df > 0:
+            for i in range(p):
+                if not np.isnan(r[i]):
+                    t_stat = r[i] * np.sqrt(df / (1.0 - r[i] ** 2))
+                    # 简化的t分布p值近似（双侧检验）
+                    # 对于df较大时，t分布接近正态分布
+                    # 使用误差函数近似
+                    abs_t = abs(t_stat)
+                    # P(|T| > t) ≈ 2 * (1 - Φ(t)) for large df
+                    # 简化：使用指数近似（快速但精度略低）
+                    if abs_t < 10:
+                        p_vals[i] = 2.0 * (1.0 - 0.5 * (1.0 + np.tanh(abs_t * np.sqrt(2.0 / np.pi))))
+                    else:
+                        p_vals[i] = 0.0
+                else:
+                    p_vals[i] = np.nan
+        else:
+            p_vals[:] = np.nan
+
+        return r, p_vals
+
+# ==================== 批量向量化版本（超高性能，参考用户代码）====================
+def partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False):
+    """
+    批量向量化偏相关计算（参考用户代码优化架构）
+
+    性能优势：批量矩阵操作 >> 逐像元循环
+    - 使用einsum批量计算协方差矩阵
+    - 使用pinv批量求逆所有像元的矩阵
+    - 向量化提取偏相关系数
+
+    Parameters:
+    -----------
+    Y_block : ndarray, shape (n_years, block_h, block_w)
+        响应变量块
+    X_block : dict of ndarray, shape (n_years, block_h, block_w)
+        预测变量块字典
+    predictor_vars : list of str
+        预测变量名列表
+    min_rows : int
+        最小有效样本数
+    enable_vif : bool
+        是否启用VIF过滤（默认False，因为VIF难以批量化）
+
+    Returns:
+    --------
+    partial_r_block : dict of ndarray (block_h, block_w)
+    partial_p_block : dict of ndarray (block_h, block_w)
+    vif_block : dict of ndarray (block_h, block_w)
+    r2_block : ndarray (block_h, block_w)
+    """
+    n_years, block_h, block_w = Y_block.shape
+    N = block_h * block_w
+    P = len(predictor_vars) + 1  # Y + X变量数
+
+    # 初始化输出
+    partial_r_block = {var: np.full((block_h, block_w), NODATA_OUT, dtype=np.float32)
+                       for var in predictor_vars}
+    partial_p_block = {var: np.full((block_h, block_w), NODATA_OUT, dtype=np.float32)
+                       for var in predictor_vars}
+    vif_block = {var: np.zeros((block_h, block_w), dtype=bool) for var in predictor_vars}
+    r2_block = np.full((block_h, block_w), NODATA_OUT, dtype=np.float32)
+
+    # 构建数据立方体 (N, T, P)
+    cube = np.empty((N, n_years, P), dtype=np.float32)
+    cube[:, :, 0] = Y_block.reshape(n_years, -1).T  # Y变量
+    for j, var in enumerate(predictor_vars, start=1):
+        cube[:, :, j] = X_block[var].reshape(n_years, -1).T  # X变量
+
+    # 有效性掩膜 (N, T)
+    valid_year = ~np.isnan(cube).any(axis=2)
+    n_eff_all = valid_year.sum(axis=1).astype(np.int16)
+    good_idx = np.where(n_eff_all >= min_rows)[0]
+
+    if good_idx.size == 0:
+        return partial_r_block, partial_p_block, vif_block, r2_block
+
+    # 提取有效像元
+    data = cube[good_idx]  # (Ng, T, P)
+    vmask = valid_year[good_idx]  # (Ng, T)
+    n_eff = vmask.sum(axis=1).astype(np.float32)  # (Ng,)
+
+    # 批量标准化（Z-score）
+    sums = np.sum(np.where(vmask[..., None], data, 0.0), axis=1, keepdims=True)  # (Ng, 1, P)
+    means = sums / vmask.sum(axis=1, keepdims=True)[..., None]
+    dmean = np.where(vmask[..., None], data - means, 0.0)  # (Ng, T, P)
+
+    # 批量计算协方差矩阵（einsum核心优化！）
+    denom = (n_eff[:, None, None] - 1.0)
+    cov = np.einsum('ntk,ntl->nkl', dmean, dmean) / denom  # (Ng, P, P)
+
+    # 批量矩阵求逆（pinv核心优化！）
+    inv_cov = np.linalg.pinv(cov.astype(np.float64)).astype(np.float32)  # (Ng, P, P)
+
+    # 向量化提取偏相关系数
+    num = -inv_cov[:, 0, 1:]  # (Ng, P-1)
+    den = np.sqrt(inv_cov[:, 0, 0, None] * inv_cov[:, 1:, 1:].diagonal(axis1=1, axis2=2))
+    r_partial = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+    r_partial = np.clip(r_partial, -0.999999, 0.999999)
+
+    # 向量化计算p值
+    m = len(predictor_vars)  # 控制变量数
+    df = (n_eff.astype(np.int32) - m - 2)[:, None]  # (Ng, 1)
+    ok_df = (df > 3) & np.isfinite(r_partial)
+
+    # 利用广播计算 t 统计量（避免布尔索引维度不匹配）
+    t_stat_full = r_partial * np.sqrt(df / (1.0 - r_partial**2))
+    t_stat = np.where(ok_df, t_stat_full, np.nan)
+
+    # 计算p值（使用广播的df）
+    p_vals_full = 2.0 * (1.0 - stats.t.cdf(np.abs(t_stat), df))
+    p_vals = np.where(ok_df, p_vals_full, np.nan)
+
+    # 计算R²（多元回归）- 批量向量化版本
+    # 使用协方差矩阵直接计算R²（避免lstsq循环）
+    #
+    # 理论公式：R² = Var(ŷ) / Var(y)
+    # 其中：
+    #   β = Cov_XX^-1 @ Cov_yX  (回归系数)
+    #   Var(ŷ) = Cov_yX^T @ Cov_XX^-1 @ Cov_yX  (预测值方差)
+    #   Var(y) = cov[:, 0, 0]  (y的方差)
+    #
+    # 因此：R² = (Cov_yX^T @ Cov_XX^-1 @ Cov_yX) / Var(y)
+    #
+    # 关键修复：必须先提取Cov_XX子矩阵，再对它求逆
+    #          不能从inv_cov中提取子矩阵（矩阵逆的子矩阵 ≠ 子矩阵的逆）
+
+    # 提取协方差向量和矩阵
+    Cov_yX = cov[:, 0, 1:]  # (Ng, m) - y与X的协方差向量
+    Cov_XX = cov[:, 1:, 1:]  # (Ng, m, m) - X的协方差矩阵
+    var_y_total = cov[:, 0, 0]  # (Ng,) - y的总方差
+
+    # 关键步骤：对Cov_XX求逆（不是从inv_cov中提取！）
+    Cov_XX_inv = np.linalg.pinv(Cov_XX.astype(np.float64)).astype(np.float32)  # (Ng, m, m)
+
+    # 批量计算预测值方差：Var(ŷ) = Cov_yX^T @ Cov_XX^-1 @ Cov_yX
+    var_y_pred = np.einsum('ni,nij,nj->n', Cov_yX, Cov_XX_inv, Cov_yX)  # (Ng,)
+
+    # 计算R²：R² = Var(ŷ) / Var(y)
+    r2_vals = var_y_pred / (var_y_total + 1e-10)
+    r2_vals = np.clip(r2_vals, 0.0, 1.0)  # 确保R²在 [0, 1] 范围内
+
+    # 样本数不足的像元设为nan
+    r2_vals[n_eff < min_rows] = np.nan
+
+    # 填充结果到块
+    r_blk = {var: np.full((N,), np.nan, dtype=np.float32) for var in predictor_vars}
+    p_blk = {var: np.full((N,), np.nan, dtype=np.float32) for var in predictor_vars}
+    r2_blk = np.full((N,), np.nan, dtype=np.float32)
+
+    for j, var in enumerate(predictor_vars):
+        r_blk[var][good_idx] = r_partial[:, j]
+        p_blk[var][good_idx] = p_vals[:, j]
+        vif_block[var].reshape(-1)[good_idx] = True  # 标记为已处理
+
+    r2_blk[good_idx] = r2_vals
+
+    # Reshape回块形状
+    for var in predictor_vars:
+        partial_r_block[var] = r_blk[var].reshape(block_h, block_w)
+        partial_p_block[var] = p_blk[var].reshape(block_h, block_w)
+    r2_block = r2_blk.reshape(block_h, block_w)
+
+    return partial_r_block, partial_p_block, vif_block, r2_block
+
+
+def _partial_corr_block_worker_batch(args):
+    """
+    批量向量化版本的块处理器（包装器）
+
+    与 _partial_corr_block_worker 接口兼容，但使用批量向量化计算
+    性能提升：10-50x（相比原版），5-20x（相比Numba版）
+
+    注意：此版本不执行VIF过滤（为了批量化性能）
+    """
+    (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows) = args
+
+    # 调用批量向量化函数
+    partial_r_block, partial_p_block, vif_block, r2_block = \
+        partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False)
+
+    return (r0, r1, c0, c1, partial_r_block, partial_p_block, vif_block, r2_block)
+
+
+# ==================== 原版函数（兼容性）====================
 def calculate_vif(X):
     """
     计算方差膨胀因子（Variance Inflation Factor, VIF）
@@ -520,6 +1162,11 @@ def calculate_vif(X):
     vif : ndarray
         每个特征的VIF值 (n_features,)
     """
+    # 优先使用Numba加速版本
+    if NUMBA_AVAILABLE:
+        return calculate_vif_numba(X)
+
+    # 原版NumPy实现
     n_features = X.shape[1]
     vif = np.zeros(n_features)
 
@@ -548,6 +1195,8 @@ def calculate_seasonal_gpp(year, season='spring'):
     """
     计算季节平均GPP（从日GPP数据）
 
+    优化策略：多线程并行读取日文件，显著加速I/O
+
     Parameters:
     -----------
     year : int
@@ -560,36 +1209,72 @@ def calculate_seasonal_gpp(year, season='spring'):
     sif_seasonal : ndarray
         季节平均GPP (H, W)
     """
+    # 缓存检查（可选优化）
+    if USE_GPP_CACHE:
+        cache_file = CACHE_DIR / f"GPP_{season}_{year}.tif"
+        if cache_file.exists():
+            data, _, _ = read_geotiff(cache_file)
+            return data
+
     if not _has_gpp_files(year):
         return None
 
     months = SPRING_MONTHS if season == 'spring' else SUMMER_MONTHS
 
-    gpp_list = []
+    # ========== 多线程并行读取优化 ==========
+    # 步骤1：收集所有需要的文件路径
+    file_paths = []
     for month in months:
         for day in range(1, 32):
             try:
                 date_str = datetime(year, month, day).strftime("%Y%m%d")
                 gpp_file = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_str)
-
                 if gpp_file.exists():
-                    data, _, nodata = read_geotiff(gpp_file)
-                    valid_data = np.where(_is_valid_value(data, nodata), data, np.nan)
-                    gpp_list.append(valid_data)
+                    file_paths.append(gpp_file)
             except ValueError:
                 continue
 
-    if len(gpp_list) == 0:
+    if len(file_paths) == 0:
         return None
 
+    # 步骤2：多线程并行读取所有文件
+    def _read_and_process(file_path):
+        """工作线程：读取单个文件并处理"""
+        data, profile, nodata = read_geotiff(file_path)
+        valid_data = np.where(_is_valid_value(data, nodata), data, np.nan)
+        return valid_data, profile
+
+    gpp_list = []
+    profile_template = None
+
+    with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
+        # 提交所有读取任务
+        futures = [executor.submit(_read_and_process, fp) for fp in file_paths]
+
+        # 收集结果（保持顺序）
+        for future in futures:
+            valid_data, profile = future.result()
+            if profile_template is None:
+                profile_template = profile
+            gpp_list.append(valid_data)
+
+    # 步骤3：内存计算
     gpp_stack = np.stack(gpp_list, axis=0)
     gpp_seasonal = np.nanmean(gpp_stack, axis=0)
+
+    # 保存缓存（可选优化）
+    if USE_GPP_CACHE and profile_template is not None:
+        cache_file = CACHE_DIR / f"GPP_{season}_{year}.tif"
+        if not cache_file.exists():
+            write_geotiff(cache_file, gpp_seasonal, profile_template)
 
     return gpp_seasonal
 
 def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
     """
     计算LSP期间的变量平均值（Wang 2025 Section 2.2.2）
+
+    优化策略：多线程并行读取日文件，显著加速I/O
 
     Parameters:
     -----------
@@ -607,6 +1292,14 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
     lsp_avg : ndarray
         LSP期间平均值 (H, W)
     """
+    # 缓存检查（可选优化）
+    # 注意：缓存键包含年份，但不包含SOS/POS（假设同一年的SOS/POS不变）
+    if USE_LSP_CACHE:
+        cache_file = CACHE_DIR / f"LSP_{var_name}_{year}.tif"
+        if cache_file.exists():
+            data, _, _ = read_geotiff(cache_file)
+            return data
+
     spec = DAILY_VAR_SPECS.get(var_name)
     if spec is None:
         raise ValueError(f"Unknown variable: {var_name}")
@@ -628,7 +1321,7 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
         (sos_int <= 366) & (pos_int <= 366)  # 允许闰年DOY=366
     )
 
-    # Clip到365以匹配365天气候态（闰年2月29日已归并到2月28日）
+    # Clip到365以匹配365天气候态（闰年DOY=366映射到平年DOY=365，即12月31日）
     sos_int = np.clip(sos_int, 1, 365)
     pos_int = np.clip(pos_int, 1, 365)
 
@@ -640,33 +1333,68 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
     doy_start = max(1, min(365, doy_start))
     doy_end = max(1, min(365, doy_end))
 
+    # ========== 多线程并行读取优化 ==========
+    # 步骤1：准备文件路径列表
+    file_doy_pairs = []
+    for doy in range(doy_start, doy_end + 1):
+        date_str = (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y%m%d")
+        var_file = var_dir / pattern.format(date=date_str)
+        if var_file.exists():
+            file_doy_pairs.append((var_file, doy))
+
+    # 步骤2：多线程并行读取所有文件
+    def _read_and_process_lsp(args):
+        """工作线程：读取单个文件并处理"""
+        file_path, doy = args
+        data, profile, nodata = read_geotiff(file_path)
+        valid_data = _is_valid_value(data, nodata)
+        return doy, data.astype(np.float32), valid_data, profile
+
+    daily_data_dict = {}  # {doy: (data_array, valid_mask)}
+    profile_template = None
+
+    with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
+        # 提交所有读取任务
+        futures = [executor.submit(_read_and_process_lsp, pair) for pair in file_doy_pairs]
+
+        # 收集结果
+        for future in futures:
+            doy, data, valid_data, profile = future.result()
+            if profile_template is None:
+                profile_template = profile
+            daily_data_dict[doy] = (data, valid_data)
+
+    # 步骤3：从内存字典中提取数据并计算（无文件I/O）
     total_sum = np.zeros((height, width), dtype=np.float32)
     total_cnt = np.zeros((height, width), dtype=np.int16)
 
     for doy in range(doy_start, doy_end + 1):
+        if doy not in daily_data_dict:
+            continue
+
         in_window = valid & (sos_int <= doy) & (pos_int >= doy)
         if not np.any(in_window):
             continue
 
-        date_str = (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y%m%d")
-        var_file = var_dir / pattern.format(date=date_str)
-        if not var_file.exists():
-            continue
-
-        data, _, nodata = read_geotiff(var_file)
-        valid_data = _is_valid_value(data, nodata)
+        data, valid_data = daily_data_dict[doy]
         use_mask = in_window & valid_data
 
         if not np.any(use_mask):
             continue
 
-        total_sum[use_mask] += data[use_mask].astype(np.float32)
+        total_sum[use_mask] += data[use_mask]
         total_cnt[use_mask] += 1
 
     window_len = pos_int - sos_int + 1
     lsp_avg = np.full((height, width), np.nan, dtype=np.float32)
     good = valid & (total_cnt >= 0.6 * window_len)
     lsp_avg[good] = total_sum[good] / total_cnt[good]
+
+    # 保存缓存（可选优化）
+    if USE_LSP_CACHE and profile_template is not None:
+        cache_file = CACHE_DIR / f"LSP_{var_name}_{year}.tif"
+        if not cache_file.exists():
+            write_geotiff(cache_file, lsp_avg, profile_template)
 
     return lsp_avg
 
@@ -783,24 +1511,45 @@ def section_3_2_phenology_impact(mask):
             delta_sos_stack, response_data[resp_var], min_frac=0.6
         )
 
+        # 异常值过滤（斜率阈值根据变量调整）
+        slope_threshold = 10.0  # TRc/TRpheno/TRproduct的合理范围
+        if resp_var == 'Trate':
+            slope_threshold = 1.0  # Trate的斜率范围更小
+
+        n_filtered, valid_mask, outlier_info = filter_statistical_outliers(
+            slope_map, r2_map=r_squared_map, pvalue_map=pvalue_map,
+            mask=mask, slope_threshold=slope_threshold, print_details=True
+        )
+
+        # 应用过滤掩膜
+        slope_map_clean = np.where(valid_mask, slope_map, np.nan)
+        pvalue_map_clean = np.where(valid_mask, pvalue_map, np.nan)
+        r_squared_map_clean = np.where(valid_mask, r_squared_map, np.nan)
+
+        # 将NaN转换为NODATA_OUT用于保存
+        slope_map_save = np.where(np.isfinite(slope_map_clean), slope_map_clean, NODATA_OUT)
+        pvalue_map_save = np.where(np.isfinite(pvalue_map_clean), pvalue_map_clean, NODATA_OUT)
+        r2_map_save = np.where(np.isfinite(r_squared_map_clean), r_squared_map_clean, NODATA_OUT)
+
         if mask is not None:
-            slope_map[~mask] = NODATA_OUT
-            pvalue_map[~mask] = NODATA_OUT
-            r_squared_map[~mask] = NODATA_OUT
+            slope_map_save[~mask] = NODATA_OUT
+            pvalue_map_save[~mask] = NODATA_OUT
+            r2_map_save[~mask] = NODATA_OUT
 
         # 保存结果
-        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_slope.tif", slope_map, profile)
-        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_pvalue.tif", pvalue_map, profile)
-        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_R2.tif", r_squared_map, profile)
+        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_slope.tif", slope_map_save, profile)
+        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_pvalue.tif", pvalue_map_save, profile)
+        write_geotiff(output_dir / f"{resp_var}_vs_deltaSOS_R2.tif", r2_map_save, profile)
 
-        # 统计显著像元（p < 0.05）
-        sig_mask = (pvalue_map < 0.05) & (pvalue_map != NODATA_OUT)
-        n_sig = np.sum(sig_mask)
-        mean_slope = np.nanmean(slope_map[sig_mask]) if n_sig > 0 else np.nan
-        std_slope = np.nanstd(slope_map[sig_mask]) if n_sig > 0 else np.nan
-
-        print(f"    显著像元数 (p<0.05): {n_sig}")
-        print(f"    平均斜率: {mean_slope:.3f} ± {std_slope:.3f} mm/day per day ΔSOS")
+        # 全面统计输出（全部有效像元 + 显著性像元）
+        unit = "mm/day per day ΔSOS" if resp_var != 'Trate' else "mm/day/day per day ΔSOS"
+        print_comprehensive_statistics(
+            slope_map_clean, pvalue_map_clean, valid_mask,
+            var_name=f"{resp_var} ~ ΔSOS 回归斜率",
+            unit=unit,
+            print_percentiles=True,
+            print_sign_split=True
+        )
 
     print("\n  ✓ Section 3.2 分析完成")
     print(f"  输出目录: {output_dir}")
@@ -842,13 +1591,14 @@ def section_3_3_driver_analysis(mask):
     height, width = data_first.shape
 
     # 定义变量（Wang 2025 Eq. 3）
-    response_vars = ['TRc', 'TRpheno', 'TRproduct']
+    # 统一因变量：移除TRpheno（物候效应），仅保留TRc和TRproduct（强度效应）
+    response_vars = ['TRc', 'TRproduct']
     # 注意：SIFspr/SIFsum 实际使用日尺度 GPP 的季节均值作为代理
-    predictor_vars = ['LSP', 'SMroot', 'Ta', 'Rs', 'P', 'SIFspr', 'SIFsum']
+    predictor_vars = ['SOS', 'SMroot', 'Ta', 'Rs', 'P', 'SIFspr', 'SIFsum']
     available_vars = []
     missing_vars = []
     for var in predictor_vars:
-        if var == 'LSP':
+        if var == 'SOS':
             available_vars.append(var)
             continue
         if var in ('SIFspr', 'SIFsum'):
@@ -877,7 +1627,8 @@ def section_3_3_driver_analysis(mask):
         return
 
     # ========== Part 1: 全时段偏相关归因分析（带VIF过滤）==========
-    print("\n[Part 1] 全时段偏相关归因分析（1982-2018，VIF过滤）...")
+    mode_desc = "批量向量化模式" if USE_BATCH_VECTORIZED else "VIF过滤模式"
+    print(f"\n[Part 1] 全时段偏相关归因分析（1982-2018，{mode_desc}）...")
 
     # 预计算所有预测变量
     print("\n  预计算预测变量...")
@@ -891,10 +1642,8 @@ def section_3_3_driver_analysis(mask):
         sos_map = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
         pos_map = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
 
-        if 'LSP' in predictor_vars:
-            lsp_map = np.where((~np.isnan(sos_map)) & (~np.isnan(pos_map)) & (pos_map >= sos_map),
-                               pos_map - sos_map + 1, np.nan)
-            X_all_years['LSP'].append(lsp_map)
+        if 'SOS' in predictor_vars:
+            X_all_years['SOS'].append(sos_map)
 
         # 计算LSP期间气象变量平均值
         for var in ['SMroot', 'Ta', 'Rs', 'P']:
@@ -945,6 +1694,10 @@ def section_3_3_driver_analysis(mask):
         r_squared_map = np.full((height, width), NODATA_OUT, dtype=np.float32)
         p = len(predictor_vars)
         min_rows = max(15, p + 8)
+
+        # 选择worker函数（批量向量化 vs VIF过滤）
+        worker_func = _partial_corr_block_worker_batch if USE_BATCH_VECTORIZED else _partial_corr_block_worker
+
         if USE_BLOCK_PARALLEL:
             with ProcessPoolExecutor(max_workers=MAX_WORKERS_3_3) as executor:
                 futures = []
@@ -952,7 +1705,7 @@ def section_3_3_driver_analysis(mask):
                     X_block = {var: X_all_years[var][:, r0:r1, c0:c1] for var in predictor_vars}
                     Y_block = Y_stack[:, r0:r1, c0:c1]
                     args = (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows)
-                    futures.append(executor.submit(_partial_corr_block_worker, args))
+                    futures.append(executor.submit(worker_func, args))
 
                 for fut in tqdm(as_completed(futures), total=len(futures),
                                 desc=f"归因分析 {response_var}", leave=False):
@@ -967,7 +1720,7 @@ def section_3_3_driver_analysis(mask):
                 X_block = {var: X_all_years[var][:, r0:r1, c0:c1] for var in predictor_vars}
                 Y_block = Y_stack[:, r0:r1, c0:c1]
                 args = (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows)
-                r0, r1, c0, c1, pr_block, pp_block, vif_block, r2_block = _partial_corr_block_worker(args)
+                r0, r1, c0, c1, pr_block, pp_block, vif_block, r2_block = worker_func(args)
                 for var in predictor_vars:
                     partial_r_maps[var][r0:r1, c0:c1] = pr_block[var]
                     partial_p_maps[var][r0:r1, c0:c1] = pp_block[var]
@@ -998,6 +1751,81 @@ def section_3_3_driver_analysis(mask):
             n_main = np.sum(main_driver_mask)
             print(f"      {var}: {n_main} 像元")
 
+        # ========== 详细统计汇总 ==========
+        print(f"\n    === {response_var} 偏相关详细统计 ===")
+
+        # 1. 全局统计（每个预测变量）- 使用全面统计函数
+        print("\n    各预测变量偏相关统计:")
+        print(f"    {'-'*80}")
+
+        stats_table = []
+        for var in predictor_vars:
+            r_map = partial_r_maps[var]
+            p_map = partial_p_maps[var]
+            valid_mask = (r_map != NODATA_OUT) & np.isfinite(r_map) & (mask if mask is not None else True)
+
+            if np.sum(valid_mask) > 0:
+                # 计算简要统计用于排名表
+                r_valid = r_map[valid_mask]
+                p_valid = p_map[valid_mask]
+
+                mean_r = np.mean(r_valid)
+                std_r = np.std(r_valid)
+                median_r = np.median(r_valid)
+                sig_pct = np.sum(p_valid < 0.05) / len(p_valid) * 100
+                main_driver_pct = np.sum(np.abs(r_valid) > 0.1) / len(r_valid) * 100
+                n_valid = len(r_valid)
+
+                stats_table.append({
+                    'var': var,
+                    'mean_R': mean_r,
+                    'std_R': std_r,
+                    'median_R': median_r,
+                    'sig_pct': sig_pct,
+                    'main_pct': main_driver_pct,
+                    'n_valid': n_valid
+                })
+
+        # 按平均|R|降序排列
+        stats_table.sort(key=lambda x: abs(x['mean_R']), reverse=True)
+
+        # 打印简要排名表
+        print("\n    主导因子排名（按平均|R|降序）:")
+        print(f"      {'排名':<4} {'变量':<10} {'平均R':<12} {'中位R':<10} {'显著%':<8} {'主导%':<8} {'有效像元':<10}")
+        print(f"      {'-'*4} {'-'*10} {'-'*12} {'-'*10} {'-'*8} {'-'*8} {'-'*10}")
+        for i, s in enumerate(stats_table, 1):
+            print(f"      {i:<4} {s['var']:<10} "
+                  f"{s['mean_R']:+.3f}±{s['std_R']:.3f}  "
+                  f"{s['median_R']:+.3f}    "
+                  f"{s['sig_pct']:>6.1f}%  "
+                  f"{s['main_pct']:>6.1f}%  "
+                  f"{s['n_valid']:>10}")
+
+        # 2. R² 拟合统计 - 使用全面统计函数
+        r2_mask = (r_squared_map != NODATA_OUT) & np.isfinite(r_squared_map)
+        if mask is not None:
+            r2_mask &= mask
+
+        if np.sum(r2_mask) > 0:
+            print(f"\n    === 模型拟合统计（R²）===")
+
+            # 全面统计（全部像元）
+            r2_stats = print_comprehensive_statistics(
+                r_squared_map, pvalue_map=None, mask=r2_mask,
+                var_name="R²",
+                unit="",
+                print_percentiles=True,
+                print_sign_split=False  # R²不需要正负值统计
+            )
+
+            # 额外统计：R²阈值分布
+            r2_valid = r_squared_map[r2_mask]
+            print(f"\n    R²阈值分布:")
+            print(f"      R² > 0.1: {np.sum(r2_valid > 0.1) / len(r2_valid) * 100:.1f}% ({np.sum(r2_valid > 0.1)} 像元)")
+            print(f"      R² > 0.3: {np.sum(r2_valid > 0.3) / len(r2_valid) * 100:.1f}% ({np.sum(r2_valid > 0.3)} 像元)")
+            print(f"      R² > 0.5: {np.sum(r2_valid > 0.5) / len(r2_valid) * 100:.1f}% ({np.sum(r2_valid > 0.5)} 像元)")
+            print(f"      有效预测像元总数: {len(r2_valid)}")
+
     # ========== Part 2: 15年滑动窗口偏相关演变 ==========
     print("\n[Part 2] 15年滑动窗口偏相关演变...")
 
@@ -1024,41 +1852,50 @@ def section_3_3_driver_analysis(mask):
     partial_r_evolution = {var: np.full((n_windows, height, width), NODATA_OUT, dtype=np.float32)
                            for var in predictor_vars}
 
-    for win_idx in tqdm(range(n_windows), desc="滑动窗口"):
-        start_idx = win_idx
-        end_idx = win_idx + window_size
-        start_year = years[start_idx]
-        end_year = years[end_idx - 1]
+    # 创建进程池（复用以避免重复创建开销）
+    p = len(predictor_vars)
+    min_rows = max(10, p + 5)
+    executor = ProcessPoolExecutor(max_workers=MAX_WORKERS_3_3) if USE_BLOCK_PARALLEL else None
 
-        # 提取窗口数据
-        Y_window = Y_stack[start_idx:end_idx]  # (window_size, H, W)
-        X_window = {var: X_all_years[var][start_idx:end_idx] for var in predictor_vars}
+    # 选择worker函数（批量向量化 vs 原版）
+    window_worker_func = _partial_corr_window_block_worker_batch if USE_BATCH_VECTORIZED else _partial_corr_window_block_worker
 
-        # 逐像元回归（分块/并行）
-        p = len(predictor_vars)
-        min_rows = max(10, p + 5)
-        if USE_BLOCK_PARALLEL:
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS_3_3) as executor:
+    try:
+        for win_idx in tqdm(range(n_windows), desc="滑动窗口"):
+            start_idx = win_idx
+            end_idx = win_idx + window_size
+            start_year = years[start_idx]
+            end_year = years[end_idx - 1]
+
+            # 提取窗口数据
+            Y_window = Y_stack[start_idx:end_idx]  # (window_size, H, W)
+            X_window = {var: X_all_years[var][start_idx:end_idx] for var in predictor_vars}
+
+            # 逐像元回归（分块/并行）
+            if USE_BLOCK_PARALLEL:
                 futures = []
                 for r0, r1, c0, c1, block_mask in blocks:
                     X_block = {var: X_window[var][:, r0:r1, c0:c1] for var in predictor_vars}
                     Y_block = Y_window[:, r0:r1, c0:c1]
                     args = (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows)
-                    futures.append(executor.submit(_partial_corr_window_block_worker, args))
+                    futures.append(executor.submit(window_worker_func, args))
 
                 for fut in tqdm(as_completed(futures), total=len(futures),
                                 desc="滑动窗口像元", leave=False):
                     r0, r1, c0, c1, pr_block = fut.result()
                     for var in predictor_vars:
                         partial_r_evolution[var][win_idx, r0:r1, c0:c1] = pr_block[var]
-        else:
-            for r0, r1, c0, c1, block_mask in tqdm(blocks, desc="滑动窗口像元", leave=False):
-                X_block = {var: X_window[var][:, r0:r1, c0:c1] for var in predictor_vars}
-                Y_block = Y_window[:, r0:r1, c0:c1]
-                args = (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows)
-                r0, r1, c0, c1, pr_block = _partial_corr_window_block_worker(args)
-                for var in predictor_vars:
-                    partial_r_evolution[var][win_idx, r0:r1, c0:c1] = pr_block[var]
+            else:
+                for r0, r1, c0, c1, block_mask in tqdm(blocks, desc="滑动窗口像元", leave=False):
+                    X_block = {var: X_window[var][:, r0:r1, c0:c1] for var in predictor_vars}
+                    Y_block = Y_window[:, r0:r1, c0:c1]
+                    args = (r0, r1, c0, c1, block_mask, predictor_vars, X_block, Y_block, min_rows)
+                    r0, r1, c0, c1, pr_block = window_worker_func(args)
+                    for var in predictor_vars:
+                        partial_r_evolution[var][win_idx, r0:r1, c0:c1] = pr_block[var]
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     # 保存每个窗口的偏相关系数
     output_dir_window = OUTPUT_DIR / "Section_3.3_Drivers" / "Moving_Window" / response_var
@@ -1129,6 +1966,13 @@ def main():
     print("统计分析模块 - Wang (2025) Sections 3.2 & 3.3")
     print("="*70)
 
+    # 性能优化状态
+    if NUMBA_AVAILABLE:
+        print("\n⚡ Numba JIT加速已启用（VIF + 偏相关计算约10-50x加速）")
+    else:
+        print("\n⚠️  Numba未安装，使用NumPy/SciPy版本（较慢）")
+        print("   建议安装以获得10-50x性能提升: pip install numba")
+
     # 读取掩膜
     print("\n[0] 读取掩膜...")
     mask_file = ANALYSIS_DIR / "masks" / "combined_mask.tif"
@@ -1178,7 +2022,7 @@ def main():
     print("  │   │   ├── TRc/")
     print("  │   │   ├── TRpheno/")
     print("  │   │   └── TRproduct/")
-    print("  │   │       ├── partial_r_{var}.tif (LSP, SMroot, Ta, Rs, P, SIFspr, SIFsum; SIF=GPP proxy)")
+    print("  │   │       ├── partial_r_{var}.tif (SOS, SMroot, Ta, Rs, P, SIFspr, SIFsum; SIF=GPP proxy)")
     print("  │   │       ├── partial_p_{var}.tif")
     print("  │   │       ├── vif_retained_{var}.tif")
     print("  │   │       └── R_squared.tif")

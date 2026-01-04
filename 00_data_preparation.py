@@ -19,21 +19,29 @@ warnings.filterwarnings('ignore')
 
 # 导入配置
 try:
-    from config import (
+    # 优先尝试导入_config.py
+    from _config import (
         ROOT, LAT_MIN, FOREST_CLASSES, NODATA_OUT,
         USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, PHENO_DIR
     )
 except ImportError:
-    # 如果无法导入config，使用默认配置
-    print("⚠ 警告：无法导入config.py，使用默认配置")
-    ROOT = Path(r"I:\F\Data4")
-    LAT_MIN = 30.0
-    FOREST_CLASSES = [1, 2, 3, 4, 5]
-    NODATA_OUT = -9999.0
-    USE_FOREST_MASK = False  # 默认不使用森林掩膜
-    LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"
-    TR_DAILY_DIR = ROOT / "Meteorological Data" / "GLEAM" / "Daily_0p5deg_TIF" / "Et"
-    PHENO_DIR = ROOT / "Phenology_Output_1" / "SIF_phenology"
+    try:
+        # 如果_config不存在，尝试config.py
+        from config import (
+            ROOT, LAT_MIN, FOREST_CLASSES, NODATA_OUT,
+            USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, PHENO_DIR
+        )
+    except ImportError:
+        # 如果都无法导入，使用默认配置
+        print("⚠ 警告：无法导入_config.py或config.py，使用默认配置")
+        ROOT = Path(r"I:\F\Data4")
+        LAT_MIN = 30.0
+        FOREST_CLASSES = [1, 2, 3, 4, 5]
+        NODATA_OUT = -9999.0
+        USE_FOREST_MASK = False  # 默认不使用森林掩膜
+        LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"
+        TR_DAILY_DIR = ROOT / "Meteorological Data" / "ERA5_Land" / "ET_components" / "ET_transp" / "ET_transp_Daily" / "ET_transp_Daily_2"
+        PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology_EPSG4326"
 
 # 输出目录
 OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "masks"
@@ -43,24 +51,27 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 def get_template_file():
     """
     获取模板文件（用于生成掩膜的空间参考）
-    优先级：物候 > TR数据
+    优先级：TR数据 > 物候（确保使用EPSG:4326 CRS）
     """
-    # 尝试从物候数据获取
-    pheno_files = list(PHENO_DIR.glob("SOS_*.tif"))
-    if pheno_files:
-        return pheno_files[0]
-
-    # 尝试从TR数据获取
+    # 优先尝试从TR数据获取（CRS: EPSG:4326）
+    # ERA5-Land格式: ERA5L_ET_transp_Daily_mm_YYYYMMDD.tif
     test_date = datetime(2000, 1, 15)
+    yyyymmdd = test_date.strftime('%Y%m%d')
     tr_files = [
-        TR_DAILY_DIR / f"Et_{test_date.strftime('%Y%m%d')}.tif",
+        TR_DAILY_DIR / f"ERA5L_ET_transp_Daily_mm_{yyyymmdd}.tif",  # ERA5-Land格式
+        TR_DAILY_DIR / f"Et_{yyyymmdd}.tif",                         # GLEAM格式（备选）
         TR_DAILY_DIR / f"Et_{test_date.year}_{test_date.timetuple().tm_yday:03d}.tif",
-        TR_DAILY_DIR / str(test_date.year) / f"Et_{test_date.strftime('%Y%m%d')}.tif"
+        TR_DAILY_DIR / str(test_date.year) / f"Et_{yyyymmdd}.tif"
     ]
 
     for f in tr_files:
         if f.exists():
             return f
+
+    # 如果找不到TR数据，尝试从物候数据获取
+    pheno_files = list(PHENO_DIR.glob("sos_gpp_*.tif"))
+    if pheno_files:
+        return pheno_files[0]
 
     return None
 
@@ -89,6 +100,16 @@ def create_lat_mask(template_file, lat_min=30.0):
         profile = src.profile.copy()
         height, width = src.height, src.width
         transform = src.transform
+        crs = src.crs
+
+    # CRS检查：确保是地理坐标系（EPSG:4326或类似）
+    if crs is not None:
+        if not crs.is_geographic:
+            print(f"  ⚠ 警告：模板CRS不是地理坐标系: {crs}")
+            print(f"  纬度掩膜可能不准确，建议使用EPSG:4326数据")
+        elif str(crs) != 'EPSG:4326':
+            print(f"  ⚠ 注意：模板CRS为 {crs}，非标准EPSG:4326")
+            print(f"  纬度计算可能略有偏差")
 
     # 生成纬度数组
     # 对于每一行，计算中心点纬度

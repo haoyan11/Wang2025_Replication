@@ -47,25 +47,38 @@ import rasterio
 from pathlib import Path
 from tqdm import tqdm
 
-# ==================== Global config ====================
-ROOT = Path(r"I:\F\Data4")
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
-TRC_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual"
-CLIM_DIR = ROOT / "Wang2025_Analysis" / "Climatology"
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "Decomposition_FixedWindow"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# 导入配置
+from _config import (
+    ROOT, PHENO_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR, DECOMPOSITION_FIXED_DIR,
+    YEAR_START, YEAR_END, NODATA_OUT
+)
 
-YEAR_START = 1982
-YEAR_END = 2018
-NODATA_OUT = -9999.0
+# 确保输出目录存在
+DECOMPOSITION_FIXED_DIR.mkdir(parents=True, exist_ok=True)
+
+# 向后兼容：保留旧变量名
+TRC_DIR = TRC_ANNUAL_DIR
+CLIM_DIR = CLIMATOLOGY_DIR
+OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
 
 
 def _is_valid_value(value, nodata):
-    if nodata is None:
-        return np.isfinite(value)
-    if np.isnan(nodata):
-        return np.isfinite(value)
-    return (value != nodata) & np.isfinite(value)
+    """
+    判断值是否有效（非NODATA）
+    兼容各种NODATA类型：-9999, NaN, 3.4e38等
+    当nodata元信息缺失时，使用绝对值阈值过滤极大填充值
+    """
+    # 基础检查：有限性
+    valid = np.isfinite(value)
+
+    # 如果有明确的nodata值，检查是否等于nodata
+    if nodata is not None and not np.isnan(nodata):
+        valid = valid & (value != nodata)
+
+    # 额外保护：过滤常见的极大填充值（1e20, 3.4e38等）
+    valid = valid & (np.abs(value) < 1e10)
+
+    return valid
 
 
 def read_geotiff(file_path):
@@ -77,8 +90,10 @@ def read_geotiff(file_path):
 
 
 def write_geotiff(file_path, data, profile):
-    profile.update(dtype=rasterio.float32, count=1, compress="lzw", nodata=NODATA_OUT)
-    with rasterio.open(file_path, "w", **profile) as dst:
+    """写入单波段GeoTIFF（不修改原profile）"""
+    out_profile = profile.copy()
+    out_profile.update(dtype=rasterio.float32, count=1, compress="lzw", nodata=NODATA_OUT)
+    with rasterio.open(file_path, "w", **out_profile) as dst:
         dst.write(data.astype(np.float32), 1)
 
 
@@ -95,6 +110,38 @@ def _sum_cum_range(cum_arr, start_doy, end_doy):
     end_vals = flat[end - 1, idx]
     start_vals = np.where(start > 1, flat[start - 2, idx], 0.0)
     return (end_vals - start_vals).reshape(start_doy.shape)
+
+
+def check_spatial_consistency(ref_profile, file_path, data_profile, var_name="data"):
+    """检查栅格空间一致性（shape/crs/transform）"""
+    if ref_profile['width'] != data_profile['width'] or \
+       ref_profile['height'] != data_profile['height']:
+        raise ValueError(
+            f"Shape mismatch for {var_name}: {file_path}\n"
+            f"  Expected: {ref_profile['height']}x{ref_profile['width']}\n"
+            f"  Got: {data_profile['height']}x{data_profile['width']}"
+        )
+    if ref_profile['crs'] != data_profile['crs']:
+        raise ValueError(
+            f"CRS mismatch for {var_name}: {file_path}\n"
+            f"  Expected: {ref_profile['crs']}\n"
+            f"  Got: {data_profile['crs']}"
+        )
+
+    # Transform比较使用容差（避免浮点精度误报）
+    ref_transform = ref_profile['transform']
+    data_transform = data_profile['transform']
+    if ref_transform is not None and data_transform is not None:
+        transform_match = all(
+            abs(ref_transform[i] - data_transform[i]) < 1e-6
+            for i in range(6)
+        )
+        if not transform_match:
+            raise ValueError(
+                f"Transform mismatch for {var_name}: {file_path}\n"
+                f"  Expected: {ref_transform}\n"
+                f"  Got: {data_transform}"
+            )
 
 
 def load_climatology():
@@ -120,14 +167,17 @@ def load_climatology():
         tr_daily_av[tr_daily_av == nodata_tr] = np.nan
     tr_daily_av[tr_daily_av < 0] = np.nan
 
-    sos_av, _, nodata_sos = read_geotiff(sos_av_file)
-    pos_av, _, nodata_pos = read_geotiff(pos_av_file)
+    sos_av, sos_profile, nodata_sos = read_geotiff(sos_av_file)
+    check_spatial_consistency(profile, sos_av_file, sos_profile, "SOSav")
+
+    pos_av, pos_profile, nodata_pos = read_geotiff(pos_av_file)
+    check_spatial_consistency(profile, pos_av_file, pos_profile, "POSav")
 
     return tr_daily_av, sos_av, pos_av, nodata_sos, nodata_pos, profile
 
 
 def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
-                   nodata_sos, nodata_pos, mask, tr_valid):
+                   nodata_sos, nodata_pos, mask, tr_valid, ref_profile):
     """
     方法2分解：固定窗口强度 + 实际窗口变化
 
@@ -139,13 +189,22 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     tr_pos_change : POS变化的贡献
     """
     # 读取当年数据
-    trc_y, _, nodata_trc = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
-    sos_y, _, nodata_sos_y = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-    pos_y, _, nodata_pos_y = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
+    trc_file = TRC_DIR / f"TRc_{year}.tif"
+    sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
+    pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"
+
+    trc_y, trc_profile, nodata_trc = read_geotiff(trc_file)
+    sos_y, sos_profile, nodata_sos_y = read_geotiff(sos_file)
+    pos_y, pos_profile, nodata_pos_y = read_geotiff(pos_file)
+
+    # 空间一致性检查
+    check_spatial_consistency(ref_profile, trc_file, trc_profile, f"TRc_{year}")
+    check_spatial_consistency(ref_profile, sos_file, sos_profile, f"sos_gpp_{year}")
+    check_spatial_consistency(ref_profile, pos_file, pos_profile, f"pos_doy_gpp_{year}")
 
     height, width = trc_y.shape
 
-    # 有效性检查（与03b一致）
+    # 有效性检查（与03a/03b一致）
     valid = (
         _is_valid_value(trc_y, nodata_trc) &
         (trc_av != NODATA_OUT) &
@@ -153,8 +212,10 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
         _is_valid_value(pos_y, nodata_pos_y) &
         _is_valid_value(sos_av, nodata_sos) &
         _is_valid_value(pos_av, nodata_pos) &
-        (sos_y > 0) & (pos_y > 0) &
-        (sos_av > 0) & (pos_av > 0) &
+        (sos_y > 0) & (sos_y <= 366) &  # 允许闰年DOY=366
+        (pos_y > 0) & (pos_y <= 366) &  # 允许闰年DOY=366
+        (sos_av > 0) & (sos_av <= 366) &  # 允许闰年DOY=366
+        (pos_av > 0) & (pos_av <= 366) &  # 允许闰年DOY=366
         (pos_y >= sos_y) &
         (pos_av >= sos_av) &
         mask &
@@ -212,6 +273,7 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
 
     # 6. 进一步分解窗口变化为SOS和POS部分
     #    这部分需要更详细的估算
+    #    注意：避免np.where包裹_sum_cum_range，防止边界越界
 
     # SOS变化效应估算
     # 如果SOS_y < SOSav（提前），计算[SOS_y, SOSav-1]的贡献
@@ -219,23 +281,31 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     sos_before = sos_y_i < sos_av_i  # SOS提前
     sos_after = sos_y_i > sos_av_i   # SOS推迟
 
+    # 初始化SOS变化数组
+    sos_advance_clim = np.zeros((height, width), dtype=np.float32)
+    sos_delay_clim = np.zeros((height, width), dtype=np.float32)
+
     # SOS提前：估算[SOS_y, SOSav-1]在当年强度下的累积
-    # 近似：使用增强因子 × 气候态累积
-    sos_advance_clim = np.where(
-        sos_before,
-        _sum_cum_range(tr_cum, sos_y_i, sos_av_i - 1),
-        0.0
-    )
-    tr_sos_advance = enhancement_factor * sos_advance_clim
+    # 确保端点有效：sos_av_i > sos_y_i（即sos_av_i >= sos_y_i + 1，所以sos_av_i - 1 >= sos_y_i）
+    valid_advance = valid_sos & sos_before & (sos_av_i > sos_y_i)
+    if np.any(valid_advance):
+        sos_advance_clim[valid_advance] = _sum_cum_range(
+            tr_cum, sos_y_i, sos_av_i - 1
+        )[valid_advance]
 
     # SOS推迟：估算[SOSav, SOS_y-1]在当年强度下的累积（为负贡献）
-    sos_delay_clim = np.where(
-        sos_after,
-        _sum_cum_range(tr_cum, sos_av_i, sos_y_i - 1),
-        0.0
-    )
+    # 确保端点有效：sos_y_i > sos_av_i
+    valid_delay = valid_sos & sos_after & (sos_y_i > sos_av_i)
+    if np.any(valid_delay):
+        sos_delay_clim[valid_delay] = _sum_cum_range(
+            tr_cum, sos_av_i, sos_y_i - 1
+        )[valid_delay]
+
+    # 应用增强因子
+    tr_sos_advance = enhancement_factor * sos_advance_clim
     tr_sos_delay = enhancement_factor * sos_delay_clim
 
+    # 根据提前/推迟设置正负号
     tr_sos_change[valid_sos] = np.where(
         sos_before,
         tr_sos_advance,
@@ -246,20 +316,31 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     pos_after = pos_y_i > pos_av_i   # POS延后
     pos_before = pos_y_i < pos_av_i  # POS提前
 
-    pos_extend_clim = np.where(
-        pos_after,
-        _sum_cum_range(tr_cum, pos_av_i + 1, pos_y_i),
-        0.0
-    )
-    tr_pos_extend = enhancement_factor * pos_extend_clim
+    # 初始化POS变化数组
+    pos_extend_clim = np.zeros((height, width), dtype=np.float32)
+    pos_shorten_clim = np.zeros((height, width), dtype=np.float32)
 
-    pos_shorten_clim = np.where(
-        pos_before,
-        _sum_cum_range(tr_cum, pos_y_i + 1, pos_av_i),
-        0.0
-    )
+    # POS延后：估算[POSav+1, POS_y]在当年强度下的累积
+    # 确保端点有效：pos_av_i + 1 <= 365 且 pos_y_i >= pos_av_i + 1
+    valid_extend = valid_sos & pos_after & (pos_av_i < 365) & (pos_y_i > pos_av_i)
+    if np.any(valid_extend):
+        pos_extend_clim[valid_extend] = _sum_cum_range(
+            tr_cum, pos_av_i + 1, pos_y_i
+        )[valid_extend]
+
+    # POS提前：估算[POS_y+1, POSav]在当年强度下的累积（为负贡献）
+    # 确保端点有效：pos_y_i + 1 <= 365 且 pos_av_i >= pos_y_i + 1
+    valid_shorten = valid_sos & pos_before & (pos_y_i < 365) & (pos_av_i > pos_y_i)
+    if np.any(valid_shorten):
+        pos_shorten_clim[valid_shorten] = _sum_cum_range(
+            tr_cum, pos_y_i + 1, pos_av_i
+        )[valid_shorten]
+
+    # 应用增强因子
+    tr_pos_extend = enhancement_factor * pos_extend_clim
     tr_pos_shorten = enhancement_factor * pos_shorten_clim
 
+    # 根据延后/提前设置正负号
     tr_pos_change[valid_sos] = np.where(
         pos_after,
         tr_pos_extend,
@@ -284,11 +365,14 @@ def main():
     mask_file = ROOT / "Wang2025_Analysis" / "masks" / "combined_mask.tif"
     if not mask_file.exists():
         raise FileNotFoundError(f"Missing mask: {mask_file}")
-    mask, profile, mask_nodata = read_geotiff(mask_file)
+    mask, mask_profile, mask_nodata = read_geotiff(mask_file)
     mask = _is_valid_value(mask, mask_nodata) & (mask > 0)
 
     # Load climatology
     tr_daily_av, sos_av, pos_av, nodata_sos, nodata_pos, profile = load_climatology()
+
+    # 空间一致性检查
+    check_spatial_consistency(profile, mask_file, mask_profile, "combined_mask")
     tr_valid = np.any(np.isfinite(tr_daily_av), axis=0)
     tr_cum = np.nancumsum(tr_daily_av, axis=0).astype(np.float32)
 
@@ -299,6 +383,8 @@ def main():
     valid_av = (
         _is_valid_value(sos_av, nodata_sos) &
         _is_valid_value(pos_av, nodata_pos) &
+        (sos_av > 0) & (sos_av <= 366) &  # 允许闰年DOY=366，排除异常值
+        (pos_av > 0) & (pos_av <= 366) &  # 允许闰年DOY=366，排除异常值
         (pos_av_i >= sos_av_i) &
         mask & tr_valid
     )
@@ -314,12 +400,44 @@ def main():
     for year in tqdm(years, desc="Fixed-Window Decomposition"):
         tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change = decompose_year(
             year, tr_cum, trc_av, sos_av, pos_av,
-            nodata_sos, nodata_pos, mask, tr_valid
+            nodata_sos, nodata_pos, mask, tr_valid, profile
         )
         write_geotiff(OUTPUT_DIR / f"TR_window_change_{year}.tif", tr_window_change, profile)
         write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, profile)
         write_geotiff(OUTPUT_DIR / f"TR_sos_change_{year}.tif", tr_sos_change, profile)
         write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, profile)
+
+    # Quality check
+    print("\n[Quality Check]")
+    test_year = 2000
+    trc_test, _, nodata_trc_test = read_geotiff(TRC_DIR / f"TRc_{test_year}.tif")
+    tr_window_test, _, _ = read_geotiff(OUTPUT_DIR / f"TR_window_change_{test_year}.tif")
+    tr_fixed_test, _, _ = read_geotiff(OUTPUT_DIR / f"TR_fixed_window_{test_year}.tif")
+
+    valid_check = (
+        mask &
+        _is_valid_value(trc_test, nodata_trc_test) &
+        (trc_av != NODATA_OUT) &
+        (tr_window_test != NODATA_OUT) &
+        (tr_fixed_test != NODATA_OUT)
+    )
+
+    # 残差检验: TRc_y - TRc_av - TR_window_change - TR_fixed_window
+    residual = (trc_test[valid_check] - trc_av[valid_check] -
+                tr_window_test[valid_check] - tr_fixed_test[valid_check])
+
+    print(f"\n  Test year: {test_year}")
+    print(f"  Residual (TRc - TRc_av - TR_window_change - TR_fixed_window):")
+    print(f"    Mean: {np.mean(residual):.6f} mm")
+    print(f"    Std:  {np.std(residual):.6f} mm")
+    print(f"    Max:  {np.max(np.abs(residual)):.6f} mm")
+    print(f"    95th percentile: {np.percentile(np.abs(residual), 95):.6f} mm")
+    print(f"    99th percentile: {np.percentile(np.abs(residual), 99):.6f} mm")
+
+    if np.max(np.abs(residual)) < 1e-2:
+        print("  ✓ Quality check passed! Residual negligible.")
+    else:
+        print("  ⚠ Warning: Large residual detected, please check calculation.")
 
     print("\n✓ Fixed-Window decomposition complete.")
     print(f"Output: {OUTPUT_DIR}")

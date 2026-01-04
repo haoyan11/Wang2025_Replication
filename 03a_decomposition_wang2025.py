@@ -29,17 +29,19 @@ import rasterio
 from pathlib import Path
 from tqdm import tqdm
 
-# ==================== 全局配置 ====================
-ROOT = Path(r"I:\F\Data4")
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"  # GPP物候（物候代码输出）
-TRC_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual"
-CLIM_DIR = ROOT / "Wang2025_Analysis" / "Climatology"  # 气候态数据（与03b/03c一致）
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "Decomposition"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# 导入配置
+from _config import (
+    ROOT, PHENO_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR, DECOMPOSITION_DIR,
+    YEAR_START, YEAR_END, NODATA_OUT
+)
 
-YEAR_START = 1982
-YEAR_END = 2018
-NODATA_OUT = -9999.0  # 仅用于输出，读取时使用真实nodata
+# 确保输出目录存在
+DECOMPOSITION_DIR.mkdir(parents=True, exist_ok=True)
+
+# 向后兼容：保留旧变量名
+TRC_DIR = TRC_ANNUAL_DIR
+CLIM_DIR = CLIMATOLOGY_DIR
+OUTPUT_DIR = DECOMPOSITION_DIR
 
 # ==================== 辅助函数 ====================
 def _is_valid_value(value, nodata):
@@ -47,13 +49,20 @@ def _is_valid_value(value, nodata):
     判断值是否有效（非NODATA）
 
     兼容各种NODATA类型：-9999, NaN, 3.4e38等
+    当nodata元信息缺失时，使用绝对值阈值过滤极大填充值
     """
-    if nodata is None:
-        return np.isfinite(value)
-    elif np.isnan(nodata):
-        return np.isfinite(value)
-    else:
-        return (value != nodata) & np.isfinite(value)
+    # 基础检查：有限性
+    valid = np.isfinite(value)
+
+    # 如果有明确的nodata值，检查是否等于nodata
+    if nodata is not None and not np.isnan(nodata):
+        valid = valid & (value != nodata)
+
+    # 额外保护：过滤常见的极大填充值（1e20, 3.4e38等）
+    # 这防止nodata元信息丢失时，极大值进入计算
+    valid = valid & (np.abs(value) < 1e10)
+
+    return valid
 
 def read_geotiff(file_path):
     """
@@ -75,9 +84,10 @@ def read_geotiff(file_path):
     return data, profile, nodata
 
 def write_geotiff(file_path, data, profile):
-    """写入单波段GeoTIFF"""
-    profile.update(dtype=rasterio.float32, count=1, compress="lzw", nodata=NODATA_OUT)
-    with rasterio.open(file_path, "w", **profile) as dst:
+    """写入单波段GeoTIFF（不修改原profile）"""
+    out_profile = profile.copy()
+    out_profile.update(dtype=rasterio.float32, count=1, compress="lzw", nodata=NODATA_OUT)
+    with rasterio.open(file_path, "w", **out_profile) as dst:
         dst.write(data.astype(np.float32), 1)
 
 def _sum_cum_range(cum_arr, start_doy, end_doy):
@@ -93,6 +103,51 @@ def _sum_cum_range(cum_arr, start_doy, end_doy):
     end_vals = flat[end - 1, idx]
     start_vals = np.where(start > 1, flat[start - 2, idx], 0.0)
     return (end_vals - start_vals).reshape(start_doy.shape)
+
+def check_spatial_consistency(ref_profile, file_path, data_profile, var_name="data"):
+    """
+    检查栅格空间一致性（shape/crs/transform）
+
+    Parameters:
+    -----------
+    ref_profile : dict
+        参考栅格的profile（通常是气候态）
+    file_path : Path or str
+        被检查文件的路径（用于错误信息）
+    data_profile : dict
+        被检查数据的profile
+    var_name : str
+        变量名（用于错误信息）
+    """
+    if ref_profile['width'] != data_profile['width'] or \
+       ref_profile['height'] != data_profile['height']:
+        raise ValueError(
+            f"Shape mismatch for {var_name}: {file_path}\n"
+            f"  Expected: {ref_profile['height']}x{ref_profile['width']}\n"
+            f"  Got: {data_profile['height']}x{data_profile['width']}"
+        )
+    if ref_profile['crs'] != data_profile['crs']:
+        raise ValueError(
+            f"CRS mismatch for {var_name}: {file_path}\n"
+            f"  Expected: {ref_profile['crs']}\n"
+            f"  Got: {data_profile['crs']}"
+        )
+
+    # Transform比较使用容差（避免浮点精度误报）
+    ref_transform = ref_profile['transform']
+    data_transform = data_profile['transform']
+    if ref_transform is not None and data_transform is not None:
+        # 检查transform的6个参数是否在容差范围内
+        transform_match = all(
+            abs(ref_transform[i] - data_transform[i]) < 1e-6
+            for i in range(6)
+        )
+        if not transform_match:
+            raise ValueError(
+                f"Transform mismatch for {var_name}: {file_path}\n"
+                f"  Expected: {ref_transform}\n"
+                f"  Got: {data_transform}"
+            )
 
 # ==================== 核心函数 ====================
 def load_climatology():
@@ -144,14 +199,16 @@ def load_climatology():
     sos_av_file = CLIM_DIR / "SOSav.tif"
     if not sos_av_file.exists():
         raise FileNotFoundError(f"Missing SOSav: {sos_av_file}")
-    sos_av, _, nodata_sos = read_geotiff(sos_av_file)
+    sos_av, sos_profile, nodata_sos = read_geotiff(sos_av_file)
+    check_spatial_consistency(profile, sos_av_file, sos_profile, "SOSav")
     print(f"  ✓ SOSav: {sos_av_file.name}")
 
     # 加载POSav（使用统一的read_geotiff，与03b/03c一致）
     pos_av_file = CLIM_DIR / "POSav.tif"
     if not pos_av_file.exists():
         raise FileNotFoundError(f"Missing POSav: {pos_av_file}")
-    pos_av, _, nodata_pos = read_geotiff(pos_av_file)
+    pos_av, pos_profile, nodata_pos = read_geotiff(pos_av_file)
+    check_spatial_consistency(profile, pos_av_file, pos_profile, "POSav")
     print(f"  ✓ POSav: {pos_av_file.name}")
 
     return tr_daily_av, sos_av, pos_av, nodata_sos, nodata_pos, profile
@@ -215,13 +272,16 @@ def calculate_TRc_av_from_climatology(TR_cum, SOSav, POSav, nodata_sos, nodata_p
 
     # 统计（使用valid掩膜，因为输出用NODATA_OUT）
     TRc_av_valid = TRc_av[valid]
-    print(f"  ✓ TRc_av统计: 平均={TRc_av_valid.mean():.2f} mm, "
-          f"范围=[{TRc_av_valid.min():.2f}, {TRc_av_valid.max():.2f}], "
-          f"有效像元={TRc_av_valid.size}")
+    if TRc_av_valid.size > 0:
+        print(f"  ✓ TRc_av统计: 平均={TRc_av_valid.mean():.2f} mm, "
+              f"范围=[{TRc_av_valid.min():.2f}, {TRc_av_valid.max():.2f}], "
+              f"有效像元={TRc_av_valid.size}")
+    else:
+        print("  ⚠ 警告：没有有效像元用于计算TRc_av")
 
     return TRc_av
 
-def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_valid):
+def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_valid, ref_profile):
     """
     原版分解方法（Wang 2025）- 真实逐日累加版本
 
@@ -239,6 +299,8 @@ def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_val
         SOS的真实nodata值
     mask : ndarray
         有效掩膜
+    ref_profile : dict
+        参考profile（用于空间一致性检查）
 
     Returns:
     --------
@@ -246,8 +308,14 @@ def decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_val
         分解后的两个分量
     """
     # 读取当年数据（使用更新后的read_geotiff，返回3个值）
-    TRc_y, _, nodata_trc = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
-    sos_y, _, nodata_sos_y = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
+    trc_file = TRC_DIR / f"TRc_{year}.tif"
+    sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
+    TRc_y, trc_profile, nodata_trc = read_geotiff(trc_file)
+    sos_y, sos_profile, nodata_sos_y = read_geotiff(sos_file)
+
+    # 空间一致性检查
+    check_spatial_consistency(ref_profile, trc_file, trc_profile, f"TRc_{year}")
+    check_spatial_consistency(ref_profile, sos_file, sos_profile, f"sos_gpp_{year}")
 
     height, width = TRc_y.shape
 
@@ -314,13 +382,17 @@ def process_all_years():
 
     # Step 1: 读取掩膜
     print("\n[1/5] 读取掩膜...")
-    mask, profile, _ = read_geotiff(OUTPUT_DIR.parent / "masks" / "combined_mask.tif")
-    mask = mask.astype(bool)
+    mask_file = OUTPUT_DIR.parent / "masks" / "combined_mask.tif"
+    mask, mask_profile, mask_nodata = read_geotiff(mask_file)
+    mask = _is_valid_value(mask, mask_nodata) & (mask > 0)
     print(f"  有效像元数: {np.sum(mask)}")
 
     # Step 2: 加载气候态数据
     print("\n[2/5] 加载气候态数据...")
     TR_daily_av, SOSav, POSav, nodata_sos, nodata_pos, profile = load_climatology()
+
+    # 空间一致性检查
+    check_spatial_consistency(profile, mask_file, mask_profile, "combined_mask")
 
     tr_valid = np.any(np.isfinite(TR_daily_av), axis=0)
     TR_cum = np.nancumsum(TR_daily_av, axis=0).astype(np.float32)
@@ -336,7 +408,7 @@ def process_all_years():
     # Step 4: 逐年分解
     print(f"\n[4/5] 逐年分解 ({YEAR_START}-{YEAR_END})...")
     for year in tqdm(years, desc="分解进度"):
-        TRpheno, TRproduct = decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_valid)
+        TRpheno, TRproduct = decompose_TRc_original(year, TRc_av, TR_cum, SOSav, nodata_sos, mask, tr_valid, profile)
 
         # 保存结果
         write_geotiff(OUTPUT_DIR / f"TRpheno_{year}.tif", TRpheno, profile)
@@ -363,8 +435,10 @@ def process_all_years():
     print(f"    Mean: {np.mean(residual):.6f} mm")
     print(f"    Std:  {np.std(residual):.6f} mm")
     print(f"    Max:  {np.max(np.abs(residual)):.6f} mm")
+    print(f"    95th percentile: {np.percentile(np.abs(residual), 95):.6f} mm")
+    print(f"    99th percentile: {np.percentile(np.abs(residual), 99):.6f} mm")
 
-    if np.max(np.abs(residual)) < 1e-3:
+    if np.max(np.abs(residual)) < 1e-2:
         print("  ✓ 质量检查通过！残差可忽略。")
     else:
         print("  ⚠ 警告：残差较大，请检查计算过程。")

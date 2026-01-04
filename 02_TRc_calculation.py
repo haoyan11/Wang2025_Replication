@@ -16,18 +16,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-# ==================== 全局配置 ====================
-ROOT = Path(r"I:\F\Data4")
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"  # GPP物候（与config.py一致）
-TR_DAILY_DIR = ROOT / "Meteorological Data" / "ERA5_Land" / "ET_components" / "ET_transp" / "ET_transp_Daily" / "ET_transp_Daily_2"  # ERA5-Land TR数据
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "TRc_annual"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# 导入配置
+from _config import (
+    ROOT, PHENO_DIR, TR_DAILY_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
+    YEAR_START, YEAR_END, BLOCK_SIZE, MAX_WORKERS, NODATA_OUT
+)
 
-YEAR_START = 1982
-YEAR_END = 2018
-BLOCK_SIZE = 128
-MAX_WORKERS = 2
-NODATA_OUT = -9999.0
+# 确保输出目录存在
+TRC_ANNUAL_DIR.mkdir(parents=True, exist_ok=True)
+CLIMATOLOGY_DIR.mkdir(parents=True, exist_ok=True)
+
+# 向后兼容：保留OUTPUT_DIR别名
+OUTPUT_DIR = TRC_ANNUAL_DIR
 
 # ==================== 辅助函数 ====================
 def get_TR_file_path(date_obj):
@@ -85,11 +85,19 @@ def calculate_TRc_for_year(year, mask):
 
     with rasterio.open(sos_file) as src:
         sos = src.read(1)
-        profile = src.profile.copy()
         height, width = src.height, src.width
 
     with rasterio.open(pos_file) as src:
         pos = src.read(1)
+
+    # 从TR数据获取profile（确保使用EPSG:4326 CRS）
+    test_date = datetime(year, 1, 15)
+    test_tr_file = get_TR_file_path(test_date)
+    if test_tr_file is None or not test_tr_file.exists():
+        print(f"  ✗ 错误：找不到TR数据文件用于获取profile")
+        return None, None
+    with rasterio.open(test_tr_file) as src:
+        profile = src.profile.copy()
 
     # 初始化TRc数组
     TRc = np.zeros((height, width), dtype=np.float32)
@@ -193,13 +201,21 @@ def calculate_TRc_block_optimized(year, mask):
 
     with rasterio.open(sos_file) as src:
         sos = src.read(1)
-        profile = src.profile.copy()
         height, width = src.height, src.width
         nodata_sos = src.nodata  # ✅ 读取真实nodata
 
     with rasterio.open(pos_file) as src:
         pos = src.read(1)
         nodata_pos = src.nodata  # ✅ 读取真实nodata
+
+    # 从TR数据获取profile（确保使用EPSG:4326 CRS）
+    test_date = datetime(year, 1, 15)
+    test_tr_file = get_TR_file_path(test_date)
+    if test_tr_file is None or not test_tr_file.exists():
+        print(f"  ✗ 错误：找不到TR数据文件用于获取profile")
+        return None, None
+    with rasterio.open(test_tr_file) as src:
+        profile = src.profile.copy()
 
     days_in_year = 366 if is_leap_year(year) else 365
     dates_year = [datetime(year, 1, 1) + timedelta(days=i) for i in range(days_in_year)]
@@ -360,9 +376,14 @@ def calculate_daily_TR_climatology(years, mask):
         for date_obj in dates_year:
             doy = date_obj.timetuple().tm_yday
 
-            # 闰年处理：2月29日（第60天）合并到2月28日（索引59）
-            if is_leap_year(year) and doy >= 60:
-                doy_idx = min(doy - 1, 364)  # 60->59, 61->60, ..., 366->364
+            # 闰年处理：跳过2月29日，3月1日之后DOY-2映射到0-based索引
+            if is_leap_year(year):
+                if doy == 60:
+                    continue  # 跳过2月29日（DOY=60）
+                elif doy > 60:
+                    doy_idx = doy - 2  # 61->59(3月1日), 62->60, ..., 366->364
+                else:
+                    doy_idx = doy - 1  # 1->0, ..., 59->58(2月28日)
             else:
                 doy_idx = doy - 1  # 1-based to 0-based
 
@@ -412,7 +433,7 @@ def calculate_daily_TR_climatology(years, mask):
 
     return TR_climatology, profile
 
-def calculate_phenology_climatology(years):
+def calculate_phenology_climatology(years, mask):
     """
     计算多年平均物候（SOSav, POSav）
 
@@ -420,11 +441,13 @@ def calculate_phenology_climatology(years):
     -----------
     years : list
         年份列表
+    mask : ndarray
+        有效掩膜（布尔数组），用于保持与TR气候态的空间一致性
 
     Returns:
     --------
     SOSav, POSav : ndarray, shape (H, W)
-        多年平均SOS和POS
+        多年平均SOS和POS（仅在mask区域内有效）
     profile : dict
         栅格配置
     """
@@ -451,17 +474,27 @@ def calculate_phenology_climatology(years):
             pos = src.read(1)
             nodata_pos = src.nodata
 
-        # 转换为NaN用于计算
-        sos_masked = np.where(
-            (sos == nodata_sos) if nodata_sos is not None and not np.isnan(nodata_sos)
-            else ~np.isfinite(sos),
-            np.nan, sos
+        # 构建有效物候掩膜（与TRc计算逻辑一致）
+        def _is_valid_pheno_value(arr, nodata):
+            """检查物候值是否有效"""
+            if nodata is None:
+                return np.isfinite(arr)
+            if np.isnan(nodata):
+                return np.isfinite(arr)
+            return (arr != nodata) & np.isfinite(arr)
+
+        valid = (
+            mask &
+            _is_valid_pheno_value(sos, nodata_sos) &
+            _is_valid_pheno_value(pos, nodata_pos) &
+            (sos > 0) & (sos <= 365) &  # 合法DOY范围
+            (pos > 0) & (pos <= 365) &  # 合法DOY范围
+            (pos >= sos)  # POS必须>=SOS
         )
-        pos_masked = np.where(
-            (pos == nodata_pos) if nodata_pos is not None and not np.isnan(nodata_pos)
-            else ~np.isfinite(pos),
-            np.nan, pos
-        )
+
+        # 转换为NaN（无效值设为NaN，不参与多年平均）
+        sos_masked = np.where(valid, sos, np.nan)
+        pos_masked = np.where(valid, pos, np.nan)
 
         sos_stack.append(sos_masked)
         pos_stack.append(pos_masked)
@@ -474,13 +507,13 @@ def calculate_phenology_climatology(years):
         SOSav = np.nanmean(sos_stack, axis=0)
         POSav = np.nanmean(pos_stack, axis=0)
 
-        # 恢复NODATA
-        SOSav = np.where(np.isnan(SOSav), NODATA_OUT, SOSav)
-        POSav = np.where(np.isnan(POSav), NODATA_OUT, POSav)
+        # 应用掩膜：仅保留mask区域的数据，保持与TR气候态一致
+        SOSav = np.where(mask & np.isfinite(SOSav), SOSav, NODATA_OUT)
+        POSav = np.where(mask & np.isfinite(POSav), POSav, NODATA_OUT)
 
     # 统计
-    sos_valid = SOSav[SOSav != NODATA_OUT]
-    pos_valid = POSav[POSav != NODATA_OUT]
+    sos_valid = SOSav[(SOSav != NODATA_OUT) & mask]
+    pos_valid = POSav[(POSav != NODATA_OUT) & mask]
 
     print(f"  SOSav统计: 平均={sos_valid.mean():.1f} DOY, "
           f"范围=[{sos_valid.min():.0f}, {sos_valid.max():.0f}], "
@@ -506,9 +539,8 @@ def save_climatology_data():
     print("计算多年平均气候态数据（用于TRc原版分解）")
     print("="*70)
 
-    # 创建输出目录
-    climatology_dir = ROOT / "Wang2025_Analysis" / "Climatology"
-    climatology_dir.mkdir(parents=True, exist_ok=True)
+    # 使用配置文件中的输出目录（已在脚本开头创建）
+    climatology_dir = CLIMATOLOGY_DIR
 
     years = list(range(YEAR_START, YEAR_END + 1))
 
@@ -553,18 +585,24 @@ def save_climatology_data():
 
     # 计算物候气候态
     print("\n[3/3] 计算物候气候态（SOSav, POSav）...")
-    SOSav, POSav, profile = calculate_phenology_climatology(years)
+    SOSav, POSav, _ = calculate_phenology_climatology(years, mask)
 
-    # 保存SOSav
+    # 保存SOSav（使用profile_tr以确保CRS和空间参考与TR_daily_climatology一致）
     output_sos = climatology_dir / "SOSav.tif"
-    profile.update(dtype=rasterio.float32, count=1, compress='lzw', nodata=NODATA_OUT)
-    with rasterio.open(output_sos, 'w', **profile) as dst:
+    profile_sos = profile_tr.copy()
+    profile_sos.update(
+        dtype=rasterio.float32,
+        count=1,
+        compress='lzw',
+        nodata=NODATA_OUT
+    )
+    with rasterio.open(output_sos, 'w', **profile_sos) as dst:
         dst.write(SOSav.astype(np.float32), 1)
     print(f"  ✓ 已保存: {output_sos}")
 
     # 保存POSav
     output_pos = climatology_dir / "POSav.tif"
-    with rasterio.open(output_pos, 'w', **profile) as dst:
+    with rasterio.open(output_pos, 'w', **profile_sos) as dst:
         dst.write(POSav.astype(np.float32), 1)
     print(f"  ✓ 已保存: {output_pos}")
 

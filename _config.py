@@ -18,7 +18,7 @@ GLEAM_ROOT = ROOT / "Meteorological Data" / "GLEAM"
 TR_DAILY_DIR = ROOT / "Meteorological Data" / "ERA5_Land" / "ET_components" / "ET_transp" / "ET_transp_Daily" / "ET_transp_Daily_2"
 
 # 土壤水分路径（GLEAM） - 推荐使用深层SMrz
-SM_DAILY_DIR = GLEAM_ROOT / "SMrz" / "SMrz_Daily"      # 深层土壤水分（日尺度）- 推荐
+SM_DAILY_DIR = GLEAM_ROOT / "SMrz" / "SMrz_Daily_1"    # 深层土壤水分（日尺度）- 推荐
 # SM_DAILY_DIR = GLEAM_ROOT / "SMs" / "SMs_Daily"      # 表层土壤水分（日尺度）- 备选
 
 # GPP数据路径
@@ -30,8 +30,10 @@ SIF_DAILY_DIR = ROOT / "SIF_Data" / "CSIF_daily"       # 日尺度SIF（暂未�
 SIF_ANNUAL_DIR = ROOT / "SIF_Data" / "CSIF_annual"     # 年度SIF总量（暂未使用）
 
 # 物候数据路径（从物候代码输出）
-# 选项1: 使用GPP物候（推荐，已计算）
-PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
+# 选项1: 使用GPP物候（推荐，已重投影到EPSG:4326）
+PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology_EPSG4326"
+# 原始Clarke 1866数据（已弃用，使用上面的EPSG:4326版本）
+# PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
 # 选项2: 使用T物候（对比分析）
 # PHENO_DIR = ROOT / "Phenology_Output_1" / "T_phenology"
 # 选项3: 使用SIF物候（需单独提取）
@@ -42,6 +44,14 @@ LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"
 
 # 输出目录
 OUTPUT_ROOT = ROOT / "Wang2025_Analysis"
+TRC_ANNUAL_DIR = OUTPUT_ROOT / "TRc_annual"              # TRc年度输出（02代码）
+CLIMATOLOGY_DIR = OUTPUT_ROOT / "Climatology"            # 气候态数据（02代码）
+DECOMPOSITION_DIR = OUTPUT_ROOT / "Decomposition"        # 分解结果（03a代码）
+DECOMPOSITION_TIMING_DIR = OUTPUT_ROOT / "Decomposition_TimingShape"  # 时序/形状分解（03b代码）
+DECOMPOSITION_FIXED_DIR = OUTPUT_ROOT / "Decomposition_FixedWindow"   # 固定窗口分解（03c代码）
+STATISTICAL_DIR = OUTPUT_ROOT / "Statistical_Analysis"   # 统计分析（04a代码）
+STATISTICAL_TIMING_DIR = OUTPUT_ROOT / "Statistical_Analysis_TimingShape"   # 统计分析（04b代码）
+STATISTICAL_FIXED_DIR = OUTPUT_ROOT / "Statistical_Analysis_FixedWindow"     # 统计分析（04c代码）
 
 # ==================== 分析参数配置 ====================
 
@@ -216,7 +226,8 @@ def get_annual_file_path(var_name, year):
     if var_name == 'SIF':
         return SIF_ANNUAL_DIR / f"SIF_annual_{year}.tif"
     elif var_name == 'SM':
-        return SM_ROOT_DIR / f"SMrz_{year}.tif"
+        # 年度SM文件位于SM_DAILY_DIR的父目录
+        return GLEAM_ROOT / "SMrz" / f"SMrz_{year}.tif"
     elif var_name == 'TRc':
         return OUTPUT_ROOT / "TRc_annual" / f"TRc_{year}.tif"
     else:

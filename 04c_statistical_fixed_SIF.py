@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module 04C: 统计分析 - Fixed Window Decomposition (Sections 3.2 & 3.3)
+Module 04C-Fixed-SIF: 统计分析 - Fixed Window (固定窗口SIF版本)
+
+[TEST VERSION] 诊断测试：使用与气候因子时间尺度一致的SIF
+
+目的：测试SIF时间尺度的影响
+- 原版：SIFspr（固定春季）+ SIFsum（固定夏季）
+- 本版：SIF_fixed（固定窗口[SOSav, POSav]内的GPP均值）
+
+关键差异：
+  原版：SIFspr = GPP(DOY 1-120), SIFsum = GPP(DOY 121-240)
+  本版：SIF_fixed = GPP(SOSav → POSav)（每个像元一致的窗口）
+
+预测变量（6个）：
+  - SOS (物候)
+  - Ta, Rs, P, SMroot (气候因子，固定窗口[SOSav, POSav])
+  - SIF_fixed (固定窗口[SOSav, POSav]内的GPP均值)
 
 Section 3.2: ΔSOS regression for fixed-window decomposition outputs
-    - 固定窗口速率 vs ΔSOS
-    - Regressions (pixel-wise):
-      - TR_fixed_window ~ ΔSOS  (固定窗口累积差异)
-      - Fixed_Trate ~ ΔSOS      (固定窗口速率差异) [CORE METRIC]
-      - TR_window_change ~ ΔSOS (窗口变化累积)
-      - TR_sos_change ~ ΔSOS    (SOS变化贡献)
-      - TR_pos_change ~ ΔSOS    (POS变化贡献)
-
-Section 3.3: Drivers of TR_fixed_window decrease with spring phenology change
-    - 偏相关归因分析（控制其他变量）
-    - 15年滑动窗口偏相关演变
-    - Theil-Sen趋势 + Mann-Kendall检验
-
-核心优势：
-  - Fixed_Trate = TR_fixed_window / Fixed_Window_Length
-  - 在固定窗口[SOSav, POSav]内计算，剥离窗口选择效应
-  - 直接回答："蒸腾速率是否真的变高变低？"
+Section 3.3: Drivers of Fixed_Trate (partial correlation analysis)
 
 核心方法：
-- ΔSOS = SOS_year - SOSav (标准异常定义，advance < 0)
-- 偏相关（控制其他变量，Z-score，Wang 2025 Eq. 3）
-- VIF > 10 的变量剔除
-- 主驱动因子判定: |R| > 0.1
+- ΔSOS = SOS_year - SOSav
+- 偏相关（Z-score标准化，VIF > 10剔除）
+- 所有变量使用相同的固定窗口[SOSav, POSav]
 """
 
 import os
@@ -63,7 +61,8 @@ from _config import (
     YEAR_START, YEAR_END, NODATA_OUT
 )
 
-# 确保输出目录存在
+# [FIXED-SIF VERSION] 修改输出目录（避免与其他版本冲突）
+STATISTICAL_FIXED_DIR = STATISTICAL_FIXED_DIR.parent / "Statistical_Analysis_FixedWindow_FixedSIF"
 STATISTICAL_FIXED_DIR.mkdir(parents=True, exist_ok=True)
 
 # 向后兼容：保留旧变量名
@@ -1332,6 +1331,112 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
     return lsp_avg
 
 
+def calculate_lsp_period_average_gpp(year, sos_map, pos_map):
+    """
+    计算LSP期间的GPP平均值（使用日尺度GPP数据）
+
+    与calculate_lsp_period_average类似，但用于GPP数据
+
+    Parameters:
+    -----------
+    year : int
+        年份
+    sos_map : ndarray
+        SOS地图 (H, W)，单位：DOY
+    pos_map : ndarray
+        POS地图 (H, W)，单位：DOY
+
+    Returns:
+    --------
+    gpp_avg : ndarray
+        LSP期间GPP平均值 (H, W)
+    """
+    height, width = sos_map.shape
+
+    # 检查GPP文件是否存在
+    if not _has_gpp_files(year):
+        return np.full((height, width), np.nan, dtype=np.float32)
+
+    sos_int = np.rint(sos_map).astype(np.int32)
+    pos_int = np.rint(pos_map).astype(np.int32)
+
+    valid = (
+        np.isfinite(sos_map) & np.isfinite(pos_map) &
+        (sos_int > 0) & (pos_int > 0) &
+        (pos_int >= sos_int) &
+        (sos_int <= 366) & (pos_int <= 366)  # 允许闰年DOY=366
+    )
+
+    # Clip到365以匹配365天数据
+    sos_int = np.clip(sos_int, 1, 365)
+    pos_int = np.clip(pos_int, 1, 365)
+
+    if not np.any(valid):
+        return np.full((height, width), np.nan, dtype=np.float32)
+
+    doy_start = int(np.nanmin(sos_int[valid]))
+    doy_end = int(np.nanmax(pos_int[valid]))
+    doy_start = max(1, min(365, doy_start))
+    doy_end = max(1, min(365, doy_end))
+
+    # 读取GPP日数据
+    file_doy_pairs = []
+    for doy in range(doy_start, doy_end + 1):
+        date_str = (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y%m%d")
+        gpp_file = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_str)
+        if gpp_file.exists():
+            file_doy_pairs.append((gpp_file, doy))
+
+    # 多线程并行读取所有文件
+    def _read_gpp_lsp(args):
+        """工作线程：读取单个GPP文件并处理"""
+        file_path, doy = args
+        data, profile, nodata = read_geotiff(file_path)
+        valid_data = _is_valid_value(data, nodata)
+        return doy, data.astype(np.float32), valid_data, profile
+
+    daily_data_dict = {}  # {doy: (data_array, valid_mask)}
+    profile_template = None
+
+    with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
+        # 提交所有读取任务
+        futures = [executor.submit(_read_gpp_lsp, pair) for pair in file_doy_pairs]
+
+        # 收集结果
+        for future in futures:
+            doy, data, valid_data, profile = future.result()
+            if profile_template is None:
+                profile_template = profile
+            daily_data_dict[doy] = (data, valid_data)
+
+    # 从内存字典中提取数据并计算
+    total_sum = np.zeros((height, width), dtype=np.float32)
+    total_cnt = np.zeros((height, width), dtype=np.int16)
+
+    for doy in range(doy_start, doy_end + 1):
+        if doy not in daily_data_dict:
+            continue
+
+        in_window = valid & (sos_int <= doy) & (pos_int >= doy)
+        if not np.any(in_window):
+            continue
+
+        data, valid_data = daily_data_dict[doy]
+        use_mask = in_window & valid_data
+
+        if not np.any(use_mask):
+            continue
+
+        total_sum[use_mask] += data[use_mask]
+        total_cnt[use_mask] += 1
+
+    window_len = pos_int - sos_int + 1
+    gpp_avg = np.full((height, width), np.nan, dtype=np.float32)
+    good = valid & (total_cnt >= 0.6 * window_len)
+    gpp_avg[good] = total_sum[good] / total_cnt[good]
+
+    return gpp_avg
+
 
 # ==================== Section 3.3: 驱动因子分析 ====================
 def section_3_3_driver_analysis(mask):
@@ -1369,23 +1474,30 @@ def section_3_3_driver_analysis(mask):
     data_first, profile, _ = read_geotiff(TRC_DIR / f"TRc_{years[0]}.tif")
     height, width = data_first.shape
 
-    # 定义变量（Wang 2025 Eq. 3）
+    # 定义变量（Fixed-window SIF版本）
     # 统一因变量：移除TR_fixed_window（固定窗口累积差异），仅保留TRc和Fixed_Trate（固定窗口速率异常）
     response_vars = ['TRc', 'Fixed_Trate']
-    # 注意：SIFspr/SIFsum 实际使用日尺度 GPP 的季节均值作为代理
-    predictor_vars = ['SOS', 'SMroot', 'Ta', 'Rs', 'P', 'SIFspr', 'SIFsum']
+    # [TEST] 使用固定窗口SIF：SIF_fixed = GPP在[SOSav, POSav]内的均值
+    predictor_vars = ['SOS', 'SMroot', 'Ta', 'Rs', 'P', 'SIF_fixed']
+    print(f"\n[FIXED-SIF TEST] Using fixed-window SIF (same timescale as climate factors)")
+    print(f"  Original: SIFspr = GPP(DOY 1-120), SIFsum = GPP(DOY 121-240)")
+    print(f"  Modified: SIF_fixed = GPP(SOSav -> POSav) for each pixel")
+    print(f"  Predictors: {', '.join(predictor_vars)}\n")
+
     available_vars = []
     missing_vars = []
     for var in predictor_vars:
         if var == 'SOS':
             available_vars.append(var)
             continue
-        if var in ('SIFspr', 'SIFsum'):
+        if var == 'SIF_fixed':
+            # 检查GPP文件
             if _has_gpp_files(years[0]) or _has_gpp_files(years[-1]):
                 available_vars.append(var)
             else:
                 missing_vars.append(var)
             continue
+        # 气候因子检查
         if var not in DAILY_VAR_SPECS:
             missing_vars.append(var)
             continue
@@ -1454,20 +1566,15 @@ def section_3_3_driver_analysis(mask):
             lsp_avg_fixed = calculate_lsp_period_average(var, year, sos_climatology, pos_climatology)
             X_all_years_fixed[var].append(lsp_avg_fixed)
 
-        # SIFspr/SIFsum（两套相同，因为是季节固定定义）
-        if 'SIFspr' in predictor_vars:
-            gpp_spring = calculate_seasonal_gpp(year, season='spring')
-            if gpp_spring is None:
-                gpp_spring = np.full((height, width), np.nan)
-            X_all_years_actual['SIFspr'].append(gpp_spring)
-            X_all_years_fixed['SIFspr'].append(gpp_spring)
+        # SIF_fixed：使用固定窗口[SOSav, POSav]内的GPP均值（与气候因子时间尺度一致）
+        if 'SIF_fixed' in predictor_vars:
+            # 对于TRc，使用实际窗口[SOS_year, POS_year]
+            gpp_actual = calculate_lsp_period_average_gpp(year, sos_map, pos_map)
+            X_all_years_actual['SIF_fixed'].append(gpp_actual)
 
-        if 'SIFsum' in predictor_vars:
-            gpp_summer = calculate_seasonal_gpp(year, season='summer')
-            if gpp_summer is None:
-                gpp_summer = np.full((height, width), np.nan)
-            X_all_years_actual['SIFsum'].append(gpp_summer)
-            X_all_years_fixed['SIFsum'].append(gpp_summer)
+            # 对于Fixed_Trate，使用固定窗口[SOSav, POSav]
+            gpp_fixed = calculate_lsp_period_average_gpp(year, sos_climatology, pos_climatology)
+            X_all_years_fixed['SIF_fixed'].append(gpp_fixed)
 
     # 转换为numpy数组
     for var in predictor_vars:
@@ -1969,6 +2076,89 @@ def main():
             print_sign_split=True
         )
 
+    # ========== 诊断验证：简单Pearson相关系数 vs 回归系数 ==========
+    print("\n" + "=" * 80)
+    print("[诊断验证] 计算SOS与Fixed_Trate的简单Pearson相关系数")
+    print("=" * 80)
+    print("目的：如果相关系数显著性远低于回归系数显著性(71.7%)，则说明回归计算有问题\n")
+
+    # 计算每个像元的Pearson相关系数
+    y_data = response_data['Fixed_Trate']
+    x_data = delta_sos_stack
+
+    n_years = x_data.shape[0]
+    H, W = x_data.shape[1], x_data.shape[2]
+
+    pearson_r = np.full((H, W), np.nan, dtype=np.float32)
+    pearson_p = np.full((H, W), np.nan, dtype=np.float32)
+
+    # 逐像元计算
+    for i in range(H):
+        for j in range(W):
+            x_pixel = x_data[:, i, j]
+            y_pixel = y_data[:, i, j]
+
+            # 有效数据掩膜
+            valid = np.isfinite(x_pixel) & np.isfinite(y_pixel)
+            n_valid = np.sum(valid)
+
+            if n_valid >= max(3, int(n_years * 0.6)):
+                x_v = x_pixel[valid]
+                y_v = y_pixel[valid]
+
+                # Pearson相关系数
+                mean_x = np.mean(x_v)
+                mean_y = np.mean(y_v)
+                dx = x_v - mean_x
+                dy = y_v - mean_y
+
+                cov_xy = np.mean(dx * dy)
+                var_x = np.mean(dx * dx)
+                var_y = np.mean(dy * dy)
+
+                if var_x > 0 and var_y > 0:
+                    r = cov_xy / np.sqrt(var_x * var_y)
+                    pearson_r[i, j] = r
+
+                    # t检验
+                    df = n_valid - 2
+                    if df > 0 and abs(r) < 0.999999:
+                        t_stat = r * np.sqrt(df / (1 - r**2))
+                        from scipy import stats as sp_stats
+                        p_val = 2 * (1 - sp_stats.t.cdf(np.abs(t_stat), df=df))
+                        pearson_p[i, j] = p_val
+
+    # 统计结果
+    valid_mask_pearson = np.isfinite(pearson_r) & np.isfinite(pearson_p) & mask
+    if np.sum(valid_mask_pearson) > 0:
+        r_valid = pearson_r[valid_mask_pearson]
+        p_valid = pearson_p[valid_mask_pearson]
+
+        sig_mask = p_valid < 0.05
+        n_sig = np.sum(sig_mask)
+        pct_sig = n_sig / len(p_valid) * 100
+
+        print(f"  === Pearson相关系数统计（SOS vs Fixed_Trate）===\n")
+        print(f"    有效像元数: {len(r_valid)}")
+        print(f"    平均相关系数: {np.mean(r_valid):.4f} ± {np.std(r_valid):.4f}")
+        print(f"    中位相关系数: {np.median(r_valid):.4f}")
+        print(f"    显著性像元 (p<0.05): {n_sig} ({pct_sig:.1f}%)")
+
+        if n_sig > 0:
+            r_sig = r_valid[sig_mask]
+            print(f"    显著像元平均r: {np.mean(r_sig):.4f} ± {np.std(r_sig):.4f}")
+
+        print(f"\n  对比：回归系数显著性比例 = 71.7%")
+        print(f"        相关系数显著性比例 = {pct_sig:.1f}%")
+
+        diff = abs(pct_sig - 71.7)
+        if diff < 5:
+            print(f"  [OK] 两者接近（差异{diff:.1f}%），回归计算正确")
+        else:
+            print(f"  [WARNING] 两者差异较大（差异{diff:.1f}%），需要检查计算逻辑")
+
+    print("=" * 80 + "\n")
+
     # Step 6: 分解平衡性检验
     print("\n[Step 6] 分解平衡性检验...")
     print("\n理论上应该满足：")
@@ -2033,7 +2223,7 @@ def main():
     print("  │   │   ├── TRc/")
     print("  │   │   ├── TR_fixed_window/")
     print("  │   │   └── Fixed_Trate/")
-    print("  │   │       ├── partial_r_{var}.tif (SOS, SMroot, Ta, Rs, P, SIFspr, SIFsum; SIF=GPP proxy)")
+    print("  │   │       ├── partial_r_{var}.tif (SOS, SMroot, Ta, Rs, P, SIF_fixed; SIF_fixed=GPP[SOSav,POSav])")
     print("  │   │       ├── partial_p_{var}.tif")
     print("  │   │       ├── vif_retained_{var}.tif")
     print("  │   │       └── R_squared.tif")
