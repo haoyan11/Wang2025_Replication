@@ -6,6 +6,7 @@
 """
 
 from pathlib import Path
+import os
 
 # ==================== 数据路径配置 ====================
 
@@ -53,6 +54,10 @@ STATISTICAL_DIR = OUTPUT_ROOT / "Statistical_Analysis"   # 统计分析（04a代
 STATISTICAL_TIMING_DIR = OUTPUT_ROOT / "Statistical_Analysis_TimingShape"   # 统计分析（04b代码）
 STATISTICAL_FIXED_DIR = OUTPUT_ROOT / "Statistical_Analysis_FixedWindow"     # 统计分析（04c代码）
 
+# 统一模板与掩膜（全流程只认 TEMPLATE_RASTER）
+TEMPLATE_RASTER = OUTPUT_ROOT / "masks" / "template_grid.tif"
+MASK_FILE = OUTPUT_ROOT / "masks" / "combined_mask.tif"
+
 # ==================== 分析参数配置 ====================
 
 # 时间范围
@@ -97,7 +102,6 @@ MOVING_WINDOW_SIZE = 15            # 滑动窗口大小（年）
 # TR (蒸腾) 文件命名格式 - ERA5-Land格式
 # 格式: ERA5L_ET_transp_Daily_mm_YYYYMMDD.tif
 # 示例: ERA5L_ET_transp_Daily_mm_19820101.tif
-TR_FILE_PREFIX = "ERA5L_ET_transp_Daily_mm_"
 TR_FILE_FORMAT = "ERA5L_ET_transp_Daily_mm_{date}.tif"  # {date} = YYYYMMDD
 
 # 土壤水分文件命名格式 - GLEAM格式
@@ -184,8 +188,8 @@ def get_TR_file_path(date_obj):
     """
     yyyymmdd = date_obj.strftime("%Y%m%d")
 
-    # ERA5-Land格式: ERA5L_ET_transp_Daily_mm_YYYYMMDD.tif
-    file_path = TR_DAILY_DIR / f"ERA5L_ET_transp_Daily_mm_{yyyymmdd}.tif"
+    # 使用TR_FILE_FORMAT
+    file_path = TR_DAILY_DIR / TR_FILE_FORMAT.format(date=yyyymmdd)
 
     if file_path.exists():
         return file_path
@@ -207,19 +211,62 @@ def get_SM_file_path(date_obj):
         文件完整路径，如果文件不存在返回None
     """
     yyyymmdd = date_obj.strftime("%Y%m%d")
-
-    # 日尺度格式: SMrz_YYYYMMDD.tif
-    file_path = SM_DAILY_DIR / f"SMrz_{yyyymmdd}.tif"
-
+    file_path = SM_DAILY_DIR / SM_FILE_FORMAT.format(date=yyyymmdd)
     if file_path.exists():
         return file_path
-
     return None
 
-def get_pheno_file_path(var_name, year):
+def _normalize_pheno_key(var_name):
+    key = str(var_name).strip().upper()
+    aliases = {
+        "SOS": "SOS",
+        "POS": "POS",
+        "POS_DOY": "POS",
+        "POSDOY": "POS",
+        "EOS": "EOS",
+        "POS_VALUE": "POS_VALUE",
+        "POSVALUE": "POS_VALUE",
+        "QUALITY": "QUALITY",
+        "QUALITY_FLAGS": "QUALITY",
+        "QUALITYFLAGS": "QUALITY",
+    }
+    return aliases.get(key, key)
+
+
+def get_pheno_file_path(var_name, year, check_exists=True):
     """获取物候文件路径"""
-    filename = PHENO_FILE_FORMAT[var_name].format(year=year)
-    return PHENO_DIR / filename
+    key = _normalize_pheno_key(var_name)
+    if key not in PHENO_FILE_FORMAT:
+        raise KeyError(f"Unknown PHENO_FILE_FORMAT key: {var_name}")
+    filename = PHENO_FILE_FORMAT[key].format(year=year)
+    file_path = PHENO_DIR / filename
+    if check_exists and not file_path.exists():
+        print(f"  ⚠ Missing pheno file: {file_path}")
+        return None
+    return file_path
+
+
+def get_GPP_file_path(date_obj, daily=True):
+    """
+    获取GPP文件路径
+
+    Parameters:
+    -----------
+    date_obj : datetime
+        日期对象
+    daily : bool
+        True为日尺度，False为8天尺度
+    """
+    if daily:
+        yyyymmdd = date_obj.strftime("%Y%m%d")
+        file_path = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=yyyymmdd)
+    else:
+        year = date_obj.year
+        doy = date_obj.timetuple().tm_yday
+        file_path = GPP_8DAY_DIR / GPP_8DAY_FORMAT.format(year=year, doy=doy)
+    if file_path.exists():
+        return file_path
+    return None
 
 def get_annual_file_path(var_name, year):
     """获取年度数据文件路径"""
@@ -246,8 +293,25 @@ def validate_config():
     if not TR_DAILY_DIR.exists():
         errors.append(f"TR数据目录不存在: {TR_DAILY_DIR}")
 
+    if not GPP_DAILY_DIR.exists():
+        errors.append(f"GPP数据目录不存在: {GPP_DAILY_DIR}")
+
+    if not SM_DAILY_DIR.exists():
+        errors.append(f"土壤水分目录不存在: {SM_DAILY_DIR}")
+
     if not PHENO_DIR.exists():
         errors.append(f"物候数据目录不存在: {PHENO_DIR}")
+
+    if USE_FOREST_MASK and not LANDCOVER_FILE.exists():
+        errors.append(f"土地覆盖文件不存在: {LANDCOVER_FILE}")
+
+    output_parent = OUTPUT_ROOT.parent
+    if OUTPUT_ROOT.exists():
+        if not os.access(OUTPUT_ROOT, os.W_OK):
+            errors.append(f"输出目录不可写: {OUTPUT_ROOT}")
+    else:
+        if not os.access(output_parent, os.W_OK):
+            errors.append(f"输出目录父路径不可写: {output_parent}")
 
     # 检查参数合理性
     if YEAR_START >= YEAR_END:

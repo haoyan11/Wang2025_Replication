@@ -60,7 +60,8 @@ except ImportError:
 from _config import (
     ROOT, OUTPUT_ROOT, PHENO_DIR, TRC_ANNUAL_DIR, DECOMPOSITION_FIXED_DIR,
     GPP_DAILY_DIR, CLIMATOLOGY_DIR, STATISTICAL_FIXED_DIR,
-    YEAR_START, YEAR_END, NODATA_OUT
+    YEAR_START, YEAR_END, NODATA_OUT, PHENO_FILE_FORMAT, get_GPP_file_path,
+    TEMPLATE_RASTER, MASK_FILE
 )
 
 # 确保输出目录存在
@@ -74,7 +75,6 @@ CLIM_DIR = CLIMATOLOGY_DIR
 OUTPUT_DIR = STATISTICAL_FIXED_DIR
 
 # 脚本特定配置
-GPP_DAILY_FORMAT = "GPP_{date}.tif"  # {date} = YYYYMMDD
 METEO_DIR = ROOT / "Meteorological Data"
 NODATA_ABS_MAX = 1e20
 BLOCK_SIZE_3_3 = 128  # 优化：增大块减少进程创建次数（原64->128）
@@ -103,6 +103,12 @@ MAX_WORKERS_3_3 = min(8, os.cpu_count() or 1)  # 优化：从4提升到8
 #   - 对于最终发表结果，使用 False（统计严谨）
 USE_BATCH_VECTORIZED = True
 
+# ==================== 偏相关异常值过滤 ====================
+# 过滤超出合理范围的偏相关系数与非法p值
+FILTER_PARTIAL_R_EXTREME = True
+PARTIAL_R_ABS_MAX = 1.0  # |R| 最大合理范围
+FILTER_PARTIAL_P_INVALID = True
+
 # ==================== I/O优化配置 ====================
 # 1. 多线程并行读取（治本方案）
 #    - I/O密集型任务，线程池能显著加速文件读取
@@ -117,11 +123,19 @@ MAX_IO_WORKERS = min(16, os.cpu_count() or 1)  # 优化：从8提升到16加速�
 #   - 缓存文件存储在 ANALYSIS_DIR / "Cache_Statistical_FixedWindow"
 #   - 如果输入数据更新，需手动删除缓存目录
 #   - 缓存文件较大（每个变量/年约几MB），注意磁盘空间
-USE_LSP_CACHE = False   # 启用LSP期间气象变量均值缓存（推荐开启）
-USE_GPP_CACHE = False   # 启用季节GPP均值缓存（推荐开启）
+USE_LSP_CACHE = True    # 启用LSP期间气象变量均值缓存（推荐开启）
+USE_GPP_CACHE = True    # 启用季节GPP均值缓存（推荐开启）
 CACHE_DIR = ANALYSIS_DIR / "Cache_Statistical_FixedWindow"
 if USE_LSP_CACHE or USE_GPP_CACHE:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ==================== 去趋势配置 ====================
+DETREND_ENABLE = False  # 是否启用去趋势（线性去趋势）
+DETREND_MIN_YEARS = 10  # 最少有效年份（像元）才去趋势
+DETREND_METHOD = "linear"
+RUN_BOTH_TRENDS = True  # 一次运行输出原始+去趋势两套结果
+OUTPUT_RAW_LABEL = "Raw"
+OUTPUT_DETREND_LABEL = "Detrended"
 
 # 季节定义
 SPRING_MONTHS = [3, 4, 5]  # 3-5月
@@ -154,10 +168,24 @@ DAILY_VAR_SPECS = {
 def _is_valid_value(value, nodata):
     """检查值是否有效（非NODATA）"""
     if nodata is None:
-        return np.isfinite(value) & (np.abs(value) < NODATA_ABS_MAX)
+        return np.isfinite(value) & (np.abs(value) < NODATA_ABS_MAX) & (value > -9000)
     if np.isnan(nodata):
-        return np.isfinite(value) & (np.abs(value) < NODATA_ABS_MAX)
+        return np.isfinite(value) & (np.abs(value) < NODATA_ABS_MAX) & (value > -9000)
     return (value != nodata) & np.isfinite(value) & (np.abs(value) < NODATA_ABS_MAX)
+
+def is_leap_year(year):
+    """判断是否为闰年"""
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+def noleap_doy_to_date(year, doy):
+    """
+    将无闰日DOY(1-365)映射到真实日期。
+    闰年中DOY>=60整体后移1天，避免2月29日错位。
+    """
+    if doy < 1 or doy > 365:
+        return None
+    offset = 1 if is_leap_year(year) and doy >= 60 else 0
+    return datetime(year, 1, 1) + timedelta(days=doy - 1 + offset)
 
 @lru_cache(maxsize=None)
 def _has_daily_files(var_name, year):
@@ -168,7 +196,10 @@ def _has_daily_files(var_name, year):
     var_dir = spec['dir']
     pattern = spec['pattern']
     for doy in (1, 120, 240):
-        date_str = (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y%m%d")
+        date_obj = noleap_doy_to_date(year, doy)
+        if date_obj is None:
+            continue
+        date_str = date_obj.strftime("%Y%m%d")
         if (var_dir / pattern.format(date=date_str)).exists():
             return True
     return False
@@ -177,8 +208,11 @@ def _has_daily_files(var_name, year):
 def _has_gpp_files(year):
     """快速检测某年日尺度GPP文件是否存在"""
     for doy in (90, 120, 180, 220):
-        date_str = (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y%m%d")
-        if (GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_str)).exists():
+        date_obj = noleap_doy_to_date(year, doy)
+        if date_obj is None:
+            continue
+        gpp_file = get_GPP_file_path(date_obj, daily=True)
+        if gpp_file is not None and gpp_file.exists():
             return True
     return False
 
@@ -201,15 +235,119 @@ def read_geotiff(file_path):
         nodata = src.nodata
     return data, profile, nodata
 
+
+def _compare_profile(ref_profile, other_profile, label, file_path):
+    if ref_profile["height"] != other_profile["height"] or ref_profile["width"] != other_profile["width"]:
+        raise ValueError(
+            f"{label}尺寸不一致: {file_path}\n"
+            f"  Expected: {ref_profile['height']}x{ref_profile['width']}\n"
+            f"  Got: {other_profile['height']}x{other_profile['width']}"
+        )
+    if ref_profile.get("crs") != other_profile.get("crs"):
+        raise ValueError(
+            f"{label} CRS不一致: {file_path}\n"
+            f"  Expected: {ref_profile.get('crs')}\n"
+            f"  Got: {other_profile.get('crs')}"
+        )
+    ref_transform = ref_profile.get("transform")
+    other_transform = other_profile.get("transform")
+    if ref_transform is not None and other_transform is not None:
+        transform_match = all(
+            abs(ref_transform[i] - other_transform[i]) < 1e-6
+            for i in range(6)
+        )
+        if not transform_match:
+            raise ValueError(
+                f"{label} Transform不一致: {file_path}\n"
+                f"  Expected: {ref_transform}\n"
+                f"  Got: {other_transform}"
+            )
+
+
+def _check_profile_match(ref_profile, file_path, label):
+    if not file_path.exists():
+        raise FileNotFoundError(f"{label}文件缺失: {file_path}")
+    with rasterio.open(file_path) as src:
+        _compare_profile(ref_profile, src.profile, label, file_path)
+
+
+def fast_consistency_check(ref_profile, sample_years):
+    """派生产物一致性检查（fail-fast）"""
+    print("\n[预检查] 栅格一致性检查（派生产物）...")
+
+    # 掩膜（如存在）
+    mask_file = MASK_FILE
+    if mask_file.exists():
+        _check_profile_match(ref_profile, mask_file, "掩膜")
+
+    # 分解产物（固定窗口）
+    _check_profile_match(ref_profile, DECOMP_DIR / "Fixed_Window_Length.tif", "Fixed_Window_Length")
+    _check_profile_match(ref_profile, DECOMP_DIR / "TRc_av.tif", "TRc_av")
+
+    for year in sample_years:
+        # 物候样本
+        _check_profile_match(ref_profile,
+                             PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year),
+                             f"SOS({year})")
+        _check_profile_match(ref_profile,
+                             PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year),
+                             f"POS({year})")
+
+        # 分解产物（固定窗口）
+        _check_profile_match(ref_profile, DECOMP_DIR / f"TR_fixed_window_{year}.tif", f"TR_fixed_window({year})")
+        _check_profile_match(ref_profile, DECOMP_DIR / f"TR_window_change_{year}.tif", f"TR_window_change({year})")
+        _check_profile_match(ref_profile, DECOMP_DIR / f"TR_sos_change_{year}.tif", f"TR_sos_change({year})")
+        _check_profile_match(ref_profile, DECOMP_DIR / f"TR_pos_change_{year}.tif", f"TR_pos_change({year})")
+
+        # TRc
+        _check_profile_match(ref_profile, TRC_DIR / f"TRc_{year}.tif", f"TRc({year})")
+
 def write_geotiff(file_path, data, profile):
     """写入单波段GeoTIFF"""
     profile.update(dtype=rasterio.float32, count=1, compress='lzw', nodata=NODATA_OUT)
     with rasterio.open(file_path, 'w', **profile) as dst:
         dst.write(data.astype(np.float32), 1)
 
+
+def filter_partial_corr_maps(partial_r_maps, partial_p_maps, mask):
+    if not FILTER_PARTIAL_R_EXTREME:
+        return {}
+    stats = {}
+    for var, r_map in partial_r_maps.items():
+        p_map = partial_p_maps[var]
+        invalid = (~np.isfinite(r_map)) | (r_map == NODATA_OUT) | (np.abs(r_map) > PARTIAL_R_ABS_MAX)
+        if FILTER_PARTIAL_P_INVALID:
+            invalid |= (~np.isfinite(p_map)) | (p_map == NODATA_OUT) | (p_map < 0) | (p_map > 1)
+        if mask is not None:
+            invalid |= ~mask
+        n_invalid = int(np.sum(invalid))
+        r_map[invalid] = NODATA_OUT
+        p_map[invalid] = NODATA_OUT
+        stats[var] = n_invalid
+    return stats
+
+
+def filter_partial_corr_window(r_map, mask):
+    if not FILTER_PARTIAL_R_EXTREME:
+        return r_map
+    invalid = (~np.isfinite(r_map)) | (r_map == NODATA_OUT) | (np.abs(r_map) > PARTIAL_R_ABS_MAX)
+    if mask is not None:
+        invalid |= ~mask
+    if np.any(invalid):
+        r_map = r_map.copy()
+        r_map[invalid] = NODATA_OUT
+    return r_map
+
 def get_doy_from_date(year, month, day):
-    """计算儒略日（DOY）"""
-    return datetime(year, month, day).timetuple().tm_yday
+    """计算无闰日DOY（1-365）"""
+    date_obj = datetime(year, month, day)
+    doy = date_obj.timetuple().tm_yday
+    if is_leap_year(year):
+        if doy == 60:
+            return None
+        if doy > 60:
+            return doy - 1
+    return doy
 
 def sen_slope(x, y):
     """
@@ -543,6 +681,35 @@ def standardize(data):
     std = np.nanstd(data, axis=0)
     std[std == 0] = 1  # 避免除零
     return (data - mean) / std
+
+
+def detrend_stack(data, years, min_years=10):
+    """
+    对 (T, H, W) 时间栈进行线性去趋势
+    """
+    t = np.asarray(years, dtype=np.float32)
+    t2 = t[:, None, None]
+    valid = np.isfinite(data)
+    n = valid.sum(axis=0)
+
+    mean_t = np.nanmean(np.where(valid, t2, np.nan), axis=0)
+    mean_x = np.nanmean(np.where(valid, data, np.nan), axis=0)
+    dt = np.where(valid, t2 - mean_t, np.nan)
+    dx = np.where(valid, data - mean_x, np.nan)
+
+    cov = np.nanmean(dt * dx, axis=0)
+    var = np.nanmean(dt * dt, axis=0)
+    good = (n >= min_years) & np.isfinite(var) & (var > 0)
+
+    slope = np.zeros_like(var, dtype=np.float32)
+    slope[good] = cov[good] / var[good]
+    intercept = np.zeros_like(var, dtype=np.float32)
+    intercept[good] = mean_x[good] - slope[good] * mean_t[good]
+
+    trend = intercept + slope * t2
+    detrended = data - trend
+    detrended[~valid] = np.nan
+    return detrended
 
 
 def filter_statistical_outliers(slope_map, r2_map=None, pvalue_map=None, mask=None,
@@ -897,7 +1064,7 @@ if NUMBA_AVAILABLE:
         return r, p_vals
 
 # ==================== 批量向量化版本（超高性能，参考用户代码）====================
-def partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False):
+def partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False, block_mask=None):
     """
     批量向量化偏相关计算（参考用户代码优化架构）
 
@@ -946,8 +1113,19 @@ def partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, en
 
     # 有效性掩膜 (N, T)
     valid_year = ~np.isnan(cube).any(axis=2)
+    if block_mask is not None:
+        mask_flat = block_mask.reshape(-1)
+        if mask_flat.shape[0] == valid_year.shape[0]:
+            valid_year[~mask_flat] = False
+        else:
+            mask_flat = None
+    else:
+        mask_flat = None
     n_eff_all = valid_year.sum(axis=1).astype(np.int16)
-    good_idx = np.where(n_eff_all >= min_rows)[0]
+    if mask_flat is not None:
+        good_idx = np.where((n_eff_all >= min_rows) & mask_flat)[0]
+    else:
+        good_idx = np.where(n_eff_all >= min_rows)[0]
 
     if good_idx.size == 0:
         return partial_r_block, partial_p_block, vif_block, r2_block
@@ -1054,7 +1232,8 @@ def _partial_corr_block_worker_batch(args):
 
     # 调用批量向量化函数
     partial_r_block, partial_p_block, vif_block, r2_block = \
-        partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False)
+    partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows,
+                                  enable_vif=False, block_mask=block_mask)
 
     return (r0, r1, c0, c1, partial_r_block, partial_p_block, vif_block, r2_block)
 
@@ -1069,7 +1248,8 @@ def _partial_corr_window_block_worker_batch(args):
 
     # 调用批量向量化函数（只需要partial_r）
     partial_r_block, _, _, _ = \
-        partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows, enable_vif=False)
+    partial_corr_batch_vectorized(Y_block, X_block, predictor_vars, min_rows,
+                                  enable_vif=False, block_mask=block_mask)
 
     return r0, r1, c0, c1, partial_r_block
 
@@ -1159,9 +1339,9 @@ def calculate_seasonal_gpp(year, season='spring'):
     for month in months:
         for day in range(1, 32):
             try:
-                date_str = datetime(year, month, day).strftime("%Y%m%d")
-                gpp_file = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_str)
-                if gpp_file.exists():
+                date_obj = datetime(year, month, day)
+                gpp_file = get_GPP_file_path(date_obj, daily=True)
+                if gpp_file is not None and gpp_file.exists():
                     file_paths.append(gpp_file)
             except ValueError:
                 continue
@@ -1169,30 +1349,35 @@ def calculate_seasonal_gpp(year, season='spring'):
     if len(file_paths) == 0:
         return None
 
-    # 步骤2：多线程并行读取所有文件
+    # 步骤2：流式累积（避免堆叠所有日文件）
     def _read_and_process(file_path):
         """工作线程：读取单个文件并处理"""
         data, profile, nodata = read_geotiff(file_path)
-        valid_data = np.where(_is_valid_value(data, nodata), data, np.nan)
-        return valid_data, profile
+        valid_data = _is_valid_value(data, nodata)
+        return data.astype(np.float32), valid_data, profile
 
-    gpp_list = []
-    profile_template = None
+    # 先同步读取首个文件以确定shape/profile
+    data0, profile_template, nodata0 = read_geotiff(file_paths[0])
+    valid0 = _is_valid_value(data0, nodata0)
+    height, width = data0.shape
+    sum_arr = np.zeros((height, width), dtype=np.float32)
+    cnt_arr = np.zeros((height, width), dtype=np.int16)
+    if np.any(valid0):
+        sum_arr[valid0] += data0.astype(np.float32)[valid0]
+        cnt_arr[valid0] += 1
 
-    with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
-        # 提交所有读取任务
-        futures = [executor.submit(_read_and_process, fp) for fp in file_paths]
+    if len(file_paths) > 1:
+        with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
+            futures = [executor.submit(_read_and_process, fp) for fp in file_paths[1:]]
+            for future in futures:
+                data, valid_data, _ = future.result()
+                if np.any(valid_data):
+                    sum_arr[valid_data] += data[valid_data]
+                    cnt_arr[valid_data] += 1
 
-        # 收集结果（保持顺序）
-        for future in futures:
-            valid_data, profile = future.result()
-            if profile_template is None:
-                profile_template = profile
-            gpp_list.append(valid_data)
-
-    # 步骤3：内存计算
-    gpp_stack = np.stack(gpp_list, axis=0)
-    gpp_seasonal = np.nanmean(gpp_stack, axis=0)
+    gpp_seasonal = np.full((height, width), np.nan, dtype=np.float32)
+    valid_cnt = cnt_arr > 0
+    gpp_seasonal[valid_cnt] = sum_arr[valid_cnt] / cnt_arr[valid_cnt]
 
     # 保存缓存（可选优化）
     if USE_GPP_CACHE and profile_template is not None:
@@ -1203,7 +1388,95 @@ def calculate_seasonal_gpp(year, season='spring'):
     return gpp_seasonal
 
 
-def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
+def calculate_gpp_lsp_average(year, sos_map, pos_map, cache_tag="fixed"):
+    """
+    计算GPP在LSP窗口内的平均值（基于日尺度GPP）
+    cache_tag: 用于区分不同窗口类型的缓存文件名
+    """
+    if USE_GPP_CACHE:
+        cache_file = CACHE_DIR / f"GPP_LSP_{cache_tag}_{year}.tif"
+        if cache_file.exists():
+            data, _, _ = read_geotiff(cache_file)
+            return data
+
+    if not _has_gpp_files(year):
+        return None
+
+    height, width = sos_map.shape
+    sos_int = np.rint(sos_map).astype(np.int32)
+    pos_int = np.rint(pos_map).astype(np.int32)
+
+    valid = (
+        np.isfinite(sos_map) & np.isfinite(pos_map) &
+        (sos_int > 0) & (pos_int > 0) &
+        (pos_int >= sos_int) &
+        (sos_int <= 366) & (pos_int <= 366)
+    )
+
+    sos_int = np.clip(sos_int, 1, 365)
+    pos_int = np.clip(pos_int, 1, 365)
+
+    if not np.any(valid):
+        return np.full((height, width), np.nan, dtype=np.float32)
+
+    doy_start = int(np.nanmin(sos_int[valid]))
+    doy_end = int(np.nanmax(pos_int[valid]))
+    doy_start = max(1, min(365, doy_start))
+    doy_end = max(1, min(365, doy_end))
+
+    file_doy_pairs = []
+    for doy in range(doy_start, doy_end + 1):
+        date_obj = noleap_doy_to_date(year, doy)
+        if date_obj is None:
+            continue
+        gpp_file = get_GPP_file_path(date_obj, daily=True)
+        if gpp_file is not None and gpp_file.exists():
+            file_doy_pairs.append((gpp_file, doy))
+
+    if not file_doy_pairs:
+        return np.full((height, width), np.nan, dtype=np.float32)
+
+    def _read_and_process_gpp(args):
+        file_path, doy = args
+        data, profile, nodata = read_geotiff(file_path)
+        valid_data = _is_valid_value(data, nodata)
+        return doy, data.astype(np.float32), valid_data, profile
+
+    total_sum = np.zeros((height, width), dtype=np.float32)
+    total_cnt = np.zeros((height, width), dtype=np.int16)
+    profile_template = None
+
+    with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
+        futures = [executor.submit(_read_and_process_gpp, pair) for pair in file_doy_pairs]
+        for future in futures:
+            doy, data, valid_data, profile = future.result()
+            if profile_template is None:
+                profile_template = profile
+
+            in_window = valid & (sos_int <= doy) & (pos_int >= doy)
+            if not np.any(in_window):
+                continue
+
+            use_mask = in_window & valid_data
+            if not np.any(use_mask):
+                continue
+
+            total_sum[use_mask] += data[use_mask]
+            total_cnt[use_mask] += 1
+
+    gpp_avg = np.full((height, width), np.nan, dtype=np.float32)
+    valid_cnt = total_cnt > 0
+    gpp_avg[valid_cnt] = total_sum[valid_cnt] / total_cnt[valid_cnt]
+
+    if USE_GPP_CACHE and profile_template is not None:
+        cache_file = CACHE_DIR / f"GPP_LSP_{cache_tag}_{year}.tif"
+        if not cache_file.exists():
+            write_geotiff(cache_file, gpp_avg, profile_template)
+
+    return gpp_avg
+
+
+def calculate_lsp_period_average(var_name, year, sos_map, pos_map, cache_tag="actual"):
     """
     计算LSP期间的变量平均值（Wang 2025 Section 2.2.2）
 
@@ -1226,9 +1499,9 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
         LSP期间平均值 (H, W)
     """
     # 缓存检查（可选优化）
-    # 注意：缓存键包含年份，但不包含SOS/POS（假设同一年的SOS/POS不变）
+    # 注意：缓存键包含窗口标签以区分实际窗口与固定窗口
     if USE_LSP_CACHE:
-        cache_file = CACHE_DIR / f"LSP_{var_name}_{year}.tif"
+        cache_file = CACHE_DIR / f"LSP_{var_name}_{cache_tag}_{year}.tif"
         if cache_file.exists():
             data, _, _ = read_geotiff(cache_file)
             return data
@@ -1270,12 +1543,15 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
     # 步骤1：准备文件路径列表
     file_doy_pairs = []
     for doy in range(doy_start, doy_end + 1):
-        date_str = (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y%m%d")
+        date_obj = noleap_doy_to_date(year, doy)
+        if date_obj is None:
+            continue
+        date_str = date_obj.strftime("%Y%m%d")
         var_file = var_dir / pattern.format(date=date_str)
         if var_file.exists():
             file_doy_pairs.append((var_file, doy))
 
-    # 步骤2：多线程并行读取所有文件
+    # 步骤2：多线程并行读取 + 流式累积（避免保存全部日数据）
     def _read_and_process_lsp(args):
         """工作线程：读取单个文件并处理"""
         file_path, doy = args
@@ -1283,40 +1559,27 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
         valid_data = _is_valid_value(data, nodata)
         return doy, data.astype(np.float32), valid_data, profile
 
-    daily_data_dict = {}  # {doy: (data_array, valid_mask)}
+    total_sum = np.zeros((height, width), dtype=np.float32)
+    total_cnt = np.zeros((height, width), dtype=np.int16)
     profile_template = None
 
     with ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
-        # 提交所有读取任务
         futures = [executor.submit(_read_and_process_lsp, pair) for pair in file_doy_pairs]
-
-        # 收集结果
         for future in futures:
             doy, data, valid_data, profile = future.result()
             if profile_template is None:
                 profile_template = profile
-            daily_data_dict[doy] = (data, valid_data)
 
-    # 步骤3：从内存字典中提取数据并计算（无文件I/O）
-    total_sum = np.zeros((height, width), dtype=np.float32)
-    total_cnt = np.zeros((height, width), dtype=np.int16)
+            in_window = valid & (sos_int <= doy) & (pos_int >= doy)
+            if not np.any(in_window):
+                continue
 
-    for doy in range(doy_start, doy_end + 1):
-        if doy not in daily_data_dict:
-            continue
+            use_mask = in_window & valid_data
+            if not np.any(use_mask):
+                continue
 
-        in_window = valid & (sos_int <= doy) & (pos_int >= doy)
-        if not np.any(in_window):
-            continue
-
-        data, valid_data = daily_data_dict[doy]
-        use_mask = in_window & valid_data
-
-        if not np.any(use_mask):
-            continue
-
-        total_sum[use_mask] += data[use_mask]
-        total_cnt[use_mask] += 1
+            total_sum[use_mask] += data[use_mask]
+            total_cnt[use_mask] += 1
 
     window_len = pos_int - sos_int + 1
     lsp_avg = np.full((height, width), np.nan, dtype=np.float32)
@@ -1325,7 +1588,7 @@ def calculate_lsp_period_average(var_name, year, sos_map, pos_map):
 
     # 保存缓存（可选优化）
     if USE_LSP_CACHE and profile_template is not None:
-        cache_file = CACHE_DIR / f"LSP_{var_name}_{year}.tif"
+        cache_file = CACHE_DIR / f"LSP_{var_name}_{cache_tag}_{year}.tif"
         if not cache_file.exists():
             write_geotiff(cache_file, lsp_avg, profile_template)
 
@@ -1372,15 +1635,15 @@ def section_3_3_driver_analysis(mask):
     # 定义变量（Wang 2025 Eq. 3）
     # 统一因变量：移除TR_fixed_window（固定窗口累积差异），仅保留TRc和Fixed_Trate（固定窗口速率异常）
     response_vars = ['TRc', 'Fixed_Trate']
-    # 注意：SIFspr/SIFsum 实际使用日尺度 GPP 的季节均值作为代理
-    predictor_vars = ['SOS', 'SMroot', 'Ta', 'Rs', 'P', 'SIFspr', 'SIFsum']
+    # 注意：GPP_fixed 使用固定窗口[SOSav, POSav]内的日尺度GPP均值
+    predictor_vars = ['SOS', 'SMroot', 'Ta', 'Rs', 'P', 'GPP_fixed']
     available_vars = []
     missing_vars = []
     for var in predictor_vars:
         if var == 'SOS':
             available_vars.append(var)
             continue
-        if var in ('SIFspr', 'SIFsum'):
+        if var == 'GPP_fixed':
             if _has_gpp_files(years[0]) or _has_gpp_files(years[-1]):
                 available_vars.append(var)
             else:
@@ -1414,13 +1677,13 @@ def section_3_3_driver_analysis(mask):
     sos_all = []
     pos_all = []
     for year in years:
-        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
+        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year))
+        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year))
         sos_all.append(np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan))
         pos_all.append(np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan))
 
-    sos_climatology = np.nanmean(np.stack(sos_all, axis=0), axis=0)  # (H, W)
-    pos_climatology = np.nanmean(np.stack(pos_all, axis=0), axis=0)  # (H, W)
+    sos_climatology = np.nanmean(np.stack(sos_all, axis=0), axis=0).astype(np.float32)  # (H, W)
+    pos_climatology = np.nanmean(np.stack(pos_all, axis=0), axis=0).astype(np.float32)  # (H, W)
     print(f"    SOSav范围: {np.nanmin(sos_climatology):.1f} - {np.nanmax(sos_climatology):.1f} DOY")
     print(f"    POSav范围: {np.nanmin(pos_climatology):.1f} - {np.nanmax(pos_climatology):.1f} DOY")
 
@@ -1431,8 +1694,8 @@ def section_3_3_driver_analysis(mask):
 
     for year in tqdm(years, desc="预计算自变量"):
         # 读取SOS和POS
-        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
+        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year))
+        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year))
 
         sos_map = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
         pos_map = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
@@ -1447,32 +1710,33 @@ def section_3_3_driver_analysis(mask):
             if var not in predictor_vars:
                 continue
             # 实际窗口[SOS_year, POS_year]
-            lsp_avg_actual = calculate_lsp_period_average(var, year, sos_map, pos_map)
+            lsp_avg_actual = calculate_lsp_period_average(var, year, sos_map, pos_map, cache_tag="actual")
             X_all_years_actual[var].append(lsp_avg_actual)
 
             # 固定窗口[SOSav, POSav]
-            lsp_avg_fixed = calculate_lsp_period_average(var, year, sos_climatology, pos_climatology)
+            lsp_avg_fixed = calculate_lsp_period_average(var, year, sos_climatology, pos_climatology, cache_tag="fixed")
             X_all_years_fixed[var].append(lsp_avg_fixed)
 
-        # SIFspr/SIFsum（两套相同，因为是季节固定定义）
-        if 'SIFspr' in predictor_vars:
-            gpp_spring = calculate_seasonal_gpp(year, season='spring')
-            if gpp_spring is None:
-                gpp_spring = np.full((height, width), np.nan)
-            X_all_years_actual['SIFspr'].append(gpp_spring)
-            X_all_years_fixed['SIFspr'].append(gpp_spring)
-
-        if 'SIFsum' in predictor_vars:
-            gpp_summer = calculate_seasonal_gpp(year, season='summer')
-            if gpp_summer is None:
-                gpp_summer = np.full((height, width), np.nan)
-            X_all_years_actual['SIFsum'].append(gpp_summer)
-            X_all_years_fixed['SIFsum'].append(gpp_summer)
+        # GPP_fixed（固定窗口[SOSav, POSav]，两套相同）
+        if 'GPP_fixed' in predictor_vars:
+            gpp_fixed = calculate_gpp_lsp_average(year, sos_climatology, pos_climatology, cache_tag="fixed")
+            if gpp_fixed is None:
+                gpp_fixed = np.full((height, width), np.nan, dtype=np.float32)
+            X_all_years_actual['GPP_fixed'].append(gpp_fixed)
+            X_all_years_fixed['GPP_fixed'].append(gpp_fixed)
 
     # 转换为numpy数组
     for var in predictor_vars:
-        X_all_years_actual[var] = np.stack(X_all_years_actual[var], axis=0)  # (n_years, H, W)
-        X_all_years_fixed[var] = np.stack(X_all_years_fixed[var], axis=0)    # (n_years, H, W)
+        X_all_years_actual[var] = np.stack(X_all_years_actual[var], axis=0).astype(np.float32)  # (n_years, H, W)
+        X_all_years_fixed[var] = np.stack(X_all_years_fixed[var], axis=0).astype(np.float32)    # (n_years, H, W)
+
+    if DETREND_ENABLE:
+        if DETREND_METHOD != "linear":
+            print(f"  ⚠️ 未知去趋势方法: {DETREND_METHOD}，已改用linear")
+        print("  去趋势: 对预测变量进行线性去趋势...")
+        for var in predictor_vars:
+            X_all_years_actual[var] = detrend_stack(X_all_years_actual[var], years, DETREND_MIN_YEARS)
+            X_all_years_fixed[var] = detrend_stack(X_all_years_fixed[var], years, DETREND_MIN_YEARS)
 
     # 读取Fixed_Window_Length（用于计算Fixed_Trate）
     fixed_window_length, _, nodata_fwl = read_geotiff(DECOMP_DIR / "Fixed_Window_Length.tif")
@@ -1513,6 +1777,12 @@ def section_3_3_driver_analysis(mask):
             Y_stack.append(data if response_var == 'Fixed_Trate' else np.where(_is_valid_value(data, nodata), data, np.nan))
 
         Y_stack = np.stack(Y_stack, axis=0)  # (n_years, H, W)
+
+        if DETREND_ENABLE:
+            if DETREND_METHOD != "linear":
+                print(f"  ⚠️ 未知去趋势方法: {DETREND_METHOD}，已改用linear")
+            print(f"    去趋势: 对响应变量 {response_var} 进行线性去趋势...")
+            Y_stack = detrend_stack(Y_stack, years, DETREND_MIN_YEARS)
 
         # 逐像元VIF过滤 + 偏相关（分块）
         partial_r_maps = {var: np.full((height, width), NODATA_OUT, dtype=np.float32)
@@ -1556,6 +1826,12 @@ def section_3_3_driver_analysis(mask):
                     partial_p_maps[var][r0:r1, c0:c1] = pp_block[var]
                     vif_filtered_vars[var][r0:r1, c0:c1] = vif_block[var]
                 r_squared_map[r0:r1, c0:c1] = r2_block
+
+        # 偏相关极端值过滤（避免|R|>1或非法p值）
+        filtered_counts = filter_partial_corr_maps(partial_r_maps, partial_p_maps, mask)
+        if filtered_counts:
+            total_filtered = sum(filtered_counts.values())
+            print(f"    偏相关极端值过滤: {total_filtered} 像元被置为NODATA")
 
         # 保存全时段归因结果
         output_dir_full = OUTPUT_DIR / "Section_3.3_Drivers" / "Full_Period" / response_var
@@ -1732,8 +2008,9 @@ def section_3_3_driver_analysis(mask):
 
         for var in predictor_vars:
             filename = f"partial_r_{var}_{start_year}-{end_year}.tif"
+            r_win = filter_partial_corr_window(partial_r_evolution[var][win_idx], mask)
             write_geotiff(output_dir_window / filename,
-                         partial_r_evolution[var][win_idx], profile)
+                         r_win, profile)
 
     # ========== Part 3: 偏相关趋势分析 ==========
     print("\n[Part 3] 偏相关趋势分析（Theil-Sen + Mann-Kendall）...")
@@ -1786,7 +2063,7 @@ def section_3_3_driver_analysis(mask):
     print(f"  输出目录: {OUTPUT_DIR / 'Section_3.3_Drivers'}")
 
 
-def main():
+def _run_analysis():
     print("\n" + "=" * 80)
     print("Fixed-Window Method: Statistical Analysis (Sections 3.2 & 3.3)")
     print("=" * 80)
@@ -1806,12 +2083,16 @@ def main():
     years = list(range(YEAR_START, YEAR_END + 1))
     n_years = len(years)
 
-    # Read template (使用TRc以确保与04a/04b空间一致)
-    data_first, profile, _ = read_geotiff(TRC_DIR / f"TRc_{years[0]}.tif")
+    # Read template (统一网格：TEMPLATE_RASTER)
+    data_first, profile, _ = read_geotiff(TEMPLATE_RASTER)
     height, width = data_first.shape
 
+    # 栅格一致性检查（派生产物）
+    sample_years = [years[0], years[len(years) // 2], years[-1]]
+    fast_consistency_check(profile, sample_years)
+
     # 读取掩膜（与04a/04b一致）
-    mask_file = ANALYSIS_DIR / "masks" / "combined_mask.tif"
+    mask_file = MASK_FILE
     if not mask_file.exists():
         print(f"  [WARNING] 掩膜文件不存在: {mask_file}")
         print("  使用默认掩膜（全部有效）")
@@ -1825,13 +2106,13 @@ def main():
     print("\n[Step 1] 计算多年平均 SOS (SOSav) 和 ΔSOS...")
     sos_stack = []
     for year in tqdm(years, desc="读取SOS"):
-        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / f"sos_gpp_{year}.tif")
-        sos_valid = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan)
+        sos_data, _, sos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year))
+        sos_valid = np.where(_is_valid_value(sos_data, sos_nodata), sos_data, np.nan).astype(np.float32)
         sos_stack.append(sos_valid)
 
-    sos_stack = np.stack(sos_stack, axis=0)  # (n_years, H, W)
-    sos_av = np.nanmean(sos_stack, axis=0)   # 现场计算（与04a一致）✅
-    delta_sos_stack = sos_stack - sos_av  # (n_years, H, W)
+    sos_stack = np.stack(sos_stack, axis=0).astype(np.float32)  # (n_years, H, W)
+    sos_av = np.nanmean(sos_stack, axis=0).astype(np.float32)   # 现场计算（与04a一致）✅
+    delta_sos_stack = (sos_stack - sos_av).astype(np.float32)  # (n_years, H, W)
 
     # Step 2: 读取固定窗口长度和POS
     print("\n[Step 2] 读取固定窗口长度和POS...")
@@ -1843,10 +2124,10 @@ def main():
     # 读取POS（用于计算变化窗口GLS）
     pos_stack = []
     for year in tqdm(years, desc="读取POS", leave=False):
-        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{year}.tif")
-        pos_valid = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan)
+        pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year))
+        pos_valid = np.where(_is_valid_value(pos_data, pos_nodata), pos_data, np.nan).astype(np.float32)
         pos_stack.append(pos_valid)
-    pos_stack = np.stack(pos_stack, axis=0)  # (n_years, H, W)
+    pos_stack = np.stack(pos_stack, axis=0).astype(np.float32)  # (n_years, H, W)
 
     # Step 3: 读取分解组分和TRc
     print("\n[Step 3] 读取固定窗口分解组分和TRc...")
@@ -1857,16 +2138,16 @@ def main():
         data_stack = []
         for year in tqdm(years, desc=f"读取{resp_var}", leave=False):
             data, _, nodata = read_geotiff(DECOMP_DIR / f"{resp_var}_{year}.tif")
-            data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan))
-        response_data[resp_var] = np.stack(data_stack, axis=0)  # (n_years, H, W)
+            data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan).astype(np.float32))
+        response_data[resp_var] = np.stack(data_stack, axis=0).astype(np.float32)  # (n_years, H, W)
 
     # 读取TRc（用于对比和计算Trate）
     print("\n  读取 TRc...")
     trc_stack = []
     for year in tqdm(years, desc="读取TRc", leave=False):
         data, _, nodata = read_geotiff(TRC_DIR / f"TRc_{year}.tif")
-        trc_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan))
-    trc_stack = np.stack(trc_stack, axis=0)
+        trc_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan).astype(np.float32))
+    trc_stack = np.stack(trc_stack, axis=0).astype(np.float32)
     response_data['TRc'] = trc_stack
 
     # Step 4: 计算速率指标
@@ -1911,6 +2192,15 @@ def main():
     valid_trate = np.isfinite(trc_stack) & np.isfinite(gls_stack) & (gls_stack > 0)
     trate_stack[valid_trate] = trc_stack[valid_trate] / gls_stack[valid_trate]
     response_data['Trate'] = trate_stack
+
+    # 可选：去趋势（像元时间序列）
+    if DETREND_ENABLE:
+        if DETREND_METHOD != "linear":
+            print(f"  ⚠️ 未知去趋势方法: {DETREND_METHOD}，已改用linear")
+        print("  去趋势: 对ΔSOS与响应变量进行线性去趋势...")
+        delta_sos_stack = detrend_stack(delta_sos_stack, years, DETREND_MIN_YEARS)
+        for key in response_data:
+            response_data[key] = detrend_stack(response_data[key], years, DETREND_MIN_YEARS)
 
     # Step 5: 像元级线性回归
     print("\n[Step 5] 像元级线性回归: Response ~ ΔSOS...")
@@ -2033,7 +2323,7 @@ def main():
     print("  │   │   ├── TRc/")
     print("  │   │   ├── TR_fixed_window/")
     print("  │   │   └── Fixed_Trate/")
-    print("  │   │       ├── partial_r_{var}.tif (SOS, SMroot, Ta, Rs, P, SIFspr, SIFsum; SIF=GPP proxy)")
+    print("  │   │       ├── partial_r_{var}.tif (SOS, SMroot, Ta, Rs, P, GPP_fixed)")
     print("  │   │       ├── partial_p_{var}.tif")
     print("  │   │       ├── vif_retained_{var}.tif")
     print("  │   │       └── R_squared.tif")
@@ -2053,6 +2343,22 @@ def main():
     print("    - 识别驱动TR_fixed_window变化的主要因子（|R| > 0.1）")
     print("    - 分析驱动因子的时间演变趋势")
     print("="*80)
+
+def main():
+    if RUN_BOTH_TRENDS:
+        runs = [(False, OUTPUT_RAW_LABEL), (True, OUTPUT_DETREND_LABEL)]
+        for detrend_flag, label in runs:
+            global DETREND_ENABLE, OUTPUT_DIR
+            DETREND_ENABLE = detrend_flag
+            OUTPUT_DIR = STATISTICAL_FIXED_DIR / label
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            print("\n" + "=" * 80)
+            print(f"Run mode: {label} (DETREND_ENABLE={DETREND_ENABLE})")
+            print("=" * 80)
+            _run_analysis()
+    else:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _run_analysis()
 
 
 if __name__ == "__main__":

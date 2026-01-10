@@ -7,17 +7,17 @@
 # 2. 使用04c代码的固定窗口方法（Fixed_Trate + 固定窗口[SOSav, POSav]）
 # 3. 计算季前气候因子（SOSav前3个月）
 # 4. 计算固定窗口生长季（SOSav-POSav）的GPP和气象因子
-# 5. 构建完整路径：季前气候 → SOS → GPP_season → Fixed_Trate
+# 5. 构建完整路径：季前气候 → SOS → Fixed_Trate → Ttotal
 # 6. 气候因子：降水(P)、气温(T)、短波辐射(SW)
 #
 # 路径结构（参考N04）：
-#   季前气候(P,T,SW) → SOS → GPP_season → Fixed_Trate
+#   季前气候(P,T,SW) → SOS → Fixed_Trate → Ttotal
 #      ↓                ↓         ↑          ↑
 #      └────────────────┴─────────┴──────────┘ (直接路径)
 #   生长季气候(P,T,SW) ──────────┴──────────┘ (同期路径)
 #
 # ⚠️ 关键修改（对比原05b版本）：
-# 1. TRproduct → Fixed_Trate（数据源：TR_fixed_window_{year}.tif，临时计算）
+# 1. Ttotal → TRc_{year}.tif（当年SOS-POS累计蒸腾）
 # 2. Fixed_Trate = TR_fixed_window / Fixed_Window_Length（与04c一致）
 # 3. 生长季气候：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
 # 4. 生长季GPP：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
@@ -58,6 +58,7 @@ PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology_EPSG4326")
 # 新路径: Decomposition_FixedWindow/TR_fixed_window_{year}.tif（03c模块输出）
 # 说明：Fixed_Trate需临时计算 = TR_fixed_window / Fixed_Window_Length
 DECOMP_DIR <- file.path(OUTPUT_ROOT, "Decomposition_FixedWindow")
+TRC_DIR <- file.path(OUTPUT_ROOT, "TRc_annual")
 MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
 TEMPLATE_FILE <- file.path(OUTPUT_ROOT, "masks", "template_grid.tif")
 
@@ -68,9 +69,9 @@ TA_DAILY_DIR <- file.path(ROOT, "Meteorological Data", "ERA5_Land", "Tem", "Tem_
 SW_DAILY_DIR <- file.path(ROOT, "Meteorological Data", "ERA5_Land", "DSW", "DSW_Daily", "DSW_Daily_2")
 
 # 输出目录（与05a命名风格保持一致：SEM_Data_*/SEM_Results_*）
-DATA_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed")
+DATA_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed_Ttotal_Trate")
 DERIVED_DIR <- file.path(DATA_DIR, "Derived")
-OUTPUT_DIR <- file.path(OUTPUT_ROOT, "SEM_Results_Dual_Fixed")
+OUTPUT_DIR <- file.path(OUTPUT_ROOT, "SEM_Results_Dual_Fixed_Ttotal_Trate")
 PIXELWISE_DIR <- file.path(OUTPUT_DIR, "Pixelwise")
 
 # 像元模式复用已有物候气候态缓存
@@ -441,7 +442,8 @@ check_raster_alignment <- function(template_r, mask_r, year) {
     list(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)), "TR_fixed_window"),
     list(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "Fixed_Window_Length"),
     list(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year)), "SOS"),
-    list(file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year)), "POS")
+    list(file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year)), "POS"),
+    list(file.path(TRC_DIR, sprintf("TRc_%d.tif", year)), "TRc")
   )
 
   for (item in sample_files) {
@@ -767,14 +769,22 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
   }
 
   tr_fixed_r <- raster(tr_fixed_file)
+  ttotal_file <- file.path(TRC_DIR, sprintf("TRc_%d.tif", year))
+  if (!file.exists(ttotal_file)) {
+    cat(sprintf("  ✗ Ttotal文件不存在: %s\n", basename(ttotal_file)))
+    return(NULL)
+  }
+  ttotal_r <- raster(ttotal_file)
   sos_r <- raster(sos_file)
 
   tr_fixed_r <- set_nodata_if_missing(tr_fixed_r)
+  ttotal_r <- set_nodata_if_missing(ttotal_r)
   sos_r <- set_nodata_if_missing(sos_r)
 
   # 应用掩膜
   sos_r <- mask_raster(sos_r, mask_r)
   tr_fixed_r <- mask_raster(tr_fixed_r, mask_r)
+  ttotal_r <- mask_raster(ttotal_r, mask_r)
 
   # 计算Fixed_Trate = TR_fixed_window / Fixed_Window_Length
   cat("  [计算Fixed_Trate] TR_fixed_window / Fixed_Window_Length...\n")
@@ -909,7 +919,8 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
 
   # ===【修改3d】返回Fixed_Trate（替代TRc）===
   list(
-    fixed_trate = fixed_trate_r,  # 修改：trc → fixed_trate
+    ttotal = ttotal_r,
+    fixed_trate = fixed_trate_r,
     sos = sos_r,
     p_pre = p_pre_r,
     t_pre = t_pre_r,
@@ -943,7 +954,7 @@ prepare_sem_caches <- function(years, sos_climatology_r, pos_climatology_r,
 # ===【修改5】Fixed_Trate替代TRc===
 calculate_vif <- function(data) {
   # 双时间尺度模型的VIF诊断
-  lm_model <- lm(Fixed_Trate ~ SOS + GPP_season + P_pre + T_pre + SW_pre +
+  lm_model <- lm(Ttotal ~ SOS + Fixed_Trate + P_pre + T_pre + SW_pre +
                    P_season + T_season + SW_season, data = data)
   x <- model.matrix(lm_model)[, -1, drop = FALSE]
 
@@ -979,7 +990,8 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
 
   # 构建文件列表
   files <- list(
-    TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),  # 修改：TRc → TR_fixed_window
+    TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),
+    TRc_annual = file.path(TRC_DIR, sprintf("TRc_%d.tif", years)),
     SOS = file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", years)),
     GPP_season = file.path(DERIVED_DIR, sprintf("GPP_season_%d.tif", years)),
     P_pre = file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", years)),
@@ -1019,24 +1031,24 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     "SOS~P_pre",
     "SOS~T_pre",
     "SOS~SW_pre",
-    "GPP_season~SOS",
-    "GPP_season~P_pre",
-    "GPP_season~T_pre",
-    "GPP_season~SW_pre",
-    "GPP_season~P_season",
-    "GPP_season~T_season",
-    "GPP_season~SW_season",
-    "Fixed_Trate~SOS",  # 修改：TRc → Fixed_Trate
-    "Fixed_Trate~GPP_season",
+    "Fixed_Trate~SOS",
     "Fixed_Trate~P_pre",
     "Fixed_Trate~T_pre",
     "Fixed_Trate~SW_pre",
     "Fixed_Trate~P_season",
     "Fixed_Trate~T_season",
     "Fixed_Trate~SW_season",
-    "P_pre_via_SOS_GPP",
-    "T_pre_via_SOS_GPP",
-    "SW_pre_via_SOS_GPP"
+    "Ttotal~SOS",
+    "Ttotal~Fixed_Trate",
+    "Ttotal~P_pre",
+    "Ttotal~T_pre",
+    "Ttotal~SW_pre",
+    "Ttotal~P_season",
+    "Ttotal~T_season",
+    "Ttotal~SW_season",
+    "P_pre_via_SOS_FixedTrate",
+    "T_pre_via_SOS_FixedTrate",
+    "SW_pre_via_SOS_FixedTrate"
   )
 
   coef_sum <- setNames(rep(0, length(coef_names)), coef_names)
@@ -1046,7 +1058,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
   sig_sumsq <- setNames(rep(0, length(coef_names)), coef_names)
   sig_count <- setNames(rep(0, length(coef_names)), coef_names)
 
-  r2_names <- c("SOS", "GPP_season", "Fixed_Trate")
+  r2_names <- c("SOS", "Fixed_Trate", "Ttotal")
   r2_sum <- setNames(rep(0, length(r2_names)), r2_names)
   r2_sumsq <- setNames(rep(0, length(r2_names)), r2_names)
   r2_count <- setNames(rep(0, length(r2_names)), r2_names)
@@ -1088,6 +1100,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     tr_block <- sanitize_values(tr_block, na_values$TR_fixed_window, allow_negative = TRUE)
     fixed_trate_block <- tr_block / matrix(fixed_len_block, nrow = n_years, ncol = n_cells, byrow = TRUE)
 
+    ttotal_block <- t(getValues(stacks$TRc_annual, row = row, nrows = nrows))
+    ttotal_block <- sanitize_values(ttotal_block, na_values$TRc_annual, allow_negative = FALSE)
+
     sos_block <- t(getValues(stacks$SOS, row = row, nrows = nrows))
     sos_block <- sanitize_values(sos_block, na_values$SOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$GPP_season, row = row, nrows = nrows))
@@ -1105,7 +1120,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     sw_season_block <- t(getValues(stacks$SW_season, row = row, nrows = nrows))
     sw_season_block <- sanitize_values(sw_season_block, na_values$SW_season, allow_negative = FALSE)
 
-    valid_mat <- is.finite(fixed_trate_block) & is.finite(sos_block) & is.finite(gpp_block) &
+    valid_mat <- is.finite(ttotal_block) & is.finite(fixed_trate_block) & is.finite(sos_block) &
                  is.finite(p_pre_block) & is.finite(t_pre_block) & is.finite(sw_pre_block) &
                  is.finite(p_season_block) & is.finite(t_season_block) & is.finite(sw_season_block)
     valid_counts <- colSums(valid_mat)
@@ -1145,9 +1160,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
 
       df <- data.frame(
         year = years[valid_years],
+        Ttotal = ttotal_block[valid_years, idx],
         Fixed_Trate = fixed_trate_block[valid_years, idx],
         SOS = sos_block[valid_years, idx],
-        GPP_season = gpp_block[valid_years, idx],
         P_pre = p_pre_block[valid_years, idx],
         T_pre = t_pre_block[valid_years, idx],
         SW_pre = sw_pre_block[valid_years, idx],
@@ -1157,9 +1172,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       )
 
       if (DETREND_PIXEL_ENABLE) {
+        df$Ttotal <- detrend_series(df$Ttotal, df$year)
         df$Fixed_Trate <- detrend_series(df$Fixed_Trate, df$year)
         df$SOS <- detrend_series(df$SOS, df$year)
-        df$GPP_season <- detrend_series(df$GPP_season, df$year)
         df$P_pre <- detrend_series(df$P_pre, df$year)
         df$T_pre <- detrend_series(df$T_pre, df$year)
         df$SW_pre <- detrend_series(df$SW_pre, df$year)
@@ -1168,9 +1183,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
         df$SW_season <- detrend_series(df$SW_season, df$year)
       }
 
+      ttotal_z <- scale_vec(df$Ttotal)
       fixed_trate_z <- scale_vec(df$Fixed_Trate)
       sos_z <- scale_vec(df$SOS)
-      gpp_z <- scale_vec(df$GPP_season)
       p_pre_z <- scale_vec(df$P_pre)
       t_pre_z <- scale_vec(df$T_pre)
       sw_pre_z <- scale_vec(df$SW_pre)
@@ -1178,7 +1193,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       t_season_z <- scale_vec(df$T_season)
       sw_season_z <- scale_vec(df$SW_season)
 
-      if (any(is.na(c(fixed_trate_z, sos_z, gpp_z, p_pre_z, t_pre_z, sw_pre_z,
+      if (any(is.na(c(ttotal_z, fixed_trate_z, sos_z, p_pre_z, t_pre_z, sw_pre_z,
                       p_season_z, t_season_z, sw_season_z)))) {
         next
       }
@@ -1189,9 +1204,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       a <- a_res$beta
       p_a <- a_res$p
 
-      X_gpp <- cbind(sos_z, p_pre_z, t_pre_z, sw_pre_z, p_season_z, t_season_z, sw_season_z)
-      bc_res <- regress_beta_p(X_gpp, gpp_z)
-      r2_gpp <- calc_r2(X_gpp, gpp_z)
+      X_trate <- cbind(sos_z, p_pre_z, t_pre_z, sw_pre_z, p_season_z, t_season_z, sw_season_z)
+      bc_res <- regress_beta_p(X_trate, fixed_trate_z)
+      r2_trate <- calc_r2(X_trate, fixed_trate_z)
       bc <- bc_res$beta
       p_bc <- bc_res$p
       b <- bc[1]
@@ -1201,9 +1216,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       p_f <- p_bc[2:4]
       p_c <- p_bc[5:7]
 
-      vars_tr <- c("SOS", "GPP_season", "P_pre", "T_pre", "SW_pre",
+      vars_tr <- c("SOS", "Fixed_Trate", "P_pre", "T_pre", "SW_pre",
                    "P_season", "T_season", "SW_season")
-      X_tr_full <- cbind(sos_z, gpp_z, p_pre_z, t_pre_z, sw_pre_z,
+      X_tr_full <- cbind(sos_z, fixed_trate_z, p_pre_z, t_pre_z, sw_pre_z,
                          p_season_z, t_season_z, sw_season_z)
       X_tr <- X_tr_full
       vars_current <- vars_tr
@@ -1228,8 +1243,8 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       p_d <- rep(NA_real_, length(vars_tr))
 
       if (ncol(X_tr) >= 1) {
-        d_res <- regress_beta_p(X_tr, fixed_trate_z)
-        r2_tr <- calc_r2(X_tr, fixed_trate_z)
+        d_res <- regress_beta_p(X_tr, ttotal_z)
+        r2_tr <- calc_r2(X_tr, ttotal_z)
         if (!any(is.na(d_res$beta)) && !any(is.na(d_res$p))) {
           for (j in seq_along(vars_current)) {
             idx_match <- match(vars_current[j], vars_tr)
@@ -1265,7 +1280,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
         NA_real_, NA_real_, NA_real_
       )
 
-      r2_vals <- c(r2_sos, r2_gpp, r2_tr)
+      r2_vals <- c(r2_sos, r2_trate, r2_tr)
       filter_res <- filter_sem_outputs(vals, p_vals, r2_vals)
       vals <- filter_res$vals
       p_vals <- filter_res$p_vals
@@ -1586,9 +1601,9 @@ run_dual_timescale_sem <- function(years, mask_r) {
     if (SEM_SAMPLE_MODE == "annual_mean") {
       year_row <- data.frame(
         year = year,
-        Fixed_Trate = cellStats(rasters$fixed_trate, mean, na.rm = TRUE),  # 修改：TRc → Fixed_Trate, trc → fixed_trate
+        Ttotal = cellStats(rasters$ttotal, mean, na.rm = TRUE),
+        Fixed_Trate = cellStats(rasters$fixed_trate, mean, na.rm = TRUE),
         SOS = cellStats(rasters$sos, mean, na.rm = TRUE),
-        GPP_season = cellStats(rasters$gpp_season, mean, na.rm = TRUE),
         P_pre = cellStats(rasters$p_pre, mean, na.rm = TRUE),
         T_pre = cellStats(rasters$t_pre, mean, na.rm = TRUE),
         SW_pre = cellStats(rasters$sw_pre, mean, na.rm = TRUE),
@@ -1602,9 +1617,9 @@ run_dual_timescale_sem <- function(years, mask_r) {
       # 提取像元值
       vals <- data.frame(
         year = year,
-        Fixed_Trate = sanitize_values(getValues(rasters$fixed_trate), NAvalue(rasters$fixed_trate), TRUE),  # 修改：TRc → Fixed_Trate, trc → fixed_trate
+        Ttotal = sanitize_values(getValues(rasters$ttotal), NAvalue(rasters$ttotal), TRUE),
+        Fixed_Trate = sanitize_values(getValues(rasters$fixed_trate), NAvalue(rasters$fixed_trate), TRUE),
         SOS = sanitize_values(getValues(rasters$sos), NAvalue(rasters$sos), FALSE),
-        GPP_season = sanitize_values(getValues(rasters$gpp_season), NAvalue(rasters$gpp_season), FALSE),
         P_pre = sanitize_values(getValues(rasters$p_pre), NAvalue(rasters$p_pre), FALSE),
         T_pre = sanitize_values(getValues(rasters$t_pre), NAvalue(rasters$t_pre), TRUE),
         SW_pre = sanitize_values(getValues(rasters$sw_pre), NAvalue(rasters$sw_pre), FALSE),
@@ -1625,8 +1640,7 @@ run_dual_timescale_sem <- function(years, mask_r) {
   cat(sprintf("  总样本数: %d\n", nrow(sem_data)))
   cat(sprintf("  完整案例数: %d\n", sum(complete.cases(sem_data))))
 
-  # 修改：TRc → Fixed_Trate
-  for (col in c("Fixed_Trate", "SOS", "GPP_season", "P_pre", "T_pre", "SW_pre",
+  for (col in c("Ttotal", "Fixed_Trate", "SOS", "P_pre", "T_pre", "SW_pre",
                 "P_season", "T_season", "SW_season")) {
     valid_n <- sum(is.finite(sem_data[[col]]))
     mean_val <- mean(sem_data[[col]], na.rm = TRUE)
@@ -1680,51 +1694,51 @@ run_dual_timescale_sem <- function(years, mask_r) {
   cat("\n=== 构建双时间尺度SEM模型（固定窗口方法） ===\n")
   cat("✓ 气候因子: 降水(P)、气温(T)、短波辐射(SW)\n")
   cat("✓ 时间窗口: 季前气候（SOSav前3个月）+ 生长季气候（固定窗口[SOSav, POSav]）\n")
-  cat("✓ 因变量: Fixed_Trate（固定窗口蒸腾速率）\n")
+  cat("✓ 因变量: Ttotal（年蒸腾总量）\n")
 
   # 完整路径模型（降水 + 温度 + 短波辐射）
   sem_model <- '
     # 第一层：季前气候 → SOS（物候响应）
     SOS ~ a1*P_pre + a2*T_pre + a3*SW_pre
 
-    # 第二层：SOS + 季前气候 + 生长季气候 → GPP_season（碳固定）
-    GPP_season ~ b*SOS + f1*P_pre + f2*T_pre + f3*SW_pre +
-                 c1*P_season + c2*T_season + c3*SW_season
+    # 第二层：SOS + 季前气候 + 生长季气候 → Fixed_Trate（蒸腾速率）
+    Fixed_Trate ~ b*SOS + f1*P_pre + f2*T_pre + f3*SW_pre +
+            c1*P_season + c2*T_season + c3*SW_season
 
-    # 第三层：SOS + GPP_season + 季前气候 + 生长季气候 → Fixed_Trate（固定窗口蒸腾速率）
-    Fixed_Trate ~ g*SOS + d*GPP_season +
-          h1*P_pre + h2*T_pre + h3*SW_pre +
-          e1*P_season + e2*T_season + e3*SW_season
+    # 第三层：SOS + Fixed_Trate + 季前气候 + 生长季气候 → Ttotal（年蒸腾总量）
+    Ttotal ~ g*SOS + d*Fixed_Trate +
+             h1*P_pre + h2*T_pre + h3*SW_pre +
+             e1*P_season + e2*T_season + e3*SW_season
 
     # === 间接效应分解 ===
 
     # 季前气候的间接效应路径
-    P_pre_via_SOS_GPP  := a1 * b * d
-    T_pre_via_SOS_GPP  := a2 * b * d
-    SW_pre_via_SOS_GPP := a3 * b * d
+    P_pre_via_SOS_FixedTrate  := a1 * b * d
+    T_pre_via_SOS_FixedTrate  := a2 * b * d
+    SW_pre_via_SOS_FixedTrate := a3 * b * d
 
     P_pre_via_SOS  := a1 * g
     T_pre_via_SOS  := a2 * g
     SW_pre_via_SOS := a3 * g
 
-    P_pre_via_GPP  := f1 * d
-    T_pre_via_GPP  := f2 * d
-    SW_pre_via_GPP := f3 * d
+    P_pre_via_FixedTrate  := f1 * d
+    T_pre_via_FixedTrate  := f2 * d
+    SW_pre_via_FixedTrate := f3 * d
 
     # 季前气候的总间接效应
     P_pre_indirect  := a1*b*d + a1*g + f1*d
     T_pre_indirect  := a2*b*d + a2*g + f2*d
     SW_pre_indirect := a3*b*d + a3*g + f3*d
 
-    # 生长季气候通过GPP的间接效应
-    P_season_via_GPP  := c1 * d
-    T_season_via_GPP  := c2 * d
-    SW_season_via_GPP := c3 * d
+    # 生长季气候通过Fixed_Trate的间接效应
+    P_season_via_FixedTrate  := c1 * d
+    T_season_via_FixedTrate  := c2 * d
+    SW_season_via_FixedTrate := c3 * d
 
-    # GPP的中介比例
-    P_GPP_mediation := (c1*d) / (e1 + c1*d)
-    T_GPP_mediation := (c2*d) / (e2 + c2*d)
-    SW_GPP_mediation := (c3*d) / (e3 + c3*d)
+    # Fixed_Trate的中介比例
+    P_FixedTrate_mediation := (c1*d) / (e1 + c1*d)
+    T_FixedTrate_mediation := (c2*d) / (e2 + c2*d)
+    SW_FixedTrate_mediation := (c3*d) / (e3 + c3*d)
   '
 
   cat("\nSEM模型结构:\n")
@@ -1886,10 +1900,9 @@ main <- function() {
 
   cat("----------------------------------------------------------------------\n")
 
+  # 运行双时间尺度SEM（全域均值 + 像元时间序列）
   sem_mode_orig <- SEM_SAMPLE_MODE
   detrend_orig <- DETREND_ENABLE
-
-  # 运行双时间尺度SEM（先全域均值，再像元级）
   SEM_SAMPLE_MODE <- "annual_mean"
   run_annual_mean_once <- function(enable_detrend, label) {
     DETREND_ENABLE <<- enable_detrend
@@ -1918,12 +1931,11 @@ main <- function() {
     run_annual_mean_once(DETREND_ENABLE, label)
   }
 
-  # ===【修改10】像元时间序列模式：添加POSav气候态计算===
+  SEM_SAMPLE_MODE <- sem_mode_orig
   set_output_dirs("")
   DETREND_ENABLE <- detrend_orig
-  SEM_SAMPLE_MODE <- "pixel_time_series"
-  cat("\n=== 像元级SEM（pixel_time_series） ===\n")
-  {
+
+  # ===【修改10】像元时间序列模式：添加POSav气候态计算===
     # 先计算物候气候态（SOSav, POSav）
     cat("\n=== 计算物候气候态（像元多年平均：SOSav, POSav） ===\n")
     sos_clim_file <- file.path(DERIVED_DIR, "SOS_climatology.tif")
@@ -2044,9 +2056,6 @@ main <- function() {
 
     # 运行像元时间序列SEM
     run_sem_pixel_time_series(years, sos_climatology_r, fixed_window_length_r, mask_r)
-  }
-
-  SEM_SAMPLE_MODE <- sem_mode_orig
 
   cat("\n======================================================================\n")
   cat("✓ 双时间尺度SEM分析完成\n")
@@ -2067,6 +2076,6 @@ if (!interactive()) {
   cat("请手动执行以下命令以运行双时间尺度SEM分析:\n\n")
   cat("  main()\n\n")
   cat("或者使用以下命令在非交互模式运行:\n\n")
-  cat("  Rscript 05b_SEM_analysis_dual_timescale_SOS.R\n")
+  cat("  Rscript 05b_SEM_analysis_dual_timescale_SOS_Ttotal_Trate.R\n")
   cat("======================================================================\n\n")
 }

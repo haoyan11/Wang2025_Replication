@@ -38,53 +38,43 @@ MODULES = [
         'description': '创建掩膜、气候平均态等'
     },
     {
-        'name': 'Module 01: 物候提取',
-        'script': '01_phenology_extraction.py',
-        'required': True,
-        'description': '从SIF提取SOS/POS/EOS'
-    },
-    {
         'name': 'Module 02: TRc计算',
         'script': '02_TRc_calculation.py',
         'required': True,
         'description': '计算SOS-POS窗口内累积蒸腾'
     },
     {
-        'name': 'Module 03a: Wang 2025分解（GPP物候）',
-        'script': '03a_decomposition_wang2025.py',
+        'name': 'Module 03c: 固定窗口分解',
+        'script': '03c_decomposition_fixed_window.py',
         'required': True,
-        'description': 'TRpheno + TRproduct 分解（Wang 2025原始方法）'
+        'description': '固定窗口分解（使用当年TR日序列）'
     },
     {
-        'name': 'Module 03b: Timing/Shape分解（可选）',
-        'script': '03b_decomposition_timing_shape.py',
-        'required': False,
-        'description': 'TRtiming + TRshape 分解（新方法）'
-    },
-    {
-        'name': 'Module 04a: 统计分析（Wang 2025方法）',
-        'script': '04a_statistical_wang2025.py',
+        'name': 'Module 04c: 固定窗口统计分析',
+        'script': '04c_statistical_fixed_window.py',
         'required': True,
-        'description': 'ΔSOS回归分析（对应03a分解）'
+        'description': '固定窗口统计分析'
     },
     {
-        'name': 'Module 04b: 统计分析（Timing/Shape）',
-        'script': '04b_statistical_timing_shape.py',
+        'name': 'Module 05b: SEM双时间尺度（SOS）',
+        'script': '05b_SEM_analysis_dual_timescale_SOS.R',
         'required': False,
-        'description': 'Timing/Shape回归分析（对应03b分解）'
-    },
-    {
-        'name': 'Module 05: SEM分析',
-        'script': '05_SEM_analysis.R',
-        'required': False,
-        'description': '结构方程模型（需要R环境）',
+        'description': '双时间尺度SEM（SOS → GPP → Fixed_Trate）',
         'interpreter': 'Rscript'
     },
     {
-        'name': 'Module 06: 绘图',
-        'script': '06_plotting.py',
-        'required': True,
-        'description': '生成所有图表'
+        'name': 'Module 05b_Ttotal: SEM双时间尺度（Ttotal/Trate）',
+        'script': '05b_SEM_analysis_dual_timescale_SOS_Ttotal_Trate.R',
+        'required': False,
+        'description': '双时间尺度SEM（SOS → Fixed_Trate → Ttotal）',
+        'interpreter': 'Rscript'
+    },
+    {
+        'name': 'Module 05c: SEM混合池（Pooled）',
+        'script': '05c_SEM_analysis_robust_pooled_SOS.R',
+        'required': False,
+        'description': 'Pooled SEM（像元-年份）',
+        'interpreter': 'Rscript'
     }
 ]
 

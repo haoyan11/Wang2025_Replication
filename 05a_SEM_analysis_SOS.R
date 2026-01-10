@@ -208,6 +208,14 @@ sanitize_values <- function(vals, nodata, allow_negative = TRUE) {
   vals
 }
 
+set_nodata_if_missing <- function(r, fallback = NODATA_OUT) {
+  nodata <- NAvalue(r)
+  if (is.na(nodata) || !is.finite(nodata)) {
+    NAvalue(r) <- fallback
+  }
+  r
+}
+
 # Z-score标准化
 scale_vec <- function(x) {
   # 移除NA值计算均值和标准差
@@ -565,9 +573,9 @@ prepare_year_rasters <- function(year, mask_r) {
   })
   if (is.null(pos_r)) return(NULL)
 
-  NAvalue(trproduct_r) <- NODATA_OUT
-  NAvalue(sos_r) <- NODATA_OUT
-  NAvalue(pos_r) <- NODATA_OUT
+  trproduct_r <- set_nodata_if_missing(trproduct_r)
+  sos_r <- set_nodata_if_missing(sos_r)
+  pos_r <- set_nodata_if_missing(pos_r)
 
   sos_r <- mask_raster(sos_r, mask_r)
   pos_r <- mask_raster(pos_r, mask_r)
@@ -764,13 +772,21 @@ run_sem_pooled <- function(data) {
   fit <- sem(model, data = data, estimator = "MLR")
 
   cat("\nSEM拟合摘要:\n")
-  summary(fit, fit.measures = TRUE, standardized = TRUE, rsquare = TRUE)
+  fit_summary <- summary(fit, fit.measures = TRUE, standardized = TRUE, rsquare = TRUE)
+  print(fit_summary)
 
   params <- parameterEstimates(fit, standardized = TRUE)
   write.csv(params, file.path(OUTPUT_DIR, "SEM_parameters.csv"), row.names = FALSE)
 
   fit_measures <- fitMeasures(fit, c("chisq", "df", "pvalue", "cfi", "tli", "rmsea", "srmr"))
   write.csv(t(as.data.frame(fit_measures)), file.path(OUTPUT_DIR, "SEM_fitindices.csv"))
+
+  r2_vals <- inspect(fit, "r2")
+  write.csv(as.data.frame(r2_vals), file.path(OUTPUT_DIR, "SEM_R2.csv"))
+
+  sink(file.path(OUTPUT_DIR, "SEM_summary.txt"))
+  print(fit_summary)
+  sink()
 
   # 路径图
   pdf(file.path(OUTPUT_DIR, "SEM_pathdiagram.pdf"), width = 10, height = 8)

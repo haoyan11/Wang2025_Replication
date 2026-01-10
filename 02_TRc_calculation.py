@@ -18,8 +18,9 @@ warnings.filterwarnings('ignore')
 
 # 导入配置
 from _config import (
-    ROOT, PHENO_DIR, TR_DAILY_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
-    YEAR_START, YEAR_END, BLOCK_SIZE, MAX_WORKERS, NODATA_OUT
+    PHENO_DIR, TR_DAILY_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
+    YEAR_START, YEAR_END, BLOCK_SIZE, MAX_WORKERS, NODATA_OUT, TR_FILE_FORMAT,
+    PHENO_FILE_FORMAT, TEMPLATE_RASTER, MASK_FILE
 )
 
 # 确保输出目录存在
@@ -32,139 +33,85 @@ OUTPUT_DIR = TRC_ANNUAL_DIR
 # ==================== 辅助函数 ====================
 def get_TR_file_path(date_obj):
     """
-    获取ERA5-Land TR日数据文件路径
-    格式: ERA5L_ET_transp_Daily_mm_YYYYMMDD.tif
+    获取TR日数据文件路径（使用_config.py中的TR_FILE_FORMAT）
     """
     yyyymmdd = date_obj.strftime("%Y%m%d")
-
-    # ERA5-Land格式
-    file_path = TR_DAILY_DIR / f"ERA5L_ET_transp_Daily_mm_{yyyymmdd}.tif"
-
+    file_path = TR_DAILY_DIR / TR_FILE_FORMAT.format(date=yyyymmdd)
     if file_path.exists():
         return file_path
-
     return None
+
+
+def load_template_profile():
+    if not TEMPLATE_RASTER.exists():
+        raise FileNotFoundError(f"模板栅格不存在: {TEMPLATE_RASTER}")
+    with rasterio.open(TEMPLATE_RASTER) as src:
+        return src.profile.copy()
+
+def load_mask():
+    if not MASK_FILE.exists():
+        raise FileNotFoundError(f"掩膜文件不存在: {MASK_FILE}")
+    with rasterio.open(MASK_FILE) as src:
+        mask_data = src.read(1)
+        mask_nodata = src.nodata
+    mask = np.isfinite(mask_data)
+    if mask_nodata is not None and np.isfinite(mask_nodata):
+        mask &= mask_data != mask_nodata
+    mask &= mask_data > 0
+    return mask
+
+
+def check_spatial_consistency(ref_profile, file_path, data_profile, var_name="data"):
+    if ref_profile["width"] != data_profile["width"] or ref_profile["height"] != data_profile["height"]:
+        raise ValueError(
+            f"{var_name}尺寸不一致: {file_path}\n"
+            f"  Expected: {ref_profile['height']}x{ref_profile['width']}\n"
+            f"  Got: {data_profile['height']}x{data_profile['width']}"
+        )
+    if ref_profile.get("crs") != data_profile.get("crs"):
+        raise ValueError(
+            f"{var_name} CRS不一致: {file_path}\n"
+            f"  Expected: {ref_profile.get('crs')}\n"
+            f"  Got: {data_profile.get('crs')}"
+        )
+    ref_transform = ref_profile.get("transform")
+    data_transform = data_profile.get("transform")
+    if ref_transform is not None and data_transform is not None:
+        transform_match = all(
+            abs(ref_transform[i] - data_transform[i]) < 1e-6
+            for i in range(6)
+        )
+        if not transform_match:
+            raise ValueError(
+                f"{var_name} Transform不一致: {file_path}\n"
+                f"  Expected: {ref_transform}\n"
+                f"  Got: {data_transform}"
+            )
 
 def is_leap_year(year):
     """判断是否为闰年"""
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
 
-# ==================== 核心计算函数 ====================
-def calculate_TRc_for_year(year, mask):
+# 物候DOY使用无闰日（1-365）
+PHENO_MAX_DOY = 365
+MIN_VALID_FRAC = 0.60  # 有效天数阈值（SOS-POS窗口内）
+
+def noleap_doy_from_date(date_obj):
     """
-    计算单个年份的TRc
-
-    Parameters:
-    -----------
-    year : int
-        年份
-    mask : ndarray
-        有效掩膜（布尔数组）
-
-    Returns:
-    --------
-    TRc : ndarray
-        累积蒸腾栅格
-    profile : dict
-        栅格配置
+    将真实日期映射为无闰日DOY（1-365）。
+    闰年跳过2月29日，3月1日及之后的DOY减1。
+    返回None表示2月29日（需跳过）。
     """
-    print(f"\n=== 计算TRc: {year} ===")
-
-    # 读取物候数据（物候代码输出格式：小写sos_gpp）
-    sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
-    pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"  # 注意是pos_doy
-
-    if not sos_file.exists() or not pos_file.exists():
-        print(f"  ✗ 错误：缺少物候数据")
-        print(f"    SOS文件: {sos_file}")
-        print(f"    SOS存在: {sos_file.exists()}")
-        print(f"    POS文件: {pos_file}")
-        print(f"    POS存在: {pos_file.exists()}")
-        print("  请先运行物候计算代码或确认物候数据路径")
-        return None, None
-
-    with rasterio.open(sos_file) as src:
-        sos = src.read(1)
-        height, width = src.height, src.width
-
-    with rasterio.open(pos_file) as src:
-        pos = src.read(1)
-
-    # 从TR数据获取profile（确保使用EPSG:4326 CRS）
-    test_date = datetime(year, 1, 15)
-    test_tr_file = get_TR_file_path(test_date)
-    if test_tr_file is None or not test_tr_file.exists():
-        print(f"  ✗ 错误：找不到TR数据文件用于获取profile")
-        return None, None
-    with rasterio.open(test_tr_file) as src:
-        profile = src.profile.copy()
-
-    # 初始化TRc数组
-    TRc = np.zeros((height, width), dtype=np.float32)
-    TRc[~mask] = NODATA_OUT
-
-    # 生成日期列表
-    days_in_year = 366 if is_leap_year(year) else 365
-    dates_year = [datetime(year, 1, 1) + timedelta(days=i) for i in range(days_in_year)]
-
-    print(f"  年份: {year}, 天数: {days_in_year}")
-
-    # 逐日累加TR
-    missing_files = 0
-    valid_days = 0
-
-    for date_obj in tqdm(dates_year, desc="累加TR", leave=False):
-        doy = date_obj.timetuple().tm_yday
-        tr_file = get_TR_file_path(date_obj)
-
-        if tr_file is None or not tr_file.exists():
-            missing_files += 1
-            continue
-
-        try:
-            with rasterio.open(tr_file) as src:
-                tr_daily = src.read(1)
-
-            # 累加：仅在SOS ≤ doy ≤ POS的像元
-            for i in range(height):
-                for j in range(width):
-                    if not mask[i, j]:
-                        continue
-
-                    sos_ij = sos[i, j]
-                    pos_ij = pos[i, j]
-
-                    # 检查有效性
-                    if sos_ij == NODATA_OUT or pos_ij == NODATA_OUT:
-                        continue
-
-                    if sos_ij <= doy <= pos_ij:
-                        tr_val = tr_daily[i, j]
-                        if tr_val != NODATA_OUT and not np.isnan(tr_val) and tr_val >= 0:
-                            TRc[i, j] += tr_val
-
-            valid_days += 1
-
-        except Exception as e:
-            tqdm.write(f"  ⚠ 读取失败: {tr_file.name} - {str(e)}")
-            missing_files += 1
-            continue
-
-    print(f"  有效天数: {valid_days}/{days_in_year}, 缺失: {missing_files}")
-
-    # 质量检查
-    TRc_valid = TRc[mask & (TRc != NODATA_OUT)]
-    if len(TRc_valid) > 0:
-        print(f"  TRc范围: {np.min(TRc_valid):.2f} - {np.max(TRc_valid):.2f} mm")
-        print(f"  TRc平均: {np.mean(TRc_valid):.2f} mm")
-        print(f"  有效像元: {len(TRc_valid)}")
-    else:
-        print(f"  ⚠ 警告：没有有效的TRc值")
-
-    return TRc, profile
+    doy = date_obj.timetuple().tm_yday
+    if is_leap_year(date_obj.year):
+        if doy == 60:
+            return None
+        if doy > 60:
+            return doy - 1
+    return doy
 
 # ==================== 块处理版本（优化内存+性能） ====================
-def calculate_TRc_block_optimized(year, mask):
+def calculate_TRc_block_optimized(year, mask, template_profile):
     """
     块处理优化版本：先天后块循环 + NODATA修复 + valid_pheno检查
 
@@ -179,6 +126,8 @@ def calculate_TRc_block_optimized(year, mask):
         年份
     mask : ndarray
         有效掩膜（布尔数组）
+    template_profile : dict
+        模板栅格profile（统一网格）
 
     Returns:
     --------
@@ -190,8 +139,8 @@ def calculate_TRc_block_optimized(year, mask):
     print(f"\n=== 计算TRc（块处理-加速版）: {year} ===")
 
     # 读取物候数据（物候代码输出格式）
-    sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
-    pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"
+    sos_file = PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year)
+    pos_file = PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year)
 
     if not sos_file.exists() or not pos_file.exists():
         print(f"  ✗ 错误：缺少物候数据")
@@ -208,14 +157,15 @@ def calculate_TRc_block_optimized(year, mask):
         pos = src.read(1)
         nodata_pos = src.nodata  # ✅ 读取真实nodata
 
-    # 从TR数据获取profile（确保使用EPSG:4326 CRS）
+    # 使用统一模板profile
+    profile = template_profile.copy()
     test_date = datetime(year, 1, 15)
     test_tr_file = get_TR_file_path(test_date)
     if test_tr_file is None or not test_tr_file.exists():
-        print(f"  ✗ 错误：找不到TR数据文件用于获取profile")
+        print(f"  ✗ 错误：找不到TR数据文件用于检查profile一致性")
         return None, None
     with rasterio.open(test_tr_file) as src:
-        profile = src.profile.copy()
+        check_spatial_consistency(profile, test_tr_file, src.profile, f"TR({year})")
 
     days_in_year = 366 if is_leap_year(year) else 365
     dates_year = [datetime(year, 1, 1) + timedelta(days=i) for i in range(days_in_year)]
@@ -236,12 +186,13 @@ def calculate_TRc_block_optimized(year, mask):
         & _is_valid_pheno(pos, nodata_pos)
         & (sos > 0) & (pos > 0)
         & (pos >= sos)
-        & (sos <= days_in_year) & (pos <= days_in_year)
+        & (sos <= PHENO_MAX_DOY) & (pos <= PHENO_MAX_DOY)
     )
 
     # 初始化TRc：只对valid_pheno初始化为0，其他为NODATA
     TRc = np.full((height, width), NODATA_OUT, dtype=np.float32)
     TRc[valid_pheno] = 0.0
+    TRc_count = np.zeros((height, width), dtype=np.int16)
 
     # 生成块窗口
     block_windows = [
@@ -254,7 +205,6 @@ def calculate_TRc_block_optimized(year, mask):
     print(f"  总块数: {len(block_windows)}")
 
     missing_files = 0
-    opened_any = False
     nodata_tr = None
 
     # ✅ 优化：改为"先天后块"循环（性能提升18倍+）
@@ -264,14 +214,14 @@ def calculate_TRc_block_optimized(year, mask):
             missing_files += 1
             continue
 
-        doy = date_obj.timetuple().tm_yday
+        doy = noleap_doy_from_date(date_obj)
+        if doy is None:
+            continue
 
         try:
             with rasterio.open(tr_file) as src:
-                # ✅ 读取TR数据的真实nodata（只读一次）
-                if not opened_any:
-                    nodata_tr = src.nodata
-                    opened_any = True
+                # ✅ 每文件读取nodata，避免跨文件不一致
+                nodata_tr = src.nodata
 
                 # 逐块读取并累加
                 for win in block_windows:
@@ -304,7 +254,10 @@ def calculate_TRc_block_optimized(year, mask):
 
                     acc = in_window & valid_tr
                     if np.any(acc):
-                        TRc[r0:r1, c0:c1][acc] += tr_b[acc]
+                        trc_block = TRc[r0:r1, c0:c1]
+                        trc_block[acc] += tr_b[acc]
+                        count_block = TRc_count[r0:r1, c0:c1]
+                        count_block[acc] += 1
 
         except Exception as e:
             missing_files += 1
@@ -312,8 +265,16 @@ def calculate_TRc_block_optimized(year, mask):
 
     print(f"  缺失日文件数: {missing_files}/{days_in_year}")
 
+    # 有效天数比例过滤（窗口内有效天数需 >= MIN_VALID_FRAC * 窗口长度）
+    sos_i = np.rint(sos).astype(np.int16)
+    pos_i = np.rint(pos).astype(np.int16)
+    window_len = (pos_i - sos_i + 1).astype(np.int16)
+    min_required = np.ceil(MIN_VALID_FRAC * window_len).astype(np.int16)
+    valid_count = valid_pheno & (TRc_count >= min_required)
+    TRc[valid_pheno & ~valid_count] = NODATA_OUT
+
     # 质量检查
-    TRc_valid = TRc[valid_pheno & (TRc != NODATA_OUT)]
+    TRc_valid = TRc[valid_count & (TRc != NODATA_OUT)]
     if TRc_valid.size > 0:
         print(f"  TRc范围: {TRc_valid.min():.2f} - {TRc_valid.max():.2f} mm")
         print(f"  TRc平均: {TRc_valid.mean():.2f} mm")
@@ -324,7 +285,7 @@ def calculate_TRc_block_optimized(year, mask):
     return TRc, profile
 
 # ==================== 气候态计算（多年平均）====================
-def calculate_daily_TR_climatology(years, mask):
+def calculate_daily_TR_climatology(years, mask, template_profile):
     """
     计算多年平均日TR时间序列（日气候态）
 
@@ -337,6 +298,8 @@ def calculate_daily_TR_climatology(years, mask):
         年份列表
     mask : ndarray
         有效掩膜（布尔数组）
+    template_profile : dict
+        模板栅格profile（统一网格）
 
     Returns:
     --------
@@ -348,17 +311,15 @@ def calculate_daily_TR_climatology(years, mask):
     print("\n=== 计算多年平均日TR气候态 ===")
     print(f"  年份范围: {min(years)}-{max(years)} ({len(years)}年)")
 
-    # 读取一个文件获取尺寸和profile
+    profile = template_profile.copy()
     test_date = datetime(years[0], 1, 15)
     test_file = get_TR_file_path(test_date)
-
     if test_file is None or not test_file.exists():
         print(f"  ✗ 错误：找不到TR数据文件")
         return None, None
-
     with rasterio.open(test_file) as src:
+        check_spatial_consistency(profile, test_file, src.profile, "TR样本")
         height, width = src.height, src.width
-        profile = src.profile.copy()
         nodata_tr = src.nodata
 
     # 初始化累加器：(365天, H, W)
@@ -394,6 +355,7 @@ def calculate_daily_TR_climatology(years, mask):
             try:
                 with rasterio.open(tr_file) as src:
                     tr_daily = src.read(1)
+                    nodata_tr = src.nodata
 
                 # 判断有效TR值
                 if nodata_tr is None:
@@ -406,8 +368,10 @@ def calculate_daily_TR_climatology(years, mask):
                 valid_tr &= (tr_daily >= 0)
 
                 # 累加
-                TR_sum[doy_idx][valid_tr] += tr_daily[valid_tr]
-                TR_count[doy_idx][valid_tr] += 1
+                tr_sum_block = TR_sum[doy_idx]
+                tr_sum_block[valid_tr] += tr_daily[valid_tr]
+                tr_count_block = TR_count[doy_idx]
+                tr_count_block[valid_tr] += 1
 
             except Exception as e:
                 continue
@@ -419,8 +383,9 @@ def calculate_daily_TR_climatology(years, mask):
     with np.errstate(divide='ignore', invalid='ignore'):
         for doy_idx in range(365):
             valid = (TR_count[doy_idx] > 0) & mask
-            TR_climatology[doy_idx][valid] = (TR_sum[doy_idx][valid] /
-                                              TR_count[doy_idx][valid]).astype(np.float32)
+            tr_clim_block = TR_climatology[doy_idx]
+            tr_clim_block[valid] = (TR_sum[doy_idx][valid] /
+                                    TR_count[doy_idx][valid]).astype(np.float32)
 
     # 统计信息
     print(f"\n  统计信息:")
@@ -433,7 +398,7 @@ def calculate_daily_TR_climatology(years, mask):
 
     return TR_climatology, profile
 
-def calculate_phenology_climatology(years, mask):
+def calculate_phenology_climatology(years, mask, template_profile):
     """
     计算多年平均物候（SOSav, POSav）
 
@@ -443,6 +408,8 @@ def calculate_phenology_climatology(years, mask):
         年份列表
     mask : ndarray
         有效掩膜（布尔数组），用于保持与TR气候态的空间一致性
+    template_profile : dict
+        模板栅格profile（统一网格）
 
     Returns:
     --------
@@ -456,10 +423,12 @@ def calculate_phenology_climatology(years, mask):
 
     sos_stack = []
     pos_stack = []
+    profile = template_profile.copy()
+    profile_checked = False
 
     for year in tqdm(years, desc="读取物候数据"):
-        sos_file = PHENO_DIR / f"sos_gpp_{year}.tif"
-        pos_file = PHENO_DIR / f"pos_doy_gpp_{year}.tif"
+        sos_file = PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year)
+        pos_file = PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year)
 
         if not sos_file.exists() or not pos_file.exists():
             print(f"  ⚠ 跳过 {year}：缺少物候数据")
@@ -467,12 +436,17 @@ def calculate_phenology_climatology(years, mask):
 
         with rasterio.open(sos_file) as src:
             sos = src.read(1)
-            profile = src.profile.copy()
+            sos_profile = src.profile.copy()
             nodata_sos = src.nodata
+            if not profile_checked:
+                check_spatial_consistency(profile, sos_file, sos_profile, f"SOS({year})")
 
         with rasterio.open(pos_file) as src:
             pos = src.read(1)
+            if not profile_checked:
+                check_spatial_consistency(profile, pos_file, src.profile, f"POS({year})")
             nodata_pos = src.nodata
+            profile_checked = True
 
         # 构建有效物候掩膜（与TRc计算逻辑一致）
         def _is_valid_pheno_value(arr, nodata):
@@ -543,24 +517,24 @@ def save_climatology_data():
     climatology_dir = CLIMATOLOGY_DIR
 
     years = list(range(YEAR_START, YEAR_END + 1))
+    template_profile = load_template_profile()
 
     # 读取掩膜
     print("\n[1/3] 读取掩膜...")
-    mask_file = ROOT / "Wang2025_Analysis" / "masks" / "combined_mask.tif"
+    mask_file = MASK_FILE
 
     if not mask_file.exists():
         print(f"  ✗ 错误：掩膜文件不存在: {mask_file}")
         print("  请先运行 Module 00: 00_data_preparation.py")
         return
 
-    with rasterio.open(mask_file) as src:
-        mask = src.read(1).astype(bool)
+    mask = load_mask()
 
     print(f"  ✓ 有效像元数: {np.sum(mask)}")
 
     # 计算TR日气候态
     print("\n[2/3] 计算TR日气候态（365天）...")
-    TR_climatology, profile = calculate_daily_TR_climatology(years, mask)
+    TR_climatology, profile = calculate_daily_TR_climatology(years, mask, template_profile)
 
     if TR_climatology is None:
         print("  ✗ 计算失败")
@@ -585,7 +559,7 @@ def save_climatology_data():
 
     # 计算物候气候态
     print("\n[3/3] 计算物候气候态（SOSav, POSav）...")
-    SOSav, POSav, _ = calculate_phenology_climatology(years, mask)
+    SOSav, POSav, _ = calculate_phenology_climatology(years, mask, template_profile)
 
     # 保存SOSav（使用profile_tr以确保CRS和空间参考与TR_daily_climatology一致）
     output_sos = climatology_dir / "SOSav.tif"
@@ -622,7 +596,7 @@ def main(use_block_processing=True):
     Parameters:
     -----------
     use_block_processing : bool
-        是否使用块处理（推荐True以节省内存）
+        是否使用块处理（普通版已移除，参数仅保留兼容）
     """
     print("\n" + "="*70)
     print("Module 02: TRc计算")
@@ -632,15 +606,14 @@ def main(use_block_processing=True):
 
     # 读取掩膜
     print("\n[1/3] 读取掩膜...")
-    mask_file = ROOT / "Wang2025_Analysis" / "masks" / "combined_mask.tif"
+    mask_file = MASK_FILE
 
     if not mask_file.exists():
         print(f"  ✗ 错误：掩膜文件不存在: {mask_file}")
         print("  请先运行 Module 00: 00_data_preparation.py")
         return
 
-    with rasterio.open(mask_file) as src:
-        mask = src.read(1).astype(bool)
+    mask = load_mask()
 
     print(f"  ✓ 有效像元数: {np.sum(mask)}")
 
@@ -652,7 +625,7 @@ def main(use_block_processing=True):
     if test_file is None or not test_file.exists():
         print(f"  ✗ 错误：找不到TR数据")
         print(f"    测试日期: {test_date.strftime('%Y-%m-%d')}")
-        print(f"    预期路径示例: {TR_DAILY_DIR / f'ERA5L_ET_transp_Daily_mm_{YEAR_START}0115.tif'}")  # ✅ 修正提示信息
+        print(f"    预期路径示例: {TR_DAILY_DIR / TR_FILE_FORMAT.format(date=f'{YEAR_START}0115')}")
         print(f"\n请检查以下路径是否正确:")
         print(f"  TR_DAILY_DIR = {TR_DAILY_DIR}")
         print(f"\n或修改 get_TR_file_path() 函数以匹配您的文件命名格式")
@@ -677,11 +650,10 @@ def main(use_block_processing=True):
             skipped += 1
             continue
 
-        # 选择处理方法
-        if use_block_processing:
-            TRc, profile = calculate_TRc_block_optimized(year, mask)
-        else:
-            TRc, profile = calculate_TRc_for_year(year, mask)
+        # 统一使用块处理（普通版已移除）
+        if not use_block_processing:
+            print("  ⚠ 已移除普通版，强制使用块处理加速版")
+        TRc, profile = calculate_TRc_block_optimized(year, mask, template_profile)
 
         if TRc is None:
             print(f"  ✗ 跳过年份 {year}（缺少数据）")
@@ -734,12 +706,10 @@ def process_single_year(args):
             'message': f"文件已存在: {output_file.name}"
         }
 
-    # 选择处理方法
+    # 统一使用块处理（普通版已移除）
     try:
-        if use_block_processing:
-            TRc, profile = calculate_TRc_block_optimized(year, mask)
-        else:
-            TRc, profile = calculate_TRc_for_year(year, mask)
+        template_profile = load_template_profile()
+        TRc, profile = calculate_TRc_block_optimized(year, mask, template_profile)
 
         if TRc is None:
             return {
@@ -774,7 +744,7 @@ def main_parallel(use_block_processing=True, max_workers=None):
     Parameters:
     -----------
     use_block_processing : bool
-        是否使用块处理
+        是否使用块处理（普通版已移除，参数仅保留兼容）
     max_workers : int
         并行进程数（默认使用MAX_WORKERS配置）
     """
@@ -784,20 +754,21 @@ def main_parallel(use_block_processing=True, max_workers=None):
     print("\n" + "="*70)
     print(f"Module 02: TRc计算（并行版本，{max_workers}个进程）")
     print("="*70)
+    if not use_block_processing:
+        print("⚠ 已移除普通版，强制使用块处理加速版")
 
     years = list(range(YEAR_START, YEAR_END + 1))
 
     # 读取掩膜
     print("\n[1/3] 读取掩膜...")
-    mask_file = ROOT / "Wang2025_Analysis" / "masks" / "combined_mask.tif"
+    mask_file = MASK_FILE
 
     if not mask_file.exists():
         print(f"  ✗ 错误：掩膜文件不存在: {mask_file}")
         print("  请先运行 Module 00: 00_data_preparation.py")
         return
 
-    with rasterio.open(mask_file) as src:
-        mask = src.read(1).astype(bool)
+    mask = load_mask()
 
     print(f"  ✓ 有效像元数: {np.sum(mask)}")
 
@@ -809,7 +780,7 @@ def main_parallel(use_block_processing=True, max_workers=None):
     if test_file is None or not test_file.exists():
         print(f"  ✗ 错误：找不到TR数据")
         print(f"    测试日期: {test_date.strftime('%Y-%m-%d')}")
-        print(f"    预期路径示例: {TR_DAILY_DIR / f'ERA5L_ET_transp_Daily_mm_{YEAR_START}0115.tif'}")
+        print(f"    预期路径示例: {TR_DAILY_DIR / TR_FILE_FORMAT.format(date=f'{YEAR_START}0115')}")
         print(f"\n请检查以下路径是否正确:")
         print(f"  TR_DAILY_DIR = {TR_DAILY_DIR}")
         return
@@ -871,10 +842,6 @@ if __name__ == "__main__":
     # - MAX_WORKERS=2-4 比较稳妥（I/O密集任务）
     # - 自动支持断点续算
     # main_parallel(use_block_processing=True, max_workers=2)
-
-    # 方式3：常规方法（仅用于对照验证，不推荐）
-    # ⚠️ 警告：常规方法比块处理慢得多，且仍有nodata硬编码问题
-    # main(use_block_processing=False)
 
     # ======================================================================
     # 步骤2：计算气候态数据（用于03_decomposition_original.py原版分解）

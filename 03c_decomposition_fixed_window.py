@@ -30,28 +30,38 @@ Optional split:
   - TR_fixed_window/(POSav-SOSav+1) = 真实的平均速率差异
   - 这是评估"蒸腾速率是否真的变高变低"的最佳指标
 
-实现方法（基于现有数据）：
-  由于没有当年每日TR数据B_y(t)，我们使用比例假设：
-  1. 计算增强因子 = TRc_y / sum_{SOS_y..POS_y} A(t)
-  2. 固定窗口估计 = 增强因子 × TRc_av
-  3. 窗口变化部分 = TRc_y - 固定窗口估计
+实现方法（使用当年每日TR数据）：
+  直接使用当年日尺度TR（B_y(t)）进行分解，无比例缩放假设：
+  1. TRc_y = sum_{SOS_y..POS_y} B_y(t)
+  2. TR_fixed_window = sum_{SOSav..POSav} [B_y(t) - A(t)]
+  3. TR_window_change = TRc_y - sum_{SOSav..POSav} B_y(t)
 
 Notes:
   - A(t) is the climatology TR_daily_av (365 bands).
-  - B_y(t) is the year-specific daily TR (estimated using proportional scaling).
+  - B_y(t) is the year-specific daily TR (observed daily TR, no scaling).
   - 固定窗口为[SOSav, POSav]，所有年份一致
 """
 
 import numpy as np
 import rasterio
+from rasterio.windows import Window
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+from datetime import datetime, timedelta
 
 # 导入配置
 from _config import (
     ROOT, PHENO_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR, DECOMPOSITION_FIXED_DIR,
-    YEAR_START, YEAR_END, NODATA_OUT
+    YEAR_START, YEAR_END, NODATA_OUT, TR_DAILY_DIR, TR_FILE_FORMAT, BLOCK_SIZE,
+    MAX_WORKERS, TEMPLATE_RASTER, MASK_FILE
 )
+
+# GDAL缓存（MB），用于加速连续读取
+GDAL_CACHE_MAX_MB = 512
+PARALLEL_BY_YEAR = True
+YEAR_WORKERS = MAX_WORKERS
+MIN_VALID_FRAC = 0.60  # 有效天数阈值（窗口内）
 
 # 确保输出目录存在
 DECOMPOSITION_FIXED_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,8 +87,48 @@ def _is_valid_value(value, nodata):
 
     # 额外保护：过滤常见的极大填充值（1e20, 3.4e38等）
     valid = valid & (np.abs(value) < 1e10)
+    # nodata缺失时的兜底：常见无效值为-9999
+    if nodata is None or np.isnan(nodata):
+        valid = valid & (value > -9000)
 
     return valid
+
+
+_GLOBAL_CTX = {}
+
+
+def _init_worker(trc_av, sos_av, pos_av, nodata_sos, nodata_pos, mask, tr_valid, profile):
+    global _GLOBAL_CTX
+    _GLOBAL_CTX = {
+        "trc_av": trc_av,
+        "sos_av": sos_av,
+        "pos_av": pos_av,
+        "nodata_sos": nodata_sos,
+        "nodata_pos": nodata_pos,
+        "mask": mask,
+        "tr_valid": tr_valid,
+        "profile": profile,
+    }
+
+
+def _process_year(year):
+    ctx = _GLOBAL_CTX
+    tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change = decompose_year(
+        year,
+        ctx["trc_av"],
+        ctx["sos_av"],
+        ctx["pos_av"],
+        ctx["nodata_sos"],
+        ctx["nodata_pos"],
+        ctx["mask"],
+        ctx["tr_valid"],
+        ctx["profile"]
+    )
+    write_geotiff(OUTPUT_DIR / f"TR_window_change_{year}.tif", tr_window_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"TR_sos_change_{year}.tif", tr_sos_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, ctx["profile"])
+    return year
 
 
 def read_geotiff(file_path):
@@ -87,6 +137,13 @@ def read_geotiff(file_path):
         profile = src.profile.copy()
         nodata = src.nodata
     return data, profile, nodata
+
+
+def load_template_profile():
+    if not TEMPLATE_RASTER.exists():
+        raise FileNotFoundError(f"模板栅格不存在: {TEMPLATE_RASTER}")
+    with rasterio.open(TEMPLATE_RASTER) as src:
+        return src.profile.copy()
 
 
 def write_geotiff(file_path, data, profile):
@@ -110,6 +167,154 @@ def _sum_cum_range(cum_arr, start_doy, end_doy):
     end_vals = flat[end - 1, idx]
     start_vals = np.where(start > 1, flat[start - 2, idx], 0.0)
     return (end_vals - start_vals).reshape(start_doy.shape)
+
+
+def is_leap_year(year):
+    """判断是否为闰年"""
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+
+def noleap_doy_from_date(date_obj):
+    """
+    将真实日期映射为无闰日DOY（1-365）。
+    闰年跳过2月29日，3月1日及之后的DOY减1。
+    返回None表示2月29日（需跳过）。
+    """
+    doy = date_obj.timetuple().tm_yday
+    if is_leap_year(date_obj.year):
+        if doy == 60:
+            return None
+        if doy > 60:
+            return doy - 1
+    return doy
+
+
+def accumulate_daily_tr_sums(year, ref_profile, valid_base,
+                             sos_y_i, pos_y_i, sos_av_i, pos_av_i):
+    """
+    按日读取TR并累积所需窗口总量，避免365天三维数组占用内存。
+    返回:
+      trc_y_actual, trc_y_fixed_actual, tr_sos_advance, tr_sos_delay,
+      tr_pos_extend, tr_pos_shorten, tr_valid_y, trc_y_count, trc_y_fixed_count
+    """
+    height = ref_profile["height"]
+    width = ref_profile["width"]
+
+    trc_y_actual = np.zeros((height, width), dtype=np.float32)
+    trc_y_fixed_actual = np.zeros((height, width), dtype=np.float32)
+    tr_sos_advance = np.zeros((height, width), dtype=np.float32)
+    tr_sos_delay = np.zeros((height, width), dtype=np.float32)
+    tr_pos_extend = np.zeros((height, width), dtype=np.float32)
+    tr_pos_shorten = np.zeros((height, width), dtype=np.float32)
+    tr_valid_y = np.zeros((height, width), dtype=bool)
+    trc_y_count = np.zeros((height, width), dtype=np.int16)
+    trc_y_fixed_count = np.zeros((height, width), dtype=np.int16)
+
+    block_windows = [
+        Window(col_off, row_off,
+               min(BLOCK_SIZE, width - col_off),
+               min(BLOCK_SIZE, height - row_off))
+        for row_off in range(0, height, BLOCK_SIZE)
+        for col_off in range(0, width, BLOCK_SIZE)
+    ]
+    block_has_valid = []
+    for win in block_windows:
+        r0, r1 = win.row_off, win.row_off + win.height
+        c0, c1 = win.col_off, win.col_off + win.width
+        block_has_valid.append(np.any(valid_base[r0:r1, c0:c1]))
+
+    days_in_year = 366 if is_leap_year(year) else 365
+    checked_ref = False
+
+    with rasterio.Env(GDAL_CACHEMAX=GDAL_CACHE_MAX_MB):
+        for day in range(1, days_in_year + 1):
+            date_obj = datetime(year, 1, 1) + timedelta(days=day - 1)
+            doy_noleap = noleap_doy_from_date(date_obj)
+            if doy_noleap is None:
+                continue
+
+            file_path = TR_DAILY_DIR / TR_FILE_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
+            if not file_path.exists():
+                continue
+
+            with rasterio.open(file_path) as src:
+                profile = src.profile.copy()
+                nodata = src.nodata
+
+                if not checked_ref:
+                    check_spatial_consistency(ref_profile, file_path, profile,
+                                              f"TR_daily_{date_obj.strftime('%Y%m%d')}")
+                    checked_ref = True
+
+                for win, has_valid in zip(block_windows, block_has_valid):
+                    if not has_valid:
+                        continue
+
+                    r0, r1 = win.row_off, win.row_off + win.height
+                    c0, c1 = win.col_off, win.col_off + win.width
+                    base_block = valid_base[r0:r1, c0:c1]
+                    if not np.any(base_block):
+                        continue
+
+                    data = src.read(1, window=win).astype(np.float32)
+                    if nodata is None or np.isnan(nodata):
+                        data[~np.isfinite(data)] = np.nan
+                    else:
+                        data[data == nodata] = np.nan
+                    data[data < 0] = np.nan
+
+                    valid_day = np.isfinite(data)
+                    if not np.any(valid_day):
+                        continue
+
+                    valid_day = valid_day & base_block
+                    if not np.any(valid_day):
+                        continue
+
+                    tr_valid_y[r0:r1, c0:c1] |= valid_day
+                    doy = doy_noleap
+
+                    sos_y_block = sos_y_i[r0:r1, c0:c1]
+                    pos_y_block = pos_y_i[r0:r1, c0:c1]
+                    sos_av_block = sos_av_i[r0:r1, c0:c1]
+                    pos_av_block = pos_av_i[r0:r1, c0:c1]
+
+                    m_trc = valid_day & (sos_y_block <= doy) & (pos_y_block >= doy)
+                    if np.any(m_trc):
+                        trc_block = trc_y_actual[r0:r1, c0:c1]
+                        trc_block[m_trc] += data[m_trc]
+                        trc_count_block = trc_y_count[r0:r1, c0:c1]
+                        trc_count_block[m_trc] += 1
+
+                    m_fixed = valid_day & (sos_av_block <= doy) & (pos_av_block >= doy)
+                    if np.any(m_fixed):
+                        fixed_block = trc_y_fixed_actual[r0:r1, c0:c1]
+                        fixed_block[m_fixed] += data[m_fixed]
+                        fixed_count_block = trc_y_fixed_count[r0:r1, c0:c1]
+                        fixed_count_block[m_fixed] += 1
+
+                    m_sos_adv = valid_day & (sos_y_block < sos_av_block) & (doy >= sos_y_block) & (doy < sos_av_block)
+                    if np.any(m_sos_adv):
+                        sos_adv_block = tr_sos_advance[r0:r1, c0:c1]
+                        sos_adv_block[m_sos_adv] += data[m_sos_adv]
+
+                    m_sos_delay = valid_day & (sos_y_block > sos_av_block) & (doy >= sos_av_block) & (doy < sos_y_block)
+                    if np.any(m_sos_delay):
+                        sos_delay_block = tr_sos_delay[r0:r1, c0:c1]
+                        sos_delay_block[m_sos_delay] += data[m_sos_delay]
+
+                    m_pos_extend = valid_day & (pos_y_block > pos_av_block) & (doy > pos_av_block) & (doy <= pos_y_block)
+                    if np.any(m_pos_extend):
+                        pos_ext_block = tr_pos_extend[r0:r1, c0:c1]
+                        pos_ext_block[m_pos_extend] += data[m_pos_extend]
+
+                    m_pos_shorten = valid_day & (pos_y_block < pos_av_block) & (doy > pos_y_block) & (doy <= pos_av_block)
+                    if np.any(m_pos_shorten):
+                        pos_short_block = tr_pos_shorten[r0:r1, c0:c1]
+                        pos_short_block[m_pos_shorten] += data[m_pos_shorten]
+
+    return (trc_y_actual, trc_y_fixed_actual, tr_sos_advance, tr_sos_delay,
+            tr_pos_extend, tr_pos_shorten, tr_valid_y, trc_y_count, trc_y_fixed_count)
 
 
 def check_spatial_consistency(ref_profile, file_path, data_profile, var_name="data"):
@@ -145,6 +350,7 @@ def check_spatial_consistency(ref_profile, file_path, data_profile, var_name="da
 
 
 def load_climatology():
+    template_profile = load_template_profile()
     tr_clim_file = CLIM_DIR / "TR_daily_climatology.tif"
     sos_av_file = CLIM_DIR / "SOSav.tif"
     pos_av_file = CLIM_DIR / "POSav.tif"
@@ -158,7 +364,8 @@ def load_climatology():
 
     with rasterio.open(tr_clim_file) as src:
         tr_daily_av = src.read().astype(np.float32)
-        profile = src.profile.copy()
+        profile = template_profile.copy()
+        check_spatial_consistency(profile, tr_clim_file, src.profile, "TR_daily_climatology")
         nodata_tr = src.nodata
 
     if nodata_tr is None or np.isnan(nodata_tr):
@@ -176,7 +383,7 @@ def load_climatology():
     return tr_daily_av, sos_av, pos_av, nodata_sos, nodata_pos, profile
 
 
-def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
+def decompose_year(year, trc_av, sos_av, pos_av,
                    nodata_sos, nodata_pos, mask, tr_valid, ref_profile):
     """
     方法2分解：固定窗口强度 + 实际窗口变化
@@ -205,17 +412,19 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     height, width = trc_y.shape
 
     # 有效性检查（与03a/03b一致）
-    valid = (
+    # 注意：TRc_{year}.tif 仅用于一致性校验与有效像元筛选，
+    #       分解计算使用当年日尺度TR逐日累积得到的 trc_y_actual。
+    valid_base = (
         _is_valid_value(trc_y, nodata_trc) &
         (trc_av != NODATA_OUT) &
         _is_valid_value(sos_y, nodata_sos_y) &
         _is_valid_value(pos_y, nodata_pos_y) &
         _is_valid_value(sos_av, nodata_sos) &
         _is_valid_value(pos_av, nodata_pos) &
-        (sos_y > 0) & (sos_y <= 366) &  # 允许闰年DOY=366
-        (pos_y > 0) & (pos_y <= 366) &  # 允许闰年DOY=366
-        (sos_av > 0) & (sos_av <= 366) &  # 允许闰年DOY=366
-        (pos_av > 0) & (pos_av <= 366) &  # 允许闰年DOY=366
+        (sos_y > 0) & (sos_y <= 365) &
+        (pos_y > 0) & (pos_y <= 365) &
+        (sos_av > 0) & (sos_av <= 365) &
+        (pos_av > 0) & (pos_av <= 365) &
         (pos_y >= sos_y) &
         (pos_av >= sos_av) &
         mask &
@@ -228,7 +437,7 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     tr_sos_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
     tr_pos_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
 
-    if not np.any(valid):
+    if not np.any(valid_base):
         return tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change
 
     # Clip DOY to 1-365
@@ -238,40 +447,36 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     pos_av_i = np.clip(np.rint(pos_av).astype(np.int32), 1, 365)
 
     # 进一步检查窗口有效性
-    valid_sos = valid & (pos_y_i >= sos_y_i) & (pos_av_i >= sos_av_i)
+    valid_sos = valid_base & (pos_y_i >= sos_y_i) & (pos_av_i >= sos_av_i)
 
     if not np.any(valid_sos):
         return tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change
 
-    # ========== 核心计算 ==========
+    # ========== 核心计算（逐日累积，避免365天三维数组） ==========
+    (trc_y_actual, trc_y_fixed_actual, tr_sos_advance, tr_sos_delay,
+     tr_pos_extend, tr_pos_shorten, tr_valid_y, trc_y_count, trc_y_fixed_count) = accumulate_daily_tr_sums(
+        year, ref_profile, valid_base, sos_y_i, pos_y_i, sos_av_i, pos_av_i
+    )
 
-    # 1. 计算当年窗口在气候态下的理论累积
-    #    sum_{SOS_y to POS_y} A(t)
-    trc_y_clim = _sum_cum_range(tr_cum, sos_y_i, pos_y_i)
+    valid_sos = valid_sos & tr_valid_y
+    # 有效天数比例过滤（窗口内有效天数需 >= MIN_VALID_FRAC * 窗口长度）
+    window_len_y = (pos_y_i - sos_y_i + 1).astype(np.int16)
+    window_len_av = (pos_av_i - sos_av_i + 1).astype(np.int16)
+    min_required_y = np.ceil(MIN_VALID_FRAC * window_len_y).astype(np.int16)
+    min_required_av = np.ceil(MIN_VALID_FRAC * window_len_av).astype(np.int16)
+    valid_sos = valid_sos & (trc_y_count >= min_required_y) & (trc_y_fixed_count >= min_required_av)
+    if not np.any(valid_sos):
+        return tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change
 
-    # 2. 计算增强因子（当年相对于气候态的倍数）
-    #    增强因子 = TRc_y / sum_{SOS_y to POS_y} A(t)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        enhancement_factor = np.where(
-            (trc_y_clim > 1e-6) & valid_sos,
-            trc_y / trc_y_clim,
-            1.0
-        )
+    # 3. 固定窗口强度差异
+    #    TR_fixed_window = sum_{SOSav..POSav} [B_y(t) - A(t)]
+    tr_fixed_window[valid_sos] = (trc_y_fixed_actual - trc_av)[valid_sos]
 
-    # 3. 估算固定窗口内的当年累积
-    #    TRc_y_fixed = 增强因子 × TRc_av
-    #    假设：相对增强在空间上是均匀的
-    trc_y_fixed = enhancement_factor * trc_av
+    # 4. 窗口变化部分（残差）
+    #    TR_window_change = TRc_y - sum_{SOSav..POSav} B_y(t)
+    tr_window_change[valid_sos] = (trc_y_actual - trc_y_fixed_actual)[valid_sos]
 
-    # 4. 固定窗口强度差异
-    #    TR_fixed_window = TRc_y_fixed - TRc_av
-    tr_fixed_window[valid_sos] = (trc_y_fixed - trc_av)[valid_sos]
-
-    # 5. 窗口变化部分（残差）
-    #    TR_window_change = TRc_y - TRc_y_fixed
-    tr_window_change[valid_sos] = (trc_y - trc_y_fixed)[valid_sos]
-
-    # 6. 进一步分解窗口变化为SOS和POS部分
+    # 5. 进一步分解窗口变化为SOS和POS部分
     #    这部分需要更详细的估算
     #    注意：避免np.where包裹_sum_cum_range，防止边界越界
 
@@ -279,31 +484,6 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
     # 如果SOS_y < SOSav（提前），计算[SOS_y, SOSav-1]的贡献
     # 如果SOS_y > SOSav（推迟），计算[SOSav, SOS_y-1]的贡献（为负）
     sos_before = sos_y_i < sos_av_i  # SOS提前
-    sos_after = sos_y_i > sos_av_i   # SOS推迟
-
-    # 初始化SOS变化数组
-    sos_advance_clim = np.zeros((height, width), dtype=np.float32)
-    sos_delay_clim = np.zeros((height, width), dtype=np.float32)
-
-    # SOS提前：估算[SOS_y, SOSav-1]在当年强度下的累积
-    # 确保端点有效：sos_av_i > sos_y_i（即sos_av_i >= sos_y_i + 1，所以sos_av_i - 1 >= sos_y_i）
-    valid_advance = valid_sos & sos_before & (sos_av_i > sos_y_i)
-    if np.any(valid_advance):
-        sos_advance_clim[valid_advance] = _sum_cum_range(
-            tr_cum, sos_y_i, sos_av_i - 1
-        )[valid_advance]
-
-    # SOS推迟：估算[SOSav, SOS_y-1]在当年强度下的累积（为负贡献）
-    # 确保端点有效：sos_y_i > sos_av_i
-    valid_delay = valid_sos & sos_after & (sos_y_i > sos_av_i)
-    if np.any(valid_delay):
-        sos_delay_clim[valid_delay] = _sum_cum_range(
-            tr_cum, sos_av_i, sos_y_i - 1
-        )[valid_delay]
-
-    # 应用增强因子
-    tr_sos_advance = enhancement_factor * sos_advance_clim
-    tr_sos_delay = enhancement_factor * sos_delay_clim
 
     # 根据提前/推迟设置正负号
     tr_sos_change[valid_sos] = np.where(
@@ -314,31 +494,6 @@ def decompose_year(year, tr_cum, trc_av, sos_av, pos_av,
 
     # POS变化效应估算（类似SOS）
     pos_after = pos_y_i > pos_av_i   # POS延后
-    pos_before = pos_y_i < pos_av_i  # POS提前
-
-    # 初始化POS变化数组
-    pos_extend_clim = np.zeros((height, width), dtype=np.float32)
-    pos_shorten_clim = np.zeros((height, width), dtype=np.float32)
-
-    # POS延后：估算[POSav+1, POS_y]在当年强度下的累积
-    # 确保端点有效：pos_av_i + 1 <= 365 且 pos_y_i >= pos_av_i + 1
-    valid_extend = valid_sos & pos_after & (pos_av_i < 365) & (pos_y_i > pos_av_i)
-    if np.any(valid_extend):
-        pos_extend_clim[valid_extend] = _sum_cum_range(
-            tr_cum, pos_av_i + 1, pos_y_i
-        )[valid_extend]
-
-    # POS提前：估算[POS_y+1, POSav]在当年强度下的累积（为负贡献）
-    # 确保端点有效：pos_y_i + 1 <= 365 且 pos_av_i >= pos_y_i + 1
-    valid_shorten = valid_sos & pos_before & (pos_y_i < 365) & (pos_av_i > pos_y_i)
-    if np.any(valid_shorten):
-        pos_shorten_clim[valid_shorten] = _sum_cum_range(
-            tr_cum, pos_y_i + 1, pos_av_i
-        )[valid_shorten]
-
-    # 应用增强因子
-    tr_pos_extend = enhancement_factor * pos_extend_clim
-    tr_pos_shorten = enhancement_factor * pos_shorten_clim
 
     # 根据延后/提前设置正负号
     tr_pos_change[valid_sos] = np.where(
@@ -362,7 +517,7 @@ def main():
     years = list(range(YEAR_START, YEAR_END + 1))
 
     # Load mask
-    mask_file = ROOT / "Wang2025_Analysis" / "masks" / "combined_mask.tif"
+    mask_file = MASK_FILE
     if not mask_file.exists():
         raise FileNotFoundError(f"Missing mask: {mask_file}")
     mask, mask_profile, mask_nodata = read_geotiff(mask_file)
@@ -397,15 +552,31 @@ def main():
     write_geotiff(OUTPUT_DIR / "Fixed_Window_Length.tif", fixed_window_length, profile)
 
     # Decompose each year
-    for year in tqdm(years, desc="Fixed-Window Decomposition"):
-        tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change = decompose_year(
-            year, tr_cum, trc_av, sos_av, pos_av,
-            nodata_sos, nodata_pos, mask, tr_valid, profile
-        )
-        write_geotiff(OUTPUT_DIR / f"TR_window_change_{year}.tif", tr_window_change, profile)
-        write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, profile)
-        write_geotiff(OUTPUT_DIR / f"TR_sos_change_{year}.tif", tr_sos_change, profile)
-        write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, profile)
+    if PARALLEL_BY_YEAR and YEAR_WORKERS > 1:
+        print(f"\n[Parallel] 按年并行分解: {YEAR_WORKERS} 进程")
+        with ProcessPoolExecutor(
+            max_workers=YEAR_WORKERS,
+            initializer=_init_worker,
+            initargs=(trc_av, sos_av, pos_av, nodata_sos, nodata_pos, mask, tr_valid, profile)
+        ) as executor:
+            futures = {executor.submit(_process_year, year): year for year in years}
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc="Fixed-Window Decomposition (parallel)"):
+                year = futures[future]
+                try:
+                    _ = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Year {year} failed: {exc}") from exc
+    else:
+        for year in tqdm(years, desc="Fixed-Window Decomposition"):
+            tr_window_change, tr_fixed_window, tr_sos_change, tr_pos_change = decompose_year(
+                year, trc_av, sos_av, pos_av,
+                nodata_sos, nodata_pos, mask, tr_valid, profile
+            )
+            write_geotiff(OUTPUT_DIR / f"TR_window_change_{year}.tif", tr_window_change, profile)
+            write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, profile)
+            write_geotiff(OUTPUT_DIR / f"TR_sos_change_{year}.tif", tr_sos_change, profile)
+            write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, profile)
 
     # Quality check
     print("\n[Quality Check]")
@@ -413,18 +584,85 @@ def main():
     trc_test, _, nodata_trc_test = read_geotiff(TRC_DIR / f"TRc_{test_year}.tif")
     tr_window_test, _, _ = read_geotiff(OUTPUT_DIR / f"TR_window_change_{test_year}.tif")
     tr_fixed_test, _, _ = read_geotiff(OUTPUT_DIR / f"TR_fixed_window_{test_year}.tif")
+    tr_sos_test, _, _ = read_geotiff(OUTPUT_DIR / f"TR_sos_change_{test_year}.tif")
+    tr_pos_test, _, _ = read_geotiff(OUTPUT_DIR / f"TR_pos_change_{test_year}.tif")
+
+    sos_y, _, nodata_sos_y = read_geotiff(PHENO_DIR / f"sos_gpp_{test_year}.tif")
+    pos_y, _, nodata_pos_y = read_geotiff(PHENO_DIR / f"pos_doy_gpp_{test_year}.tif")
+
+    sos_y_i = np.clip(np.rint(sos_y).astype(np.int32), 1, 365)
+    pos_y_i = np.clip(np.rint(pos_y).astype(np.int32), 1, 365)
+    sos_av_i = np.clip(np.rint(sos_av).astype(np.int32), 1, 365)
+    pos_av_i = np.clip(np.rint(pos_av).astype(np.int32), 1, 365)
+
+    valid_base = (
+        _is_valid_value(trc_test, nodata_trc_test) &
+        (trc_av != NODATA_OUT) &
+        _is_valid_value(sos_y, nodata_sos_y) &
+        _is_valid_value(pos_y, nodata_pos_y) &
+        _is_valid_value(sos_av, nodata_sos) &
+        _is_valid_value(pos_av, nodata_pos) &
+        (sos_y > 0) & (sos_y <= 365) &
+        (pos_y > 0) & (pos_y <= 365) &
+        (sos_av > 0) & (sos_av <= 365) &
+        (pos_av > 0) & (pos_av <= 365) &
+        (pos_y >= sos_y) &
+        (pos_av >= sos_av) &
+        mask &
+        tr_valid
+    )
+
+    (trc_y_actual, _, _, _, _, _, tr_valid_y, trc_y_count, trc_y_fixed_count) = accumulate_daily_tr_sums(
+        test_year, profile, valid_base, sos_y_i, pos_y_i, sos_av_i, pos_av_i
+    )
+
+    window_len_y = (pos_y_i - sos_y_i + 1).astype(np.int16)
+    window_len_av = (pos_av_i - sos_av_i + 1).astype(np.int16)
+    min_required_y = np.ceil(MIN_VALID_FRAC * window_len_y).astype(np.int16)
+    min_required_av = np.ceil(MIN_VALID_FRAC * window_len_av).astype(np.int16)
+    valid_count = (trc_y_count >= min_required_y) & (trc_y_fixed_count >= min_required_av)
+
+    # 额外校验：TRc_{year}.tif 与 当年日序列累计的一致性
+    valid_trc_compare = (
+        _is_valid_value(trc_test, nodata_trc_test) &
+        tr_valid_y &
+        valid_count &
+        np.isfinite(trc_y_actual) &
+        (trc_test != NODATA_OUT)
+    )
+    if np.any(valid_trc_compare):
+        trc_diff = trc_test[valid_trc_compare] - trc_y_actual[valid_trc_compare]
+        print("\n  TRc一致性检查 (TRc_file - TRc_daily_actual):")
+        print(f"    Mean: {np.mean(trc_diff):.6f} mm")
+        print(f"    Std:  {np.std(trc_diff):.6f} mm")
+        print(f"    Max:  {np.max(np.abs(trc_diff)):.6f} mm")
+        print(f"    95th percentile: {np.percentile(np.abs(trc_diff), 95):.6f} mm")
 
     valid_check = (
         mask &
-        _is_valid_value(trc_test, nodata_trc_test) &
+        _is_valid_value(sos_y, nodata_sos_y) &
+        _is_valid_value(pos_y, nodata_pos_y) &
+        (sos_y > 0) & (sos_y <= 366) &
+        (pos_y > 0) & (pos_y <= 366) &
+        (pos_y >= sos_y) &
+        tr_valid_y &
+        valid_count &
+        np.isfinite(trc_y_actual) &
         (trc_av != NODATA_OUT) &
         (tr_window_test != NODATA_OUT) &
-        (tr_fixed_test != NODATA_OUT)
+        (tr_fixed_test != NODATA_OUT) &
+        (tr_sos_test != NODATA_OUT) &
+        (tr_pos_test != NODATA_OUT)
     )
 
-    # 残差检验: TRc_y - TRc_av - TR_window_change - TR_fixed_window
-    residual = (trc_test[valid_check] - trc_av[valid_check] -
+    # 残差检验: TRc_y_actual - TRc_av - TR_window_change - TR_fixed_window
+    residual = (trc_y_actual[valid_check] - trc_av[valid_check] -
                 tr_window_test[valid_check] - tr_fixed_test[valid_check])
+    window_balance = (tr_window_test[valid_check] -
+                      (tr_sos_test[valid_check] + tr_pos_test[valid_check]))
+    residual_split = (trc_y_actual[valid_check] - trc_av[valid_check] -
+                      tr_fixed_test[valid_check] -
+                      tr_sos_test[valid_check] - tr_pos_test[valid_check])
 
     print(f"\n  Test year: {test_year}")
     print(f"  Residual (TRc - TRc_av - TR_window_change - TR_fixed_window):")
@@ -433,6 +671,18 @@ def main():
     print(f"    Max:  {np.max(np.abs(residual)):.6f} mm")
     print(f"    95th percentile: {np.percentile(np.abs(residual), 95):.6f} mm")
     print(f"    99th percentile: {np.percentile(np.abs(residual), 99):.6f} mm")
+    print(f"  Window balance (TR_window_change - (TR_sos_change + TR_pos_change)):")
+    print(f"    Mean: {np.mean(window_balance):.6f} mm")
+    print(f"    Std:  {np.std(window_balance):.6f} mm")
+    print(f"    Max:  {np.max(np.abs(window_balance)):.6f} mm")
+    print(f"    95th percentile: {np.percentile(np.abs(window_balance), 95):.6f} mm")
+    print(f"    99th percentile: {np.percentile(np.abs(window_balance), 99):.6f} mm")
+    print(f"  Residual (TRc - TRc_av - TR_fixed_window - TR_sos_change - TR_pos_change):")
+    print(f"    Mean: {np.mean(residual_split):.6f} mm")
+    print(f"    Std:  {np.std(residual_split):.6f} mm")
+    print(f"    Max:  {np.max(np.abs(residual_split)):.6f} mm")
+    print(f"    95th percentile: {np.percentile(np.abs(residual_split), 95):.6f} mm")
+    print(f"    99th percentile: {np.percentile(np.abs(residual_split), 99):.6f} mm")
 
     if np.max(np.abs(residual)) < 1e-2:
         print("  ✓ Quality check passed! Residual negligible.")
