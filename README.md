@@ -11,7 +11,7 @@
 
 | 文档 | 说明 |
 |------|------|
-| **[使用说明.md](使用说明.md)** | 📖 完整使用指南（从这里开始）⭐ |
+| **[docs/使用说明.md](docs/使用说明.md)** | 📖 完整使用指南（从这里开始）⭐ |
 | **[docs/项目文档.md](docs/项目文档.md)** | 📋 项目文档（配置/修改记录/分析对比） |
 | **[diagnostics/诊断工具说明.md](diagnostics/诊断工具说明.md)** | 🔧 诊断工具使用说明 |
 
@@ -30,7 +30,7 @@ python 00_data_preparation.py
 python 00_master_pipeline.py
 ```
 
-**详细步骤**: 请查看 [使用说明.md](使用说明.md)
+**详细步骤**: 请查看 [docs/使用说明.md](docs/使用说明.md)
 
 ---
 
@@ -67,7 +67,7 @@ python 00_master_pipeline.py
 | "TR_fixed_window全部为正值" | 运行 `python diagnostics/check_decomposition.py` |
 | 内存不足 | 编辑`_config.py`: `BLOCK_SIZE=64`, `MAX_WORKERS=1` |
 
-更多帮助: [使用说明.md](使用说明.md) | [项目文档.md](docs/项目文档.md#7-结果诊断)
+更多帮助: [docs/使用说明.md](docs/使用说明.md) | [docs/项目文档.md](docs/项目文档.md#7-结果诊断)
 
 ---
 
@@ -82,4 +82,4 @@ on forest transpiration. [期刊名称], [卷期页码].
 
 ---
 
-**开始使用**: 请先阅读 [使用说明.md](使用说明.md) 📖
+**开始使用**: 请先阅读 [docs/使用说明.md](docs/使用说明.md) 📖
