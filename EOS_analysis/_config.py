@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-配置文件: Wang (2025) 分析流程
+配置文件: Wang (2025) EOS分析流程
 请根据您的数据路径修改以下配置
 """
 
@@ -43,8 +43,8 @@ PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
 # 土地覆盖数据
 LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"
 
-# 输出目录
-OUTPUT_ROOT = ROOT / "Wang2025_Analysis"
+# 输出目录（EOS分析建议独立目录，避免覆盖SOS结果）
+OUTPUT_ROOT = ROOT / "Wang2025_Analysis_EOS"
 TRC_ANNUAL_DIR = OUTPUT_ROOT / "TRc_annual"              # TRc年度输出（02代码）
 CLIMATOLOGY_DIR = OUTPUT_ROOT / "Climatology"            # 气候态数据（02代码）
 DECOMPOSITION_DIR = OUTPUT_ROOT / "Decomposition"        # 分解结果（03a代码）
@@ -91,7 +91,7 @@ MIN_VALID_FRAC = 0.60    # 最小有效数据比例（趋势分析）
 
 # 物候提取参数
 PHENO_THRESHOLD = 0.20   # 物候提取阈值（20%）
-SOS_MAX_DOY = 150        # SOS最大DOY（约束条件）
+EOS_MIN_DOY = 200        # EOS最小DOY（约束条件，经验值）
 
 # 统计分析参数
 TREND_PVALUE_THRESHOLD = 0.05      # 趋势显著性阈值
@@ -144,7 +144,7 @@ MAP_EXTENT = [-180, 180, 30, 90]  # [lon_min, lon_max, lat_min, lat_max]
 CBAR_RANGES = {
     'TRc': [0, 500],              # mm
     'LSP': [60, 150],             # days
-    'SOS': [60, 150],             # DOY
+    'EOS': [200, 300],            # DOY
     'trend': [-20, 20],           # mm/decade
     'attribution': [-0.5, 0.5]    # standardized coefficient
 }

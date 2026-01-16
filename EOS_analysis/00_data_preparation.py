@@ -29,7 +29,7 @@ from _config import (
     USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, PHENO_DIR,
     YEAR_START, YEAR_END, PHENO_FILE_FORMAT,
     GPP_DAILY_DIR, SM_DAILY_DIR, TR_FILE_FORMAT, get_TR_file_path,
-    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path
+    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path, OUTPUT_ROOT
 )
 
 # 运行开关
@@ -60,7 +60,7 @@ else:
     OUTPUT_PHENO_DIR = PHENO_DIR.parent / f"{PHENO_DIR_NAME}_EPSG4326"
 
 # 输出目录
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "masks"
+OUTPUT_DIR = OUTPUT_ROOT / "masks"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 交集掩膜配置（按首个有效文件做交集）

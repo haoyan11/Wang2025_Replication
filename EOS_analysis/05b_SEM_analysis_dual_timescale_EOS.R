@@ -1,27 +1,27 @@
 #!/usr/bin/env Rscript
 # -*- coding: utf-8 -*-
-# Module 05b: 双时间尺度SEM分析 - 基于N04路径结构 + 04c固定窗口方法
+# Module 05b: 双时间尺度SEM分析（EOS） - 基于N04路径结构 + 04c固定窗口方法
 #
 # 设计思路：
 # 1. 借鉴N04_Cal_SEM的双时间尺度路径结构
-# 2. 使用04c代码的固定窗口方法（Fixed_Trate + 固定窗口[SOSav, POSav]）
-# 3. 计算季前气候因子（SOSav前3个月）
-# 4. 计算固定窗口生长季（SOSav-POSav）的GPP和气象因子
-# 5. 构建完整路径：季前气候 → SOS → GPP_season → Fixed_Trate
+# 2. 使用04c代码的固定窗口方法（Fixed_Trate + 固定窗口[POSav, EOSav]）
+# 3. 计算早季气候因子（固定窗口[SOSav, POSav]）
+# 4. 计算晚季气候因子/GPP（固定窗口[POSav, EOSav]）
+# 5. 构建完整路径：早/晚季气候 → EOS → GPP_season → Fixed_Trate
 # 6. 气候因子：降水(P)、气温(T)、短波辐射(SW)
 #
 # 路径结构（参考N04）：
-#   季前气候(P,T,SW) → SOS → GPP_season → Fixed_Trate
-#      ↓                ↓         ↑          ↑
-#      └────────────────┴─────────┴──────────┘ (直接路径)
-#   生长季气候(P,T,SW) ──────────┴──────────┘ (同期路径)
+#   早季气候(P,T,SW) + 晚季气候(P,T,SW) → EOS → GPP_season → Fixed_Trate
+#      ↓                           ↓         ↑          ↑
+#      └───────────────────────────┴─────────┴──────────┘ (直接路径)
+#   晚季气候(P,T,SW) ────────────────────────┴──────────┘ (同期路径)
 #
 # ⚠️ 关键修改（对比原05b版本）：
 # 1. TRproduct → Fixed_Trate（数据源：TR_fixed_window_{year}.tif，临时计算）
 # 2. Fixed_Trate = TR_fixed_window / Fixed_Window_Length（与04c一致）
-# 3. 生长季气候：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
-# 4. 生长季GPP：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
-# 5. 季前气候：保持不变（基于SOSav前3个月）
+# 3. 晚季气候：当年POS-EOS窗口 → 多年平均固定窗口[POSav, EOSav]
+# 4. 晚季GPP：当年POS-EOS窗口 → 多年平均固定窗口[POSav, EOSav]
+# 5. 早季气候：固定窗口[SOSav, POSav]
 #
 # Version: 2.0.1 (Bug Fix 5)
 # Author: Wang2025 Replication Project
@@ -101,7 +101,7 @@ if (.Platform$OS.type == "windows") {
 }
 
 # 自动生成的路径
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis")
+OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_EOS")
 PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
 # ===【修改1】Fixed_Trate数据源（04c固定窗口方法）===
 # 原路径: Decomposition/TRproduct_{year}.tif（03a模块输出）
@@ -206,7 +206,7 @@ NODATA_ABS_MAX <- 1e20
 SEM_SAMPLE_MODE <- "pixel_time_series"  # 像元尺度先计算，再全域汇总
 
 USE_CACHE <- TRUE                  # 启用缓存以加快处理速度
-MIN_VALID_FRAC <- 0.60            # SOS-POS窗口内有效数据最低比例
+MIN_VALID_FRAC <- 0.60            # POS-EOS窗口内有效数据最低比例
 MIN_VALID_YEAR_FRAC <- 0.60       # 像元时间序列最少有效年份比例
 WRITE_PIXELWISE_RASTERS <- FALSE  # 是否输出像元级栅格（会生成大量文件）
 DETREND_ENABLE <- FALSE           # 是否启用去趋势（仅对annual_mean生效）
@@ -599,7 +599,8 @@ check_raster_alignment <- function(template_r, mask_r, year) {
     list(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)), "TR_fixed_window"),
     list(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "Fixed_Window_Length"),
     list(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year)), "SOS"),
-    list(file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year)), "POS")
+    list(file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year)), "POS"),
+    list(file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", year)), "EOS")
   )
 
   for (item in sample_files) {
@@ -641,198 +642,36 @@ doy_to_date_noleap <- function(year, doy) {
 
 # ==================== 核心计算函数 ====================
 
-# 计算季前气候因子（基于像元多年平均SOS）
-calc_preseason_climate <- function(year, sos_climatology_r, daily_dir, pattern, mask_r,
-                                    cache_file, var_name, allow_negative = TRUE) {
+# ===【EOS】固定窗口气候因子（通用窗口[start, end]均值）===
+calc_window_climate_fixed <- function(year, start_climatology_r, end_climatology_r, daily_dir, pattern, mask_r,
+                                      cache_file, var_name, allow_negative = TRUE, window_label = "") {
   if (file.exists(cache_file)) {
     cat(sprintf("    [缓存] %s\n", var_name))
     return(raster(cache_file))
   }
 
-  cat(sprintf("    计算 %s (基于像元多年平均SOS前3个月)...\n", var_name))
-
-  template <- mask_r
-  sos_clim_vals <- getValues(sos_climatology_r)
-  sos_clim_vals <- sanitize_values(sos_clim_vals, NAvalue(sos_climatology_r), allow_negative = FALSE)
-
-  # 初始化输出数组
-  mean_vals <- rep(NA_real_, ncell(template))
-
-  # 确定有效像元
-  valid_cells <- which(!is.na(sos_clim_vals))
-  n_valid <- length(valid_cells)
-
-  cat(sprintf("      有效像元数: %d\n", n_valid))
-
-  # 统计季前窗口分布
-  sos_clim_valid <- sos_clim_vals[valid_cells]
-  cat(sprintf("      SOS气候态范围: %.0f - %.0f DOY\n",
-              min(sos_clim_valid, na.rm = TRUE),
-              max(sos_clim_valid, na.rm = TRUE)))
-
-  # ===【优化：使用缓存避免重复读取文件】===
-  # 逐像元计算（使用日期缓存大幅提升效率）
-  sos_int <- round(sos_clim_valid)
-  sos_int <- pmax(1, pmin(365, sos_int))  # 修复BUG：SOS下限应为1而非90（季前窗口可跨年到前一年）
-
-  # 确定需要读取的日期范围
-  min_sos <- min(sos_int, na.rm = TRUE)
-  max_sos <- max(sos_int, na.rm = TRUE)
-  earliest_start <- min_sos - 90
-
-  # 构建需要读取的DOY列表
-  if (earliest_start < 1) {
-    doys_prev_year <- (365 + earliest_start):365
-    doys_this_year <- 1:(max_sos - 1)
+  if (nzchar(window_label)) {
+    cat(sprintf("    计算 %s (固定窗口[%s]均值)...\n", var_name, window_label))
   } else {
-    doys_prev_year <- integer(0)
-    doys_this_year <- earliest_start:(max_sos - 1)
+    cat(sprintf("    计算 %s (固定窗口均值)...\n", var_name))
   }
-
-  total_days <- length(doys_prev_year) + length(doys_this_year)
-  cat(sprintf("      需读取日期范围: %d 天\n", total_days))
-
-  # 创建日期数据缓存（环境变量）
-  daily_cache <- new.env(hash = TRUE, size = total_days)
-
-  # 预读取所有需要的日期数据（每个文件只读一次）
-  cat("      [1/2] 正在预读取日期数据...\n")
-  files_read <- 0
-
-  # 读取上年数据
-  if (length(doys_prev_year) > 0) {
-    for (doy in doys_prev_year) {
-      date_obj <- doy_to_date_noleap(year - 1, doy)
-      if (is.na(date_obj)) {
-        next
-      }
-      date_str <- format(date_obj, "%Y%m%d")
-      file_path <- build_daily_path(daily_dir, pattern, date_str)
-
-      if (file.exists(file_path)) {
-        tryCatch({
-          daily_r <- raster(file_path)
-          daily_vals <- getValues(daily_r)
-          daily_vals <- sanitize_values(daily_vals, NAvalue(daily_r), allow_negative)
-          cache_key <- paste0("doy_", doy, "_year_", year - 1)
-          assign(cache_key, daily_vals, envir = daily_cache)
-          files_read <- files_read + 1
-        }, error = function(e) {})
-      }
-    }
-  }
-
-  # 读取本年数据
-  for (doy in doys_this_year) {
-    date_obj <- doy_to_date_noleap(year, doy)
-    if (is.na(date_obj)) {
-      next
-    }
-    date_str <- format(date_obj, "%Y%m%d")
-    file_path <- build_daily_path(daily_dir, pattern, date_str)
-
-    if (file.exists(file_path)) {
-      tryCatch({
-        daily_r <- raster(file_path)
-        daily_vals <- getValues(daily_r)
-        daily_vals <- sanitize_values(daily_vals, NAvalue(daily_r), allow_negative)
-        cache_key <- paste0("doy_", doy, "_year_", year)
-        assign(cache_key, daily_vals, envir = daily_cache)
-        files_read <- files_read + 1
-      }, error = function(e) {})
-    }
-  }
-
-  cat(sprintf("      ✓ 已缓存 %d 个日期文件\n", files_read))
-
-  # 逐像元计算季前均值（从缓存读取，极快）
-  cat("      [2/2] 正在计算像元季前均值...\n")
-
-  for (i in seq_along(valid_cells)) {
-    cell_idx <- valid_cells[i]
-    sos_doy <- sos_int[i]
-
-    # 确定季前窗口
-    preseason_start_doy <- sos_doy - 90
-    preseason_end_doy <- sos_doy - 1
-
-    # 构建窗口DOY列表
-    if (preseason_start_doy < 1) {
-      window_doys <- c((365 + preseason_start_doy):365, 1:preseason_end_doy)
-      window_years <- c(rep(year - 1, 365 - (365 + preseason_start_doy) + 1),
-                       rep(year, preseason_end_doy))
-    } else {
-      window_doys <- preseason_start_doy:preseason_end_doy
-      window_years <- rep(year, length(window_doys))
-    }
-
-    # 从缓存提取该像元在窗口内的所有值
-    cell_vals <- numeric(0)
-    for (j in seq_along(window_doys)) {
-      cache_key <- paste0("doy_", window_doys[j], "_year_", window_years[j])
-      if (exists(cache_key, envir = daily_cache)) {
-        daily_vals <- get(cache_key, envir = daily_cache)
-        if (cell_idx <= length(daily_vals)) {
-          val <- daily_vals[cell_idx]
-          if (!is.na(val)) {
-            cell_vals <- c(cell_vals, val)
-          }
-        }
-      }
-    }
-
-    # 计算均值
-    if (length(cell_vals) > 0) {
-      mean_vals[cell_idx] <- mean(cell_vals)
-    }
-
-    # 进度显示
-    if (i %% max(1, floor(n_valid / 5)) == 0 || i == n_valid) {
-      cat(sprintf("      进度: %d/%d 像元 (%.1f%%)\n",
-                  i, n_valid, 100 * i / n_valid))
-    }
-  }
-
-  cat(sprintf("      ✓ 完成: %d 像元计算完毕\n", sum(!is.na(mean_vals))))
-
-  # 构建输出栅格
-  out_r <- setValues(template, mean_vals)
-  out_r <- mask_raster(out_r, mask_r)
-
-  # 保存缓存
-  safe_write_raster(out_r, cache_file, datatype = "FLT4S")
-
-  out_r
-}
-
-# ===【修改2】计算生长季气候因子（固定窗口[SOSav, POSav]均值）===
-# 原版本：使用当年SOS-POS窗口
-# 新版本：使用多年平均固定窗口[SOSav, POSav]
-calc_season_climate_fixed <- function(year, sos_climatology_r, pos_climatology_r, daily_dir, pattern, mask_r,
-                                      cache_file, var_name, allow_negative = TRUE) {
-  if (file.exists(cache_file)) {
-    cat(sprintf("    [缓存] %s\n", var_name))
-    return(raster(cache_file))
-  }
-
-  cat(sprintf("    计算 %s (固定窗口[SOSav, POSav]均值)...\n", var_name))
 
   template <- mask_r
   # 使用多年平均物候（气候态）
-  sos_vals <- getValues(sos_climatology_r)
-  pos_vals <- getValues(pos_climatology_r)
+  start_vals <- getValues(start_climatology_r)
+  end_vals <- getValues(end_climatology_r)
 
-  sos_vals <- sanitize_values(sos_vals, NAvalue(sos_climatology_r), allow_negative = FALSE)
-  pos_vals <- sanitize_values(pos_vals, NAvalue(pos_climatology_r), allow_negative = FALSE)
+  start_vals <- sanitize_values(start_vals, NAvalue(start_climatology_r), allow_negative = FALSE)
+  end_vals <- sanitize_values(end_vals, NAvalue(end_climatology_r), allow_negative = FALSE)
 
-  sos_int <- as.integer(round(sos_vals))
-  pos_int <- as.integer(round(pos_vals))
+  start_int <- as.integer(round(start_vals))
+  end_int <- as.integer(round(end_vals))
 
   # 限制到1-365
-  sos_int <- pmax(1, pmin(365, sos_int))
-  pos_int <- pmax(1, pmin(365, pos_int))
+  start_int <- pmax(1, pmin(365, start_int))
+  end_int <- pmax(1, pmin(365, end_int))
 
-  valid_pheno <- !is.na(sos_int) & !is.na(pos_int) & (sos_int < pos_int)  # 修复：改为严格小于，与POSav>SOSav验证保持一致
+  valid_pheno <- !is.na(start_int) & !is.na(end_int) & (start_int < end_int)
 
   # 初始化
   sum_vals <- rep(0, ncell(template))
@@ -846,8 +685,8 @@ calc_season_climate_fixed <- function(year, sos_climatology_r, pos_climatology_r
   }
 
   # 确定DOY范围
-  min_doy <- min(sos_int[valid_pheno], na.rm = TRUE)
-  max_doy <- max(pos_int[valid_pheno], na.rm = TRUE)
+  min_doy <- min(start_int[valid_pheno], na.rm = TRUE)
+  max_doy <- max(end_int[valid_pheno], na.rm = TRUE)
 
   cat(sprintf("      物候DOY范围: %d-%d\n", min_doy, max_doy))
 
@@ -869,7 +708,7 @@ calc_season_climate_fixed <- function(year, sos_climatology_r, pos_climatology_r
       daily_vals <- sanitize_values(daily_vals, NAvalue(daily_r), allow_negative)
 
       valid_daily <- !is.na(daily_vals)
-      in_window <- valid_pheno & (sos_int <= doy) & (pos_int >= doy)
+      in_window <- valid_pheno & (start_int <= doy) & (end_int >= doy)
       use_mask <- in_window & valid_daily
 
       list(daily_vals = daily_vals, use_mask = use_mask)
@@ -884,7 +723,7 @@ calc_season_climate_fixed <- function(year, sos_climatology_r, pos_climatology_r
     }
   }
 
-  window_len <- pos_int - sos_int + 1
+  window_len <- end_int - start_int + 1
   min_required <- ceiling(MIN_VALID_FRAC * window_len)
   cat(sprintf("      有效像元: %d (cnt >= %.0f%%窗口长度)\n",
               sum(cnt_vals >= min_required, na.rm = TRUE),
@@ -906,7 +745,7 @@ calc_season_climate_fixed <- function(year, sos_climatology_r, pos_climatology_r
 # ==================== 数据准备 ====================
 # ===【修改3】数据准备函数：Fixed_Trate + 固定窗口===
 prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology_r,
-                                        fixed_window_length_r, mask_r,
+                                        eos_climatology_r, fixed_window_length_r, mask_r,
                                         parallel_inner = PARALLEL_ENABLE) {
   cat(sprintf("\n年份: %d\n", year))
 
@@ -917,22 +756,22 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
     return(NULL)
   }
 
-  # 读取当年物候数据（用于SEM中的SOS变量）
-  sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
+  # 读取当年物候数据（用于SEM中的EOS变量）
+  eos_file <- file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", year))
 
-  if (!file.exists(sos_file)) {
-    cat(sprintf("  跳过: SOS文件不存在\n"))
+  if (!file.exists(eos_file)) {
+    cat(sprintf("  跳过: EOS文件不存在\n"))
     return(NULL)
   }
 
   tr_fixed_r <- raster(tr_fixed_file)
-  sos_r <- raster(sos_file)
+  eos_r <- raster(eos_file)
 
   tr_fixed_r <- set_nodata_if_missing(tr_fixed_r)
-  sos_r <- set_nodata_if_missing(sos_r)
+  eos_r <- set_nodata_if_missing(eos_r)
 
   # 应用掩膜
-  sos_r <- mask_raster(sos_r, mask_r)
+  eos_r <- mask_raster(eos_r, mask_r)
   tr_fixed_r <- mask_raster(tr_fixed_r, mask_r)
 
   # 计算Fixed_Trate = TR_fixed_window / Fixed_Window_Length
@@ -951,10 +790,10 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
                            "P_season", "T_season", "SW_season",
                            "GPP_season")
 
-  # ===== 计算季前气候因子（使用SOS气候态） =====
-  cat("  [1/7] 季前气候因子（基于像元多年平均SOS）:\n")
+  # ===== 计算早季气候因子（固定窗口[SOSav, POSav]） =====
+  cat("  [1/7] 早季气候因子（固定窗口[SOSav, POSav]）:\n")
 
-  # ===【并行化优化】季前3个变量并行计算===
+  # ===【并行化优化】早季3个变量并行计算===
   if (parallel_inner && PARALLEL_CORES > 1) {
     cat(sprintf("    使用 %d 个核心并行计算...\n", PARALLEL_CORES))
 
@@ -963,8 +802,8 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
     on.exit(stopCluster(cl), add = TRUE)
 
     # 导出必要的变量和函数到集群
-    clusterExport(cl, c("year", "sos_climatology_r", "mask_r", "cache_prefix",
-                        "calc_preseason_climate", "build_daily_path", "sanitize_values",
+    clusterExport(cl, c("year", "sos_climatology_r", "pos_climatology_r", "mask_r", "cache_prefix",
+                        "calc_window_climate_fixed", "build_daily_path", "sanitize_values",
                         "mask_raster", "safe_write_raster", "should_write", "OVERWRITE",
                         "NODATA_OUT", "NODATA_ABS_MAX",
                         "MIN_VALID_FRAC", "is_leap_year", "doy_to_date_noleap",
@@ -976,38 +815,46 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
     # 加载raster包到每个工作进程
     clusterEvalQ(cl, library(raster))
 
-    # 并行计算3个季前变量
-    preseason_list <- parLapply(cl, list(
+    # 并行计算3个早季变量
+    early_list <- parLapply(cl, list(
       list(dir = PRECIP_DAILY_DIR, pattern = PRECIP_DAILY_PATTERN, var = "P_pre", neg = FALSE),
       list(dir = TA_DAILY_DIR, pattern = TA_DAILY_PATTERN, var = "T_pre", neg = TRUE),
       list(dir = SW_DAILY_DIR, pattern = SW_DAILY_PATTERN, var = "SW_pre", neg = FALSE)
     ), function(params) {
-      calc_preseason_climate(year, sos_climatology_r, params$dir, params$pattern,
-                            mask_r, cache_prefix[params$var], params$var, params$neg)
+      calc_window_climate_fixed(year, sos_climatology_r, pos_climatology_r,
+                                params$dir, params$pattern, mask_r,
+                                cache_prefix[params$var], params$var, params$neg,
+                                window_label = "SOSav, POSav")
     })
 
     stopCluster(cl)
     on.exit()  # 清除on.exit
 
-    p_pre_r <- preseason_list[[1]]
-    t_pre_r <- preseason_list[[2]]
-    sw_pre_r <- preseason_list[[3]]
+    p_pre_r <- early_list[[1]]
+    t_pre_r <- early_list[[2]]
+    sw_pre_r <- early_list[[3]]
 
   } else {
     # 单核模式（原始串行计算）
-    p_pre_r <- calc_preseason_climate(year, sos_climatology_r, PRECIP_DAILY_DIR, PRECIP_DAILY_PATTERN,
-                                       mask_r, cache_prefix["P_pre"], "P_pre", allow_negative = FALSE)
+    p_pre_r <- calc_window_climate_fixed(year, sos_climatology_r, pos_climatology_r,
+                                         PRECIP_DAILY_DIR, PRECIP_DAILY_PATTERN,
+                                         mask_r, cache_prefix["P_pre"], "P_pre",
+                                         allow_negative = FALSE, window_label = "SOSav, POSav")
 
-    t_pre_r <- calc_preseason_climate(year, sos_climatology_r, TA_DAILY_DIR, TA_DAILY_PATTERN,
-                                       mask_r, cache_prefix["T_pre"], "T_pre", allow_negative = TRUE)
+    t_pre_r <- calc_window_climate_fixed(year, sos_climatology_r, pos_climatology_r,
+                                         TA_DAILY_DIR, TA_DAILY_PATTERN,
+                                         mask_r, cache_prefix["T_pre"], "T_pre",
+                                         allow_negative = TRUE, window_label = "SOSav, POSav")
 
-    sw_pre_r <- calc_preseason_climate(year, sos_climatology_r, SW_DAILY_DIR, SW_DAILY_PATTERN,
-                                        mask_r, cache_prefix["SW_pre"], "SW_pre", allow_negative = FALSE)
+    sw_pre_r <- calc_window_climate_fixed(year, sos_climatology_r, pos_climatology_r,
+                                          SW_DAILY_DIR, SW_DAILY_PATTERN,
+                                          mask_r, cache_prefix["SW_pre"], "SW_pre",
+                                          allow_negative = FALSE, window_label = "SOSav, POSav")
   }
 
-  # ===【修改3b】计算固定窗口生长季气候因子 =====
-  cat("  [2/7] 生长季气候因子（固定窗口[SOSav, POSav]）:\n")
-  cat("  [3/7] 生长季GPP（固定窗口[SOSav, POSav]）:\n")
+  # ===【EOS】计算晚季气候因子与GPP =====
+  cat("  [2/7] 晚季气候因子（固定窗口[POSav, EOSav]）:\n")
+  cat("  [3/7] 晚季GPP（固定窗口[POSav, EOSav]）:\n")
 
   # ===【并行化优化】生长季4个变量并行计算===
   if (parallel_inner && PARALLEL_CORES > 1) {
@@ -1018,8 +865,8 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
     on.exit(stopCluster(cl), add = TRUE)
 
     # 导出必要的变量和函数到集群
-    clusterExport(cl, c("year", "sos_climatology_r", "pos_climatology_r", "mask_r", "cache_prefix",
-                        "calc_season_climate_fixed", "build_daily_path", "sanitize_values",
+    clusterExport(cl, c("year", "pos_climatology_r", "eos_climatology_r", "mask_r", "cache_prefix",
+                        "calc_window_climate_fixed", "build_daily_path", "sanitize_values",
                         "mask_raster", "safe_write_raster", "should_write", "OVERWRITE",
                         "NODATA_OUT", "NODATA_ABS_MAX",
                         "MIN_VALID_FRAC", "is_leap_year", "doy_to_date_noleap",
@@ -1039,8 +886,10 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
       list(dir = SW_DAILY_DIR, pattern = SW_DAILY_PATTERN, var = "SW_season", neg = FALSE),
       list(dir = GPP_DAILY_DIR, pattern = GPP_DAILY_PATTERN, var = "GPP_season", neg = FALSE)
     ), function(params) {
-      calc_season_climate_fixed(year, sos_climatology_r, pos_climatology_r, params$dir, params$pattern,
-                                mask_r, cache_prefix[params$var], params$var, params$neg)
+      calc_window_climate_fixed(year, pos_climatology_r, eos_climatology_r,
+                                params$dir, params$pattern, mask_r,
+                                cache_prefix[params$var], params$var, params$neg,
+                                window_label = "POSav, EOSav")
     })
 
     stopCluster(cl)
@@ -1053,17 +902,25 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
 
   } else {
     # 单核模式（原始串行计算）
-    p_season_r <- calc_season_climate_fixed(year, sos_climatology_r, pos_climatology_r, PRECIP_DAILY_DIR, PRECIP_DAILY_PATTERN,
-                                             mask_r, cache_prefix["P_season"], "P_season", allow_negative = FALSE)
+    p_season_r <- calc_window_climate_fixed(year, pos_climatology_r, eos_climatology_r,
+                                            PRECIP_DAILY_DIR, PRECIP_DAILY_PATTERN,
+                                            mask_r, cache_prefix["P_season"], "P_season",
+                                            allow_negative = FALSE, window_label = "POSav, EOSav")
 
-    t_season_r <- calc_season_climate_fixed(year, sos_climatology_r, pos_climatology_r, TA_DAILY_DIR, TA_DAILY_PATTERN,
-                                             mask_r, cache_prefix["T_season"], "T_season", allow_negative = TRUE)
+    t_season_r <- calc_window_climate_fixed(year, pos_climatology_r, eos_climatology_r,
+                                            TA_DAILY_DIR, TA_DAILY_PATTERN,
+                                            mask_r, cache_prefix["T_season"], "T_season",
+                                            allow_negative = TRUE, window_label = "POSav, EOSav")
 
-    sw_season_r <- calc_season_climate_fixed(year, sos_climatology_r, pos_climatology_r, SW_DAILY_DIR, SW_DAILY_PATTERN,
-                                              mask_r, cache_prefix["SW_season"], "SW_season", allow_negative = FALSE)
+    sw_season_r <- calc_window_climate_fixed(year, pos_climatology_r, eos_climatology_r,
+                                             SW_DAILY_DIR, SW_DAILY_PATTERN,
+                                             mask_r, cache_prefix["SW_season"], "SW_season",
+                                             allow_negative = FALSE, window_label = "POSav, EOSav")
 
-    gpp_season_r <- calc_season_climate_fixed(year, sos_climatology_r, pos_climatology_r, GPP_DAILY_DIR, GPP_DAILY_PATTERN,
-                                               mask_r, cache_prefix["GPP_season"], "GPP_season", allow_negative = FALSE)
+    gpp_season_r <- calc_window_climate_fixed(year, pos_climatology_r, eos_climatology_r,
+                                              GPP_DAILY_DIR, GPP_DAILY_PATTERN,
+                                              mask_r, cache_prefix["GPP_season"], "GPP_season",
+                                              allow_negative = FALSE, window_label = "POSav, EOSav")
   }
 
   cat("  ✓ 数据准备完成\n")
@@ -1071,7 +928,7 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
   # ===【修改3d】返回Fixed_Trate（替代TRc）===
   list(
     fixed_trate = fixed_trate_r,  # 修改：trc → fixed_trate
-    sos = sos_r,
+    eos = eos_r,
     p_pre = p_pre_r,
     t_pre = t_pre_r,
     sw_pre = sw_pre_r,
@@ -1085,7 +942,7 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
 # ==================== 缓存准备 ====================
 # ===【修改4】添加POSav和fixed_window_length_r参数===
 prepare_sem_caches <- function(years, sos_climatology_r, pos_climatology_r,
-                               fixed_window_length_r, mask_r) {
+                               eos_climatology_r, fixed_window_length_r, mask_r) {
   cat("\n=== 准备SEM缓存数据 ===\n")
   if (PARALLEL_ENABLE && PARALLEL_CORES > 1 && length(years) > 1) {
     cat(sprintf("  使用 %d 个核心并行准备缓存...\n", PARALLEL_CORES))
@@ -1093,8 +950,9 @@ prepare_sem_caches <- function(years, sos_climatology_r, pos_climatology_r,
     clusterEvalQ(cl, library(raster))
     clusterExport(
       cl,
-      c("years", "sos_climatology_r", "pos_climatology_r", "fixed_window_length_r", "mask_r",
-        "prepare_dual_timescale_data", "calc_preseason_climate", "calc_season_climate_fixed",
+      c("years", "sos_climatology_r", "pos_climatology_r", "eos_climatology_r",
+        "fixed_window_length_r", "mask_r",
+        "prepare_dual_timescale_data", "calc_window_climate_fixed",
         "build_daily_path", "sanitize_values", "mask_raster", "safe_write_raster",
         "should_write", "OVERWRITE", "set_nodata_if_missing", "PARALLEL_CORES",
         "NODATA_OUT", "NODATA_ABS_MAX", "MIN_VALID_FRAC", "is_leap_year",
@@ -1108,6 +966,7 @@ prepare_sem_caches <- function(years, sos_climatology_r, pos_climatology_r,
     res_list <- parLapply(cl, years, function(year) {
       tryCatch({
         prepare_dual_timescale_data(year, sos_climatology_r, pos_climatology_r,
+                                   eos_climatology_r,
                                    fixed_window_length_r, mask_r,
                                    parallel_inner = FALSE)
         list(year = year, ok = TRUE, msg = NULL)
@@ -1131,6 +990,7 @@ prepare_sem_caches <- function(years, sos_climatology_r, pos_climatology_r,
       cat(sprintf("  年份: %d\n", year))
       tryCatch({
         prepare_dual_timescale_data(year, sos_climatology_r, pos_climatology_r,
+                                   eos_climatology_r,
                                    fixed_window_length_r, mask_r)
         cat(sprintf("    ✓ 完成\n"))
       }, error = function(e) {
@@ -1158,7 +1018,7 @@ safe_mediation_ratio <- function(c_val, d_val, e_val, eps = MEDIATION_DENOM_EPS)
 # ===【修改5】Fixed_Trate替代TRc===
 calculate_vif <- function(data) {
   # 双时间尺度模型的VIF诊断
-  lm_model <- lm(Fixed_Trate ~ SOS + GPP_season + P_pre + T_pre + SW_pre +
+  lm_model <- lm(Fixed_Trate ~ EOS + GPP_season + P_pre + T_pre + SW_pre +
                    P_season + T_season + SW_season, data = data)
   x <- model.matrix(lm_model)[, -1, drop = FALSE]
 
@@ -1195,7 +1055,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
   # 构建文件列表
   files <- list(
     TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),  # 修改：TRc → TR_fixed_window
-    SOS = file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", years)),
+    EOS = file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", years)),
     GPP_season = file.path(DERIVED_DIR, sprintf("GPP_season_%d.tif", years)),
     P_pre = file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", years)),
     T_pre = file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", years)),
@@ -1231,17 +1091,20 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
 
   # 路径名称（双时间尺度）
   coef_names <- c(
-    "SOS~P_pre",
-    "SOS~T_pre",
-    "SOS~SW_pre",
-    "GPP_season~SOS",
+    "EOS~P_pre",
+    "EOS~T_pre",
+    "EOS~SW_pre",
+    "EOS~P_season",
+    "EOS~T_season",
+    "EOS~SW_season",
+    "GPP_season~EOS",
     "GPP_season~P_pre",
     "GPP_season~T_pre",
     "GPP_season~SW_pre",
     "GPP_season~P_season",
     "GPP_season~T_season",
     "GPP_season~SW_season",
-    "Fixed_Trate~SOS",  # 修改：TRc → Fixed_Trate
+    "Fixed_Trate~EOS",
     "Fixed_Trate~GPP_season",
     "Fixed_Trate~P_pre",
     "Fixed_Trate~T_pre",
@@ -1249,19 +1112,25 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     "Fixed_Trate~P_season",
     "Fixed_Trate~T_season",
     "Fixed_Trate~SW_season",
-    "P_pre_via_SOS_GPP",
-    "T_pre_via_SOS_GPP",
-    "SW_pre_via_SOS_GPP",
-    "P_pre_via_SOS",
-    "T_pre_via_SOS",
-    "SW_pre_via_SOS",
+    "P_pre_via_EOS_GPP",
+    "T_pre_via_EOS_GPP",
+    "SW_pre_via_EOS_GPP",
+    "P_pre_via_EOS",
+    "T_pre_via_EOS",
+    "SW_pre_via_EOS",
     "P_pre_via_GPP",
     "T_pre_via_GPP",
     "SW_pre_via_GPP",
+    "P_season_via_EOS_GPP",
+    "T_season_via_EOS_GPP",
+    "SW_season_via_EOS_GPP",
+    "P_season_via_EOS",
+    "T_season_via_EOS",
+    "SW_season_via_EOS",
     "P_season_via_GPP",
     "T_season_via_GPP",
     "SW_season_via_GPP",
-    "SOS_via_GPP",
+    "EOS_via_GPP",
     "P_GPP_mediation",
     "T_GPP_mediation",
     "SW_GPP_mediation"
@@ -1274,7 +1143,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
   sig_sumsq <- setNames(rep(0, length(coef_names)), coef_names)
   sig_count <- setNames(rep(0, length(coef_names)), coef_names)
 
-  r2_names <- c("SOS", "GPP_season", "Fixed_Trate")
+  r2_names <- c("EOS", "GPP_season", "Fixed_Trate")
   r2_sum <- setNames(rep(0, length(r2_names)), r2_names)
   r2_sumsq <- setNames(rep(0, length(r2_names)), r2_names)
   r2_count <- setNames(rep(0, length(r2_names)), r2_names)
@@ -1317,8 +1186,8 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     tr_block <- sanitize_values(tr_block, na_values$TR_fixed_window, allow_negative = TRUE)
     fixed_trate_block <- tr_block / matrix(fixed_len_block, nrow = n_years, ncol = n_cells, byrow = TRUE)
 
-    sos_block <- t(getValues(stacks$SOS, row = row, nrows = nrows))
-    sos_block <- sanitize_values(sos_block, na_values$SOS, allow_negative = FALSE)
+    eos_block <- t(getValues(stacks$EOS, row = row, nrows = nrows))
+    eos_block <- sanitize_values(eos_block, na_values$EOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$GPP_season, row = row, nrows = nrows))
     gpp_block <- sanitize_values(gpp_block, na_values$GPP_season, allow_negative = FALSE)
     p_pre_block <- t(getValues(stacks$P_pre, row = row, nrows = nrows))
@@ -1334,7 +1203,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     sw_season_block <- t(getValues(stacks$SW_season, row = row, nrows = nrows))
     sw_season_block <- sanitize_values(sw_season_block, na_values$SW_season, allow_negative = FALSE)
 
-    valid_mat <- is.finite(fixed_trate_block) & is.finite(sos_block) & is.finite(gpp_block) &
+    valid_mat <- is.finite(fixed_trate_block) & is.finite(eos_block) & is.finite(gpp_block) &
                  is.finite(p_pre_block) & is.finite(t_pre_block) & is.finite(sw_pre_block) &
                  is.finite(p_season_block) & is.finite(t_season_block) & is.finite(sw_season_block)
     valid_counts <- colSums(valid_mat)
@@ -1377,7 +1246,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       df <- data.frame(
         year = years[valid_years],
         Fixed_Trate = fixed_trate_block[valid_years, idx],
-        SOS = sos_block[valid_years, idx],
+        EOS = eos_block[valid_years, idx],
         GPP_season = gpp_block[valid_years, idx],
         P_pre = p_pre_block[valid_years, idx],
         T_pre = t_pre_block[valid_years, idx],
@@ -1389,7 +1258,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
 
       if (DETREND_PIXEL_ENABLE) {
         df$Fixed_Trate <- detrend_series(df$Fixed_Trate, df$year)
-        df$SOS <- detrend_series(df$SOS, df$year)
+        df$EOS <- detrend_series(df$EOS, df$year)
         df$GPP_season <- detrend_series(df$GPP_season, df$year)
         df$P_pre <- detrend_series(df$P_pre, df$year)
         df$T_pre <- detrend_series(df$T_pre, df$year)
@@ -1400,7 +1269,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       }
 
       fixed_trate_z <- scale_vec(df$Fixed_Trate)
-      sos_z <- scale_vec(df$SOS)
+      eos_z <- scale_vec(df$EOS)
       gpp_z <- scale_vec(df$GPP_season)
       p_pre_z <- scale_vec(df$P_pre)
       t_pre_z <- scale_vec(df$T_pre)
@@ -1409,19 +1278,19 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       t_season_z <- scale_vec(df$T_season)
       sw_season_z <- scale_vec(df$SW_season)
 
-      if (any(is.na(c(fixed_trate_z, sos_z, gpp_z, p_pre_z, t_pre_z, sw_pre_z,
+      if (any(is.na(c(fixed_trate_z, eos_z, gpp_z, p_pre_z, t_pre_z, sw_pre_z,
                       p_season_z, t_season_z, sw_season_z)))) {
         next
       }
 
-      X_sos <- cbind(p_pre_z, t_pre_z, sw_pre_z)
-      a_res <- regress_beta_p(X_sos, sos_z)
-      r2_sos <- calc_r2(X_sos, sos_z)
+      X_eos <- cbind(p_pre_z, t_pre_z, sw_pre_z, p_season_z, t_season_z, sw_season_z)
+      a_res <- regress_beta_p(X_eos, eos_z)
+      r2_eos <- calc_r2(X_eos, eos_z)
       a <- a_res$beta
       p_a <- a_res$p
       se_a <- a_res$se
 
-      X_gpp <- cbind(sos_z, p_pre_z, t_pre_z, sw_pre_z, p_season_z, t_season_z, sw_season_z)
+      X_gpp <- cbind(eos_z, p_pre_z, t_pre_z, sw_pre_z, p_season_z, t_season_z, sw_season_z)
       bc_res <- regress_beta_p(X_gpp, gpp_z)
       r2_gpp <- calc_r2(X_gpp, gpp_z)
       bc <- bc_res$beta
@@ -1437,9 +1306,9 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       se_f <- se_bc[2:4]
       se_c <- se_bc[5:7]
 
-      vars_tr <- c("SOS", "GPP_season", "P_pre", "T_pre", "SW_pre",
+      vars_tr <- c("EOS", "GPP_season", "P_pre", "T_pre", "SW_pre",
                    "P_season", "T_season", "SW_season")
-      X_tr_full <- cbind(sos_z, gpp_z, p_pre_z, t_pre_z, sw_pre_z,
+      X_tr_full <- cbind(eos_z, gpp_z, p_pre_z, t_pre_z, sw_pre_z,
                          p_season_z, t_season_z, sw_season_z)
       X_tr <- X_tr_full
       vars_current <- vars_tr
@@ -1484,7 +1353,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       }
 
       vals <- c(
-        a[1], a[2], a[3],
+        a[1], a[2], a[3], a[4], a[5], a[6],
         b,
         f[1], f[2], f[3],
         c[1], c[2], c[3],
@@ -1498,6 +1367,12 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
         f[1] * d[2],
         f[2] * d[2],
         f[3] * d[2],
+        a[4] * b * d[2],
+        a[5] * b * d[2],
+        a[6] * b * d[2],
+        a[4] * d[1],
+        a[5] * d[1],
+        a[6] * d[1],
         c[1] * d[2],
         c[2] * d[2],
         c[3] * d[2],
@@ -1508,7 +1383,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
       )
 
       p_vals <- c(
-        p_a[1], p_a[2], p_a[3],
+        p_a[1], p_a[2], p_a[3], p_a[4], p_a[5], p_a[6],
         p_b,
         p_f[1], p_f[2], p_f[3],
         p_c[1], p_c[2], p_c[3],
@@ -1522,6 +1397,12 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
         delta_p_two(f[1], d[2], se_f[1], se_d[2]),
         delta_p_two(f[2], d[2], se_f[2], se_d[2]),
         delta_p_two(f[3], d[2], se_f[3], se_d[2]),
+        delta_p_three(a[4], b, d[2], se_a[4], se_b, se_d[2]),
+        delta_p_three(a[5], b, d[2], se_a[5], se_b, se_d[2]),
+        delta_p_three(a[6], b, d[2], se_a[6], se_b, se_d[2]),
+        delta_p_two(a[4], d[1], se_a[4], se_d[1]),
+        delta_p_two(a[5], d[1], se_a[5], se_d[1]),
+        delta_p_two(a[6], d[1], se_a[6], se_d[1]),
         delta_p_two(c[1], d[2], se_c[1], se_d[2]),
         delta_p_two(c[2], d[2], se_c[2], se_d[2]),
         delta_p_two(c[3], d[2], se_c[3], se_d[2]),
@@ -1531,7 +1412,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
         delta_p_ratio(c[3], d[2], d[8], se_c[3], se_d[2], se_d[8])
       )
 
-      r2_vals <- c(r2_sos, r2_gpp, r2_tr)
+      r2_vals <- c(r2_eos, r2_gpp, r2_tr)
       filter_res <- filter_sem_outputs(vals, p_vals, r2_vals)
       vals <- filter_res$vals
       p_vals <- filter_res$p_vals
@@ -1775,17 +1656,20 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
 # ==================== SEM分析（全局合并）====================
 # ===【修改7】添加POSav气候态计算===
 run_dual_timescale_sem <- function(years, mask_r) {
-  cat("\n=== 计算物候气候态（像元多年平均：SOSav, POSav） ===\n")
+  cat("\n=== 计算物候气候态（像元多年平均：SOSav, POSav, EOSav） ===\n")
 
-  # 读取所有年份的SOS和POS数据并计算多年平均
+  # 读取所有年份的SOS、POS、EOS数据并计算多年平均
   sos_stack_list <- list()
   pos_stack_list <- list()
+  eos_stack_list <- list()
   n_loaded_sos <- 0
   n_loaded_pos <- 0
+  n_loaded_eos <- 0
 
   for (year in years) {
     sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
     pos_file <- file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year))
+    eos_file <- file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", year))
 
     if (file.exists(sos_file)) {
       sos_r <- raster(sos_file)
@@ -1803,6 +1687,14 @@ run_dual_timescale_sem <- function(years, mask_r) {
       n_loaded_pos <- n_loaded_pos + 1
     }
 
+    if (file.exists(eos_file)) {
+      eos_r <- raster(eos_file)
+      eos_r <- set_nodata_if_missing(eos_r)
+      eos_r <- mask_raster(eos_r, mask_r)
+      eos_stack_list[[length(eos_stack_list) + 1]] <- eos_r
+      n_loaded_eos <- n_loaded_eos + 1
+    }
+
     if ((n_loaded_sos %% 10 == 0) && (n_loaded_sos > 0)) {
       cat(sprintf("  已读取 %d/%d 年份的物候数据...\n", n_loaded_sos, length(years)))
     }
@@ -1810,9 +1702,10 @@ run_dual_timescale_sem <- function(years, mask_r) {
 
   cat(sprintf("  ✓ 成功读取 %d/%d 年份的SOS数据\n", n_loaded_sos, length(years)))
   cat(sprintf("  ✓ 成功读取 %d/%d 年份的POS数据\n", n_loaded_pos, length(years)))
+  cat(sprintf("  ✓ 成功读取 %d/%d 年份的EOS数据\n", n_loaded_eos, length(years)))
 
-  if (n_loaded_sos == 0 || n_loaded_pos == 0) {
-    stop("未找到足够的SOS或POS数据文件")
+  if (n_loaded_sos == 0 || n_loaded_pos == 0 || n_loaded_eos == 0) {
+    stop("未找到足够的SOS/POS/EOS数据文件")
   }
 
   # 将列表转换为stack并计算多年平均
@@ -1830,7 +1723,14 @@ run_dual_timescale_sem <- function(years, mask_r) {
   })
   pos_climatology_r <- mask_raster(pos_climatology_r, mask_r)
 
-  # ===【修改：先统计掩膜内有效像元，再验证POS > SOS】===
+  cat("  正在计算EOS多年平均（EOSav）...\n")
+  eos_stack <- stack(eos_stack_list)
+  eos_climatology_r <- calc(eos_stack, fun = function(x) {
+    mean(x, na.rm = TRUE)
+  })
+  eos_climatology_r <- mask_raster(eos_climatology_r, mask_r)
+
+  # ===【修改：先统计掩膜内有效像元，再验证POS > SOS、EOS > POS】===
   mask_vals <- getValues(mask_r)
   in_mask <- !is.na(mask_vals) & (mask_vals > 0)
 
@@ -1838,53 +1738,70 @@ run_dual_timescale_sem <- function(years, mask_r) {
   sos_clim_vals_pre <- sanitize_values(sos_clim_vals_pre, NAvalue(sos_climatology_r), FALSE)
   pos_clim_vals_pre <- getValues(pos_climatology_r)
   pos_clim_vals_pre <- sanitize_values(pos_clim_vals_pre, NAvalue(pos_climatology_r), FALSE)
+  eos_clim_vals_pre <- getValues(eos_climatology_r)
+  eos_clim_vals_pre <- sanitize_values(eos_clim_vals_pre, NAvalue(eos_climatology_r), FALSE)
 
   valid_sos_pre <- in_mask & !is.na(sos_clim_vals_pre)
   valid_pos_pre <- in_mask & !is.na(pos_clim_vals_pre)
-  valid_overlap_pre <- valid_sos_pre & valid_pos_pre
+  valid_eos_pre <- in_mask & !is.na(eos_clim_vals_pre)
+  valid_overlap_pre <- valid_sos_pre & valid_pos_pre & valid_eos_pre
 
-  cat(sprintf("  掩膜内有效像元(预过滤): SOSav=%d, POSav=%d, 重叠=%d\n",
-              sum(valid_sos_pre), sum(valid_pos_pre), sum(valid_overlap_pre)))
+  cat(sprintf("  掩膜内有效像元(预过滤): SOSav=%d, POSav=%d, EOSav=%d, 重叠=%d\n",
+              sum(valid_sos_pre), sum(valid_pos_pre), sum(valid_eos_pre), sum(valid_overlap_pre)))
 
-  cat("  验证POSav > SOSav...\n")
-  valid_window <- valid_overlap_pre & (pos_clim_vals_pre > sos_clim_vals_pre)
+  cat("  验证POSav > SOSav, EOSav > POSav...\n")
+  valid_window <- valid_overlap_pre &
+    (pos_clim_vals_pre > sos_clim_vals_pre) &
+    (eos_clim_vals_pre > pos_clim_vals_pre)
   n_invalid <- sum(valid_overlap_pre & !valid_window)
-  cat(sprintf("  POSav > SOSav 过滤掉的像元数: %d\n", n_invalid))
+  cat(sprintf("  POSav/EOSav窗口过滤掉的像元数: %d\n", n_invalid))
   if (n_invalid > 0) {
-    cat(sprintf("  ⚠️ 过滤了 %d 个POSav≤SOSav的无效像元\n", n_invalid))
+    cat(sprintf("  ⚠️ 过滤了 %d 个无效像元\n", n_invalid))
   }
 
   valid_window_mask <- setValues(raster(mask_r), as.integer(valid_window))
   sos_climatology_r <- mask(sos_climatology_r, valid_window_mask, maskvalue = 0)
   pos_climatology_r <- mask(pos_climatology_r, valid_window_mask, maskvalue = 0)
+  eos_climatology_r <- mask(eos_climatology_r, valid_window_mask, maskvalue = 0)
 
   # 统计气候态信息（过滤后）
   sos_clim_vals <- getValues(sos_climatology_r)
   sos_clim_vals <- sanitize_values(sos_clim_vals, NAvalue(sos_climatology_r), FALSE)
   pos_clim_vals <- getValues(pos_climatology_r)
   pos_clim_vals <- sanitize_values(pos_clim_vals, NAvalue(pos_climatology_r), FALSE)
+  eos_clim_vals <- getValues(eos_climatology_r)
+  eos_clim_vals <- sanitize_values(eos_clim_vals, NAvalue(eos_climatology_r), FALSE)
 
   n_valid_sos <- sum(!is.na(sos_clim_vals))
   n_valid_pos <- sum(!is.na(pos_clim_vals))
+  n_valid_eos <- sum(!is.na(eos_clim_vals))
   sos_min <- min(sos_clim_vals, na.rm = TRUE)
   sos_max <- max(sos_clim_vals, na.rm = TRUE)
   sos_mean <- mean(sos_clim_vals, na.rm = TRUE)
   pos_min <- min(pos_clim_vals, na.rm = TRUE)
   pos_max <- max(pos_clim_vals, na.rm = TRUE)
   pos_mean <- mean(pos_clim_vals, na.rm = TRUE)
+  eos_min <- min(eos_clim_vals, na.rm = TRUE)
+  eos_max <- max(eos_clim_vals, na.rm = TRUE)
+  eos_mean <- mean(eos_clim_vals, na.rm = TRUE)
 
   cat(sprintf("  ✓ 物候气候态计算完成:\n"))
   cat(sprintf("    SOSav - 有效像元: %d, 范围: %.1f - %.1f DOY, 平均: %.1f DOY\n",
               n_valid_sos, sos_min, sos_max, sos_mean))
   cat(sprintf("    POSav - 有效像元: %d, 范围: %.1f - %.1f DOY, 平均: %.1f DOY\n",
               n_valid_pos, pos_min, pos_max, pos_mean))
+  cat(sprintf("    EOSav - 有效像元: %d, 范围: %.1f - %.1f DOY, 平均: %.1f DOY\n",
+              n_valid_eos, eos_min, eos_max, eos_mean))
 
   # 保存物候气候态
   sos_clim_file <- file.path(DERIVED_DIR, "SOS_climatology.tif")
   pos_clim_file <- file.path(DERIVED_DIR, "POS_climatology.tif")
+  eos_clim_file <- file.path(DERIVED_DIR, "EOS_climatology.tif")
   safe_write_raster(sos_climatology_r, sos_clim_file, datatype = "FLT4S")
   safe_write_raster(pos_climatology_r, pos_clim_file, datatype = "FLT4S")
-  cat(sprintf("  ✓ 物候气候态已保存: %s, %s\n", basename(sos_clim_file), basename(pos_clim_file)))
+  safe_write_raster(eos_climatology_r, eos_clim_file, datatype = "FLT4S")
+  cat(sprintf("  ✓ 物候气候态已保存: %s, %s, %s\n",
+              basename(sos_clim_file), basename(pos_clim_file), basename(eos_clim_file)))
 
   # 读取Fixed_Window_Length（用于计算Fixed_Trate）
   cat("\n=== 读取Fixed_Window_Length ===\n")
@@ -1909,8 +1826,9 @@ run_dual_timescale_sem <- function(years, mask_r) {
     clusterEvalQ(cl, library(raster))
     clusterExport(
       cl,
-      c("years", "sos_climatology_r", "pos_climatology_r", "fixed_window_length_r", "mask_r",
-        "prepare_dual_timescale_data", "calc_preseason_climate", "calc_season_climate_fixed",
+      c("years", "sos_climatology_r", "pos_climatology_r", "eos_climatology_r",
+        "fixed_window_length_r", "mask_r",
+        "prepare_dual_timescale_data", "calc_window_climate_fixed",
         "build_daily_path", "sanitize_values", "mask_raster", "safe_write_raster",
         "should_write", "OVERWRITE", "set_nodata_if_missing", "PARALLEL_CORES",
         "NODATA_OUT", "NODATA_ABS_MAX", "MIN_VALID_FRAC", "is_leap_year",
@@ -1924,15 +1842,16 @@ run_dual_timescale_sem <- function(years, mask_r) {
     res_list <- parLapply(cl, years, function(year) {
       tryCatch({
         rasters <- prepare_dual_timescale_data(year, sos_climatology_r, pos_climatology_r,
-                                              fixed_window_length_r, mask_r,
-                                              parallel_inner = FALSE)
+                                               eos_climatology_r,
+                                               fixed_window_length_r, mask_r,
+                                               parallel_inner = FALSE)
         if (is.null(rasters)) {
           return(list(year = year, ok = FALSE, msg = "输出为空", row = NULL))
         }
         year_row <- data.frame(
           year = year,
           Fixed_Trate = cellStats(rasters$fixed_trate, mean, na.rm = TRUE),
-          SOS = cellStats(rasters$sos, mean, na.rm = TRUE),
+          EOS = cellStats(rasters$eos, mean, na.rm = TRUE),
           GPP_season = cellStats(rasters$gpp_season, mean, na.rm = TRUE),
           P_pre = cellStats(rasters$p_pre, mean, na.rm = TRUE),
           T_pre = cellStats(rasters$t_pre, mean, na.rm = TRUE),
@@ -1959,14 +1878,15 @@ run_dual_timescale_sem <- function(years, mask_r) {
   } else {
     for (year in years) {
       rasters <- prepare_dual_timescale_data(year, sos_climatology_r, pos_climatology_r,
-                                            fixed_window_length_r, mask_r)
+                                             eos_climatology_r,
+                                             fixed_window_length_r, mask_r)
       if (is.null(rasters)) next
 
       if (SEM_SAMPLE_MODE == "annual_mean") {
         year_row <- data.frame(
           year = year,
           Fixed_Trate = cellStats(rasters$fixed_trate, mean, na.rm = TRUE),
-          SOS = cellStats(rasters$sos, mean, na.rm = TRUE),
+          EOS = cellStats(rasters$eos, mean, na.rm = TRUE),
           GPP_season = cellStats(rasters$gpp_season, mean, na.rm = TRUE),
           P_pre = cellStats(rasters$p_pre, mean, na.rm = TRUE),
           T_pre = cellStats(rasters$t_pre, mean, na.rm = TRUE),
@@ -1981,7 +1901,7 @@ run_dual_timescale_sem <- function(years, mask_r) {
         vals <- data.frame(
           year = year,
           Fixed_Trate = sanitize_values(getValues(rasters$fixed_trate), NAvalue(rasters$fixed_trate), TRUE),
-          SOS = sanitize_values(getValues(rasters$sos), NAvalue(rasters$sos), FALSE),
+          EOS = sanitize_values(getValues(rasters$eos), NAvalue(rasters$eos), FALSE),
           GPP_season = sanitize_values(getValues(rasters$gpp_season), NAvalue(rasters$gpp_season), FALSE),
           P_pre = sanitize_values(getValues(rasters$p_pre), NAvalue(rasters$p_pre), FALSE),
           T_pre = sanitize_values(getValues(rasters$t_pre), NAvalue(rasters$t_pre), TRUE),
@@ -2005,7 +1925,7 @@ run_dual_timescale_sem <- function(years, mask_r) {
   cat(sprintf("  完整案例数: %d\n", sum(complete.cases(sem_data))))
 
   # 修改：TRc → Fixed_Trate
-  for (col in c("Fixed_Trate", "SOS", "GPP_season", "P_pre", "T_pre", "SW_pre",
+  for (col in c("Fixed_Trate", "EOS", "GPP_season", "P_pre", "T_pre", "SW_pre",
                 "P_season", "T_season", "SW_season")) {
     valid_n <- sum(is.finite(sem_data[[col]]))
     mean_val <- mean(sem_data[[col]], na.rm = TRUE)
@@ -2058,50 +1978,65 @@ run_dual_timescale_sem <- function(years, mask_r) {
   # ===【修改9】SEM模型：Fixed_Trate替代TRc===
   cat("\n=== 构建双时间尺度SEM模型（固定窗口方法） ===\n")
   cat("✓ 气候因子: 降水(P)、气温(T)、短波辐射(SW)\n")
-  cat("✓ 时间窗口: 季前气候（SOSav前3个月）+ 生长季气候（固定窗口[SOSav, POSav]）\n")
+  cat("✓ 时间窗口: 早季气候（SOSav-POSav）+ 晚季气候（POSav-EOSav）\n")
   cat("✓ 因变量: Fixed_Trate（固定窗口蒸腾速率）\n")
 
   # 完整路径模型（降水 + 温度 + 短波辐射）
   sem_model <- '
-    # 第一层：季前气候 → SOS（物候响应）
-    SOS ~ a1*P_pre + a2*T_pre + a3*SW_pre
+    # 第一层：早/晚季气候 → EOS（物候响应）
+    EOS ~ a1*P_pre + a2*T_pre + a3*SW_pre +
+          a4*P_season + a5*T_season + a6*SW_season
 
-    # 第二层：SOS + 季前气候 + 生长季气候 → GPP_season（碳固定）
-    GPP_season ~ b*SOS + f1*P_pre + f2*T_pre + f3*SW_pre +
+    # 第二层：EOS + 早/晚季气候 → GPP_season（碳固定）
+    GPP_season ~ b*EOS + f1*P_pre + f2*T_pre + f3*SW_pre +
                  c1*P_season + c2*T_season + c3*SW_season
 
-    # 第三层：SOS + GPP_season + 季前气候 + 生长季气候 → Fixed_Trate（固定窗口蒸腾速率）
-    Fixed_Trate ~ g*SOS + d*GPP_season +
+    # 第三层：EOS + GPP_season + 早/晚季气候 → Fixed_Trate（固定窗口蒸腾速率）
+    Fixed_Trate ~ g*EOS + d*GPP_season +
           h1*P_pre + h2*T_pre + h3*SW_pre +
           e1*P_season + e2*T_season + e3*SW_season
 
     # === 间接效应分解 ===
 
-    # 季前气候的间接效应路径
-    P_pre_via_SOS_GPP  := a1 * b * d
-    T_pre_via_SOS_GPP  := a2 * b * d
-    SW_pre_via_SOS_GPP := a3 * b * d
+    # 早季气候的间接效应路径
+    P_pre_via_EOS_GPP  := a1 * b * d
+    T_pre_via_EOS_GPP  := a2 * b * d
+    SW_pre_via_EOS_GPP := a3 * b * d
 
-    P_pre_via_SOS  := a1 * g
-    T_pre_via_SOS  := a2 * g
-    SW_pre_via_SOS := a3 * g
+    P_pre_via_EOS  := a1 * g
+    T_pre_via_EOS  := a2 * g
+    SW_pre_via_EOS := a3 * g
 
     P_pre_via_GPP  := f1 * d
     T_pre_via_GPP  := f2 * d
     SW_pre_via_GPP := f3 * d
 
-    # 季前气候的总间接效应
+    # 早季气候的总间接效应
     P_pre_indirect  := a1*b*d + a1*g + f1*d
     T_pre_indirect  := a2*b*d + a2*g + f2*d
     SW_pre_indirect := a3*b*d + a3*g + f3*d
 
-    # 生长季气候通过GPP的间接效应
+    # 晚季气候经由EOS的间接效应
+    P_season_via_EOS_GPP  := a4 * b * d
+    T_season_via_EOS_GPP  := a5 * b * d
+    SW_season_via_EOS_GPP := a6 * b * d
+
+    P_season_via_EOS  := a4 * g
+    T_season_via_EOS  := a5 * g
+    SW_season_via_EOS := a6 * g
+
+    # 晚季气候通过GPP的间接效应
     P_season_via_GPP  := c1 * d
     T_season_via_GPP  := c2 * d
     SW_season_via_GPP := c3 * d
 
-    # SOS通过GPP的间接效应
-    SOS_via_GPP := b * d
+    # 晚季气候的总间接效应
+    P_season_indirect  := a4*b*d + a4*g + c1*d
+    T_season_indirect  := a5*b*d + a5*g + c2*d
+    SW_season_indirect := a6*b*d + a6*g + c3*d
+
+    # EOS通过GPP的间接效应
+    EOS_via_GPP := b * d
 
     # GPP的中介比例
     P_GPP_mediation := (c1*d) / (e1 + c1*d)
@@ -2209,6 +2144,9 @@ run_dual_timescale_sem <- function(years, mask_r) {
   a1_stats <- get_label_stats(params, "a1")
   a2_stats <- get_label_stats(params, "a2")
   a3_stats <- get_label_stats(params, "a3")
+  a4_stats <- get_label_stats(params, "a4")
+  a5_stats <- get_label_stats(params, "a5")
+  a6_stats <- get_label_stats(params, "a6")
   b_stats <- get_label_stats(params, "b")
   f1_stats <- get_label_stats(params, "f1")
   f2_stats <- get_label_stats(params, "f2")
@@ -2226,27 +2164,27 @@ run_dual_timescale_sem <- function(years, mask_r) {
   t_ratio_std <- safe_mediation_ratio(c2_stats$std, d_stats$std, e2_stats$std)
   sw_ratio_std <- safe_mediation_ratio(c3_stats$std, d_stats$std, e3_stats$std)
 
-  params <- update_defined_param(params, "P_pre_via_SOS_GPP",
+  params <- update_defined_param(params, "P_pre_via_EOS_GPP",
                                  a1_stats$std * b_stats$std * d_stats$std,
                                  delta_p_three(a1_stats$std, b_stats$std, d_stats$std,
                                                a1_stats$se_std, b_stats$se_std, d_stats$se_std))
-  params <- update_defined_param(params, "T_pre_via_SOS_GPP",
+  params <- update_defined_param(params, "T_pre_via_EOS_GPP",
                                  a2_stats$std * b_stats$std * d_stats$std,
                                  delta_p_three(a2_stats$std, b_stats$std, d_stats$std,
                                                a2_stats$se_std, b_stats$se_std, d_stats$se_std))
-  params <- update_defined_param(params, "SW_pre_via_SOS_GPP",
+  params <- update_defined_param(params, "SW_pre_via_EOS_GPP",
                                  a3_stats$std * b_stats$std * d_stats$std,
                                  delta_p_three(a3_stats$std, b_stats$std, d_stats$std,
                                                a3_stats$se_std, b_stats$se_std, d_stats$se_std))
-  params <- update_defined_param(params, "P_pre_via_SOS",
+  params <- update_defined_param(params, "P_pre_via_EOS",
                                  a1_stats$std * g_stats$std,
                                  delta_p_two(a1_stats$std, g_stats$std,
                                              a1_stats$se_std, g_stats$se_std))
-  params <- update_defined_param(params, "T_pre_via_SOS",
+  params <- update_defined_param(params, "T_pre_via_EOS",
                                  a2_stats$std * g_stats$std,
                                  delta_p_two(a2_stats$std, g_stats$std,
                                              a2_stats$se_std, g_stats$se_std))
-  params <- update_defined_param(params, "SW_pre_via_SOS",
+  params <- update_defined_param(params, "SW_pre_via_EOS",
                                  a3_stats$std * g_stats$std,
                                  delta_p_two(a3_stats$std, g_stats$std,
                                              a3_stats$se_std, g_stats$se_std))
@@ -2262,6 +2200,30 @@ run_dual_timescale_sem <- function(years, mask_r) {
                                  f3_stats$std * d_stats$std,
                                  delta_p_two(f3_stats$std, d_stats$std,
                                              f3_stats$se_std, d_stats$se_std))
+  params <- update_defined_param(params, "P_season_via_EOS_GPP",
+                                 a4_stats$std * b_stats$std * d_stats$std,
+                                 delta_p_three(a4_stats$std, b_stats$std, d_stats$std,
+                                               a4_stats$se_std, b_stats$se_std, d_stats$se_std))
+  params <- update_defined_param(params, "T_season_via_EOS_GPP",
+                                 a5_stats$std * b_stats$std * d_stats$std,
+                                 delta_p_three(a5_stats$std, b_stats$std, d_stats$std,
+                                               a5_stats$se_std, b_stats$se_std, d_stats$se_std))
+  params <- update_defined_param(params, "SW_season_via_EOS_GPP",
+                                 a6_stats$std * b_stats$std * d_stats$std,
+                                 delta_p_three(a6_stats$std, b_stats$std, d_stats$std,
+                                               a6_stats$se_std, b_stats$se_std, d_stats$se_std))
+  params <- update_defined_param(params, "P_season_via_EOS",
+                                 a4_stats$std * g_stats$std,
+                                 delta_p_two(a4_stats$std, g_stats$std,
+                                             a4_stats$se_std, g_stats$se_std))
+  params <- update_defined_param(params, "T_season_via_EOS",
+                                 a5_stats$std * g_stats$std,
+                                 delta_p_two(a5_stats$std, g_stats$std,
+                                             a5_stats$se_std, g_stats$se_std))
+  params <- update_defined_param(params, "SW_season_via_EOS",
+                                 a6_stats$std * g_stats$std,
+                                 delta_p_two(a6_stats$std, g_stats$std,
+                                             a6_stats$se_std, g_stats$se_std))
   params <- update_defined_param(params, "P_season_via_GPP",
                                  c1_stats$std * d_stats$std,
                                  delta_p_two(c1_stats$std, d_stats$std,
@@ -2274,7 +2236,7 @@ run_dual_timescale_sem <- function(years, mask_r) {
                                  c3_stats$std * d_stats$std,
                                  delta_p_two(c3_stats$std, d_stats$std,
                                              c3_stats$se_std, d_stats$se_std))
-  params <- update_defined_param(params, "SOS_via_GPP",
+  params <- update_defined_param(params, "EOS_via_GPP",
                                  b_stats$std * d_stats$std,
                                  delta_p_two(b_stats$std, d_stats$std,
                                              b_stats$se_std, d_stats$se_std))
@@ -2291,27 +2253,27 @@ run_dual_timescale_sem <- function(years, mask_r) {
                                  delta_p_ratio(c3_stats$std, d_stats$std, e3_stats$std,
                                                c3_stats$se_std, d_stats$se_std, e3_stats$se_std))
 
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "P_pre_via_SOS_GPP",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "P_pre_via_EOS_GPP",
                                          a1_stats$std * b_stats$std * d_stats$std,
                                          delta_p_three(a1_stats$std, b_stats$std, d_stats$std,
                                                        a1_stats$se_std, b_stats$se_std, d_stats$se_std))
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "T_pre_via_SOS_GPP",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "T_pre_via_EOS_GPP",
                                          a2_stats$std * b_stats$std * d_stats$std,
                                          delta_p_three(a2_stats$std, b_stats$std, d_stats$std,
                                                        a2_stats$se_std, b_stats$se_std, d_stats$se_std))
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "SW_pre_via_SOS_GPP",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "SW_pre_via_EOS_GPP",
                                          a3_stats$std * b_stats$std * d_stats$std,
                                          delta_p_three(a3_stats$std, b_stats$std, d_stats$std,
                                                        a3_stats$se_std, b_stats$se_std, d_stats$se_std))
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "P_pre_via_SOS",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "P_pre_via_EOS",
                                          a1_stats$std * g_stats$std,
                                          delta_p_two(a1_stats$std, g_stats$std,
                                                      a1_stats$se_std, g_stats$se_std))
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "T_pre_via_SOS",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "T_pre_via_EOS",
                                          a2_stats$std * g_stats$std,
                                          delta_p_two(a2_stats$std, g_stats$std,
                                                      a2_stats$se_std, g_stats$se_std))
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "SW_pre_via_SOS",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "SW_pre_via_EOS",
                                          a3_stats$std * g_stats$std,
                                          delta_p_two(a3_stats$std, g_stats$std,
                                                      a3_stats$se_std, g_stats$se_std))
@@ -2327,6 +2289,30 @@ run_dual_timescale_sem <- function(years, mask_r) {
                                          f3_stats$std * d_stats$std,
                                          delta_p_two(f3_stats$std, d_stats$std,
                                                      f3_stats$se_std, d_stats$se_std))
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "P_season_via_EOS_GPP",
+                                         a4_stats$std * b_stats$std * d_stats$std,
+                                         delta_p_three(a4_stats$std, b_stats$std, d_stats$std,
+                                                       a4_stats$se_std, b_stats$se_std, d_stats$se_std))
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "T_season_via_EOS_GPP",
+                                         a5_stats$std * b_stats$std * d_stats$std,
+                                         delta_p_three(a5_stats$std, b_stats$std, d_stats$std,
+                                                       a5_stats$se_std, b_stats$se_std, d_stats$se_std))
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "SW_season_via_EOS_GPP",
+                                         a6_stats$std * b_stats$std * d_stats$std,
+                                         delta_p_three(a6_stats$std, b_stats$std, d_stats$std,
+                                                       a6_stats$se_std, b_stats$se_std, d_stats$se_std))
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "P_season_via_EOS",
+                                         a4_stats$std * g_stats$std,
+                                         delta_p_two(a4_stats$std, g_stats$std,
+                                                     a4_stats$se_std, g_stats$se_std))
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "T_season_via_EOS",
+                                         a5_stats$std * g_stats$std,
+                                         delta_p_two(a5_stats$std, g_stats$std,
+                                                     a5_stats$se_std, g_stats$se_std))
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "SW_season_via_EOS",
+                                         a6_stats$std * g_stats$std,
+                                         delta_p_two(a6_stats$std, g_stats$std,
+                                                     a6_stats$se_std, g_stats$se_std))
   fit_summary$pe <- update_defined_param(fit_summary$pe, "P_season_via_GPP",
                                          c1_stats$std * d_stats$std,
                                          delta_p_two(c1_stats$std, d_stats$std,
@@ -2339,7 +2325,7 @@ run_dual_timescale_sem <- function(years, mask_r) {
                                          c3_stats$std * d_stats$std,
                                          delta_p_two(c3_stats$std, d_stats$std,
                                                      c3_stats$se_std, d_stats$se_std))
-  fit_summary$pe <- update_defined_param(fit_summary$pe, "SOS_via_GPP",
+  fit_summary$pe <- update_defined_param(fit_summary$pe, "EOS_via_GPP",
                                          b_stats$std * d_stats$std,
                                          delta_p_two(b_stats$std, d_stats$std,
                                                      b_stats$se_std, d_stats$se_std))
@@ -2587,28 +2573,36 @@ main <- function() {
   if (pixel_all_skipped) {
     cat("  ✓ 像元级输出齐全，已跳过\n")
   } else {
-    # 先计算物候气候态（SOSav, POSav）
-    cat("\n=== 计算物候气候态（像元多年平均：SOSav, POSav） ===\n")
+    # 先计算物候气候态（SOSav, POSav, EOSav）
+    cat("\n=== 计算物候气候态（像元多年平均：SOSav, POSav, EOSav） ===\n")
     sos_clim_file <- file.path(DERIVED_DIR, "SOS_climatology.tif")
     pos_clim_file <- file.path(DERIVED_DIR, "POS_climatology.tif")
+    eos_clim_file <- file.path(DERIVED_DIR, "EOS_climatology.tif")
 
-    if (USE_EXISTING_CLIMATOLOGY && file.exists(sos_clim_file) && file.exists(pos_clim_file)) {
+    if (USE_EXISTING_CLIMATOLOGY &&
+        file.exists(sos_clim_file) && file.exists(pos_clim_file) && file.exists(eos_clim_file)) {
       cat("  ✓ 复用已存在的物候气候态缓存\n")
       sos_climatology_r <- raster(sos_clim_file)
       pos_climatology_r <- raster(pos_clim_file)
+      eos_climatology_r <- raster(eos_clim_file)
       sos_climatology_r <- set_nodata_if_missing(sos_climatology_r)
       pos_climatology_r <- set_nodata_if_missing(pos_climatology_r)
+      eos_climatology_r <- set_nodata_if_missing(eos_climatology_r)
       sos_climatology_r <- mask_raster(sos_climatology_r, mask_r)
       pos_climatology_r <- mask_raster(pos_climatology_r, mask_r)
+      eos_climatology_r <- mask_raster(eos_climatology_r, mask_r)
     } else {
       sos_stack_list <- list()
       pos_stack_list <- list()
+      eos_stack_list <- list()
       n_loaded_sos <- 0
       n_loaded_pos <- 0
+      n_loaded_eos <- 0
 
       for (year in years) {
         sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
         pos_file <- file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year))
+        eos_file <- file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", year))
 
         if (file.exists(sos_file)) {
           sos_r <- raster(sos_file)
@@ -2626,6 +2620,14 @@ main <- function() {
           n_loaded_pos <- n_loaded_pos + 1
         }
 
+        if (file.exists(eos_file)) {
+          eos_r <- raster(eos_file)
+          eos_r <- set_nodata_if_missing(eos_r)
+          eos_r <- mask_raster(eos_r, mask_r)
+          eos_stack_list[[length(eos_stack_list) + 1]] <- eos_r
+          n_loaded_eos <- n_loaded_eos + 1
+        }
+
         if ((n_loaded_sos %% 10 == 0) && (n_loaded_sos > 0)) {
           cat(sprintf("  已读取 %d/%d 年份的物候数据...\n", n_loaded_sos, length(years)))
         }
@@ -2633,9 +2635,10 @@ main <- function() {
 
       cat(sprintf("  ✓ 成功读取 %d/%d 年份的SOS数据\n", n_loaded_sos, length(years)))
       cat(sprintf("  ✓ 成功读取 %d/%d 年份的POS数据\n", n_loaded_pos, length(years)))
+      cat(sprintf("  ✓ 成功读取 %d/%d 年份的EOS数据\n", n_loaded_eos, length(years)))
 
-      if (n_loaded_sos == 0 || n_loaded_pos == 0) {
-        stop("未找到足够的SOS或POS数据文件")
+      if (n_loaded_sos == 0 || n_loaded_pos == 0 || n_loaded_eos == 0) {
+        stop("未找到足够的SOS/POS/EOS数据文件")
       }
 
       cat("  正在计算SOS多年平均（SOSav）...\n")
@@ -2647,19 +2650,25 @@ main <- function() {
       pos_stack <- stack(pos_stack_list)
       pos_climatology_r <- calc(pos_stack, fun = function(x) { mean(x, na.rm = TRUE) })
       pos_climatology_r <- mask_raster(pos_climatology_r, mask_r)
+
+      cat("  正在计算EOS多年平均（EOSav）...\n")
+      eos_stack <- stack(eos_stack_list)
+      eos_climatology_r <- calc(eos_stack, fun = function(x) { mean(x, na.rm = TRUE) })
+      eos_climatology_r <- mask_raster(eos_climatology_r, mask_r)
     }
 
-    # ===【修改：添加POS > SOS验证】===
-    cat("  验证POSav > SOSav...\n")
-    valid_window_mask <- pos_climatology_r > sos_climatology_r
+    # ===【修改：添加POS > SOS和EOS > POS验证】===
+    cat("  验证POSav > SOSav, EOSav > POSav...\n")
+    valid_window_mask <- (pos_climatology_r > sos_climatology_r) & (eos_climatology_r > pos_climatology_r)
     valid_window_mask[is.na(valid_window_mask)] <- FALSE
     sos_climatology_r <- mask(sos_climatology_r, valid_window_mask, maskvalue = 0)
     pos_climatology_r <- mask(pos_climatology_r, valid_window_mask, maskvalue = 0)
+    eos_climatology_r <- mask(eos_climatology_r, valid_window_mask, maskvalue = 0)
 
     n_invalid <- sum(getValues(valid_window_mask) == 0, na.rm = TRUE)
     cat(sprintf("  过滤掉的像元数: %d\n", n_invalid))
     if (n_invalid > 0) {
-      cat(sprintf("  ⚠️ 过滤了 %d 个POSav≤SOSav的无效像元\n", n_invalid))
+      cat(sprintf("  ⚠️ 过滤了 %d 个无效像元\n", n_invalid))
     }
 
     # 统计气候态信息
@@ -2667,27 +2676,38 @@ main <- function() {
     sos_clim_vals <- sanitize_values(sos_clim_vals, NAvalue(sos_climatology_r), FALSE)
     pos_clim_vals <- getValues(pos_climatology_r)
     pos_clim_vals <- sanitize_values(pos_clim_vals, NAvalue(pos_climatology_r), FALSE)
+    eos_clim_vals <- getValues(eos_climatology_r)
+    eos_clim_vals <- sanitize_values(eos_clim_vals, NAvalue(eos_climatology_r), FALSE)
 
     n_valid_sos <- sum(!is.na(sos_clim_vals))
     n_valid_pos <- sum(!is.na(pos_clim_vals))
+    n_valid_eos <- sum(!is.na(eos_clim_vals))
     sos_min <- min(sos_clim_vals, na.rm = TRUE)
     sos_max <- max(sos_clim_vals, na.rm = TRUE)
     sos_mean <- mean(sos_clim_vals, na.rm = TRUE)
     pos_min <- min(pos_clim_vals, na.rm = TRUE)
     pos_max <- max(pos_clim_vals, na.rm = TRUE)
     pos_mean <- mean(pos_clim_vals, na.rm = TRUE)
+    eos_min <- min(eos_clim_vals, na.rm = TRUE)
+    eos_max <- max(eos_clim_vals, na.rm = TRUE)
+    eos_mean <- mean(eos_clim_vals, na.rm = TRUE)
 
     cat(sprintf("  ✓ 物候气候态计算完成:\n"))
     cat(sprintf("    SOSav - 有效像元: %d, 范围: %.1f - %.1f DOY, 平均: %.1f DOY\n",
                 n_valid_sos, sos_min, sos_max, sos_mean))
     cat(sprintf("    POSav - 有效像元: %d, 范围: %.1f - %.1f DOY, 平均: %.1f DOY\n",
                 n_valid_pos, pos_min, pos_max, pos_mean))
+    cat(sprintf("    EOSav - 有效像元: %d, 范围: %.1f - %.1f DOY, 平均: %.1f DOY\n",
+                n_valid_eos, eos_min, eos_max, eos_mean))
 
     # 保存物候气候态（仅在未复用缓存时写入）
-    if (!(USE_EXISTING_CLIMATOLOGY && file.exists(sos_clim_file) && file.exists(pos_clim_file))) {
+    if (!(USE_EXISTING_CLIMATOLOGY &&
+          file.exists(sos_clim_file) && file.exists(pos_clim_file) && file.exists(eos_clim_file))) {
       safe_write_raster(sos_climatology_r, sos_clim_file, datatype = "FLT4S")
       safe_write_raster(pos_climatology_r, pos_clim_file, datatype = "FLT4S")
-      cat(sprintf("  ✓ 物候气候态已保存: %s, %s\n", basename(sos_clim_file), basename(pos_clim_file)))
+      safe_write_raster(eos_climatology_r, eos_clim_file, datatype = "FLT4S")
+      cat(sprintf("  ✓ 物候气候态已保存: %s, %s, %s\n",
+                  basename(sos_clim_file), basename(pos_clim_file), basename(eos_clim_file)))
     }
 
     # 读取Fixed_Window_Length（用于计算Fixed_Trate）
@@ -2704,7 +2724,7 @@ main <- function() {
 
     # 准备缓存
     prepare_sem_caches(years, sos_climatology_r, pos_climatology_r,
-                      fixed_window_length_r, mask_r)
+                      eos_climatology_r, fixed_window_length_r, mask_r)
 
     # 运行像元时间序列SEM（raw + detrended）
     for (pr in pixel_runs) {
@@ -2741,6 +2761,6 @@ if (!interactive()) {
   cat("请手动执行以下命令以运行双时间尺度SEM分析:\n\n")
   cat("  main()\n\n")
   cat("或者使用以下命令在非交互模式运行:\n\n")
-  cat("  Rscript 05b_SEM_analysis_dual_timescale_SOS.R\n")
+  cat("  Rscript 05b_SEM_analysis_dual_timescale_EOS.R\n")
   cat("======================================================================\n\n")
 }

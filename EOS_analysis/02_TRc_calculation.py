@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Module 02: TRc（累积蒸腾）计算
-计算SOS-POS窗口内的累积蒸腾量
-TRc_y = Σ[SOS to POS] TR(t)
+计算POS-EOS窗口内的累积蒸腾量
+TRc_y = Σ[POS to EOS] TR(t)
 """
 
 import numpy as np
@@ -43,7 +43,7 @@ def outputs_complete(years):
     trc_done = all((OUTPUT_DIR / f"TRc_{year}.tif").exists() for year in years)
     clim_done = all(
         (CLIMATOLOGY_DIR / name).exists()
-        for name in ("TR_daily_climatology.tif", "SOSav.tif", "POSav.tif")
+        for name in ("TR_daily_climatology.tif", "POSav.tif", "EOSav.tif")
     )
     return trc_done and clim_done
 
@@ -111,7 +111,7 @@ def is_leap_year(year):
 
 # 物候DOY使用无闰日（1-365）
 PHENO_MAX_DOY = 365
-MIN_VALID_FRAC = 0.60  # 有效天数阈值（SOS-POS窗口内）
+MIN_VALID_FRAC = 0.60  # 有效天数阈值（POS-EOS窗口内）
 
 def noleap_doy_from_date(date_obj):
     """
@@ -156,23 +156,22 @@ def calculate_TRc_block_optimized(year, mask, template_profile):
     print(f"\n=== 计算TRc（块处理-加速版）: {year} ===")
 
     # 读取物候数据（物候代码输出格式）
-    sos_file = PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year)
     pos_file = PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year)
+    eos_file = PHENO_DIR / PHENO_FILE_FORMAT['EOS'].format(year=year)
 
-    if not sos_file.exists() or not pos_file.exists():
+    if not pos_file.exists() or not eos_file.exists():
         print(f"  ✗ 错误：缺少物候数据")
-        print(f"    SOS: {sos_file} ({'存在' if sos_file.exists() else '不存在'})")
         print(f"    POS: {pos_file} ({'存在' if pos_file.exists() else '不存在'})")
+        print(f"    EOS: {eos_file} ({'存在' if eos_file.exists() else '不存在'})")
         return None, None
-
-    with rasterio.open(sos_file) as src:
-        sos = src.read(1)
-        height, width = src.height, src.width
-        nodata_sos = src.nodata  # ✅ 读取真实nodata
 
     with rasterio.open(pos_file) as src:
         pos = src.read(1)
+        height, width = src.height, src.width
         nodata_pos = src.nodata  # ✅ 读取真实nodata
+    with rasterio.open(eos_file) as src:
+        eos = src.read(1)
+        nodata_eos = src.nodata  # ✅ 读取真实nodata
 
     # 使用统一模板profile
     profile = template_profile.copy()
@@ -199,11 +198,11 @@ def calculate_TRc_block_optimized(year, mask, template_profile):
 
     valid_pheno = (
         mask
-        & _is_valid_pheno(sos, nodata_sos)
         & _is_valid_pheno(pos, nodata_pos)
-        & (sos > 0) & (pos > 0)
-        & (pos >= sos)
-        & (sos <= PHENO_MAX_DOY) & (pos <= PHENO_MAX_DOY)
+        & _is_valid_pheno(eos, nodata_eos)
+        & (pos > 0) & (eos > 0)
+        & (eos >= pos)
+        & (pos <= PHENO_MAX_DOY) & (eos <= PHENO_MAX_DOY)
     )
 
     # 初始化TRc：只对valid_pheno初始化为0，其他为NODATA
@@ -245,8 +244,8 @@ def calculate_TRc_block_optimized(year, mask, template_profile):
                     r0, r1 = win.row_off, win.row_off + win.height
                     c0, c1 = win.col_off, win.col_off + win.width
 
-                    sos_b = sos[r0:r1, c0:c1]
                     pos_b = pos[r0:r1, c0:c1]
+                    eos_b = eos[r0:r1, c0:c1]
                     vph_b = valid_pheno[r0:r1, c0:c1]
 
                     # 如果块内没有有效像元，跳过
@@ -256,8 +255,8 @@ def calculate_TRc_block_optimized(year, mask, template_profile):
                     # 读取块内TR数据
                     tr_b = src.read(1, window=win)
 
-                    # 累加条件：SOS ≤ doy ≤ POS
-                    in_window = vph_b & (sos_b <= doy) & (doy <= pos_b)
+                    # 累加条件：POS ≤ doy ≤ EOS
+                    in_window = vph_b & (pos_b <= doy) & (doy <= eos_b)
 
                     # ✅ 使用真实nodata判断TR有效性
                     if nodata_tr is None:
@@ -283,9 +282,9 @@ def calculate_TRc_block_optimized(year, mask, template_profile):
     print(f"  缺失日文件数: {missing_files}/{days_in_year}")
 
     # 有效天数比例过滤（窗口内有效天数需 >= MIN_VALID_FRAC * 窗口长度）
-    sos_i = np.rint(sos).astype(np.int16)
     pos_i = np.rint(pos).astype(np.int16)
-    window_len = (pos_i - sos_i + 1).astype(np.int16)
+    eos_i = np.rint(eos).astype(np.int16)
+    window_len = (eos_i - pos_i + 1).astype(np.int16)
     min_required = np.ceil(MIN_VALID_FRAC * window_len).astype(np.int16)
     valid_count = valid_pheno & (TRc_count >= min_required)
     TRc[valid_pheno & ~valid_count] = NODATA_OUT
@@ -417,7 +416,7 @@ def calculate_daily_TR_climatology(years, mask, template_profile):
 
 def calculate_phenology_climatology(years, mask, template_profile):
     """
-    计算多年平均物候（SOSav, POSav）
+    计算多年平均物候（POSav, EOSav）
 
     Parameters:
     -----------
@@ -430,39 +429,37 @@ def calculate_phenology_climatology(years, mask, template_profile):
 
     Returns:
     --------
-    SOSav, POSav : ndarray, shape (H, W)
-        多年平均SOS和POS（仅在mask区域内有效）
+    POSav, EOSav : ndarray, shape (H, W)
+        多年平均POS和EOS（仅在mask区域内有效）
     profile : dict
         栅格配置
     """
-    print("\n=== 计算多年平均物候（SOSav, POSav）===")
+    print("\n=== 计算多年平均物候（POSav, EOSav）===")
     print(f"  年份范围: {min(years)}-{max(years)} ({len(years)}年)")
 
-    sos_stack = []
     pos_stack = []
+    eos_stack = []
     profile = template_profile.copy()
     profile_checked = False
 
     for year in tqdm(years, desc="读取物候数据"):
-        sos_file = PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year)
         pos_file = PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year)
+        eos_file = PHENO_DIR / PHENO_FILE_FORMAT['EOS'].format(year=year)
 
-        if not sos_file.exists() or not pos_file.exists():
+        if not pos_file.exists() or not eos_file.exists():
             print(f"  ⚠ 跳过 {year}：缺少物候数据")
             continue
-
-        with rasterio.open(sos_file) as src:
-            sos = src.read(1)
-            sos_profile = src.profile.copy()
-            nodata_sos = src.nodata
-            if not profile_checked:
-                check_spatial_consistency(profile, sos_file, sos_profile, f"SOS({year})")
 
         with rasterio.open(pos_file) as src:
             pos = src.read(1)
             if not profile_checked:
                 check_spatial_consistency(profile, pos_file, src.profile, f"POS({year})")
             nodata_pos = src.nodata
+        with rasterio.open(eos_file) as src:
+            eos = src.read(1)
+            if not profile_checked:
+                check_spatial_consistency(profile, eos_file, src.profile, f"EOS({year})")
+            nodata_eos = src.nodata
             profile_checked = True
 
         # 构建有效物候掩膜（与TRc计算逻辑一致）
@@ -476,44 +473,44 @@ def calculate_phenology_climatology(years, mask, template_profile):
 
         valid = (
             mask &
-            _is_valid_pheno_value(sos, nodata_sos) &
             _is_valid_pheno_value(pos, nodata_pos) &
-            (sos > 0) & (sos <= 365) &  # 合法DOY范围
+            _is_valid_pheno_value(eos, nodata_eos) &
             (pos > 0) & (pos <= 365) &  # 合法DOY范围
-            (pos >= sos)  # POS必须>=SOS
+            (eos > 0) & (eos <= 365) &  # 合法DOY范围
+            (eos >= pos)  # EOS必须>=POS
         )
 
         # 转换为NaN（无效值设为NaN，不参与多年平均）
-        sos_masked = np.where(valid, sos, np.nan)
         pos_masked = np.where(valid, pos, np.nan)
+        eos_masked = np.where(valid, eos, np.nan)
 
-        sos_stack.append(sos_masked)
         pos_stack.append(pos_masked)
+        eos_stack.append(eos_masked)
 
     # 计算多年平均
-    sos_stack = np.stack(sos_stack, axis=0)
     pos_stack = np.stack(pos_stack, axis=0)
+    eos_stack = np.stack(eos_stack, axis=0)
 
     with np.errstate(invalid='ignore'):
-        SOSav = np.nanmean(sos_stack, axis=0)
         POSav = np.nanmean(pos_stack, axis=0)
+        EOSav = np.nanmean(eos_stack, axis=0)
 
         # 应用掩膜：仅保留mask区域的数据，保持与TR气候态一致
-        SOSav = np.where(mask & np.isfinite(SOSav), SOSav, NODATA_OUT)
         POSav = np.where(mask & np.isfinite(POSav), POSav, NODATA_OUT)
+        EOSav = np.where(mask & np.isfinite(EOSav), EOSav, NODATA_OUT)
 
     # 统计
-    sos_valid = SOSav[(SOSav != NODATA_OUT) & mask]
     pos_valid = POSav[(POSav != NODATA_OUT) & mask]
+    eos_valid = EOSav[(EOSav != NODATA_OUT) & mask]
 
-    print(f"  SOSav统计: 平均={sos_valid.mean():.1f} DOY, "
-          f"范围=[{sos_valid.min():.0f}, {sos_valid.max():.0f}], "
-          f"有效像元={sos_valid.size}")
     print(f"  POSav统计: 平均={pos_valid.mean():.1f} DOY, "
           f"范围=[{pos_valid.min():.0f}, {pos_valid.max():.0f}], "
           f"有效像元={pos_valid.size}")
+    print(f"  EOSav统计: 平均={eos_valid.mean():.1f} DOY, "
+          f"范围=[{eos_valid.min():.0f}, {eos_valid.max():.0f}], "
+          f"有效像元={eos_valid.size}")
 
-    return SOSav, POSav, profile
+    return POSav, EOSav, profile
 
 def save_climatology_data():
     """
@@ -523,8 +520,8 @@ def save_climatology_data():
     ---------
     Wang2025_Analysis/Climatology/
         ├── TR_daily_climatology.tif  (365波段，每波段为一个DOY的多年平均TR)
-        ├── SOSav.tif                 (多年平均SOS)
-        └── POSav.tif                 (多年平均POS)
+        ├── POSav.tif                 (多年平均POS)
+        └── EOSav.tif                 (多年平均EOS)
     """
     print("\n" + "="*70)
     print("计算多年平均气候态数据（用于TRc原版分解）")
@@ -537,9 +534,9 @@ def save_climatology_data():
     template_profile = load_template_profile()
 
     output_tr = climatology_dir / "TR_daily_climatology.tif"
-    output_sos = climatology_dir / "SOSav.tif"
     output_pos = climatology_dir / "POSav.tif"
-    if not OVERWRITE and output_tr.exists() and output_sos.exists() and output_pos.exists():
+    output_eos = climatology_dir / "EOSav.tif"
+    if not OVERWRITE and output_tr.exists() and output_pos.exists() and output_eos.exists():
         print("  ⚠ 气候态文件已存在，按skip模式跳过计算")
         return
 
@@ -584,40 +581,38 @@ def save_climatology_data():
         print(f"  ⚠ 跳过已存在: {output_tr}")
 
     # 计算物候气候态
-    print("\n[3/3] 计算物候气候态（SOSav, POSav）...")
-    SOSav, POSav, _ = calculate_phenology_climatology(years, mask, template_profile)
+    print("\n[3/3] 计算物候气候态（POSav, EOSav）...")
+    POSav, EOSav, _ = calculate_phenology_climatology(years, mask, template_profile)
 
-    # 保存SOSav（使用profile_tr以确保CRS和空间参考与TR_daily_climatology一致）
-    output_sos = climatology_dir / "SOSav.tif"
-    profile_sos = profile_tr.copy()
-    profile_sos.update(
+    # 保存POSav/EOSav（使用profile_tr以确保CRS和空间参考与TR_daily_climatology一致）
+    profile_pheno = profile_tr.copy()
+    profile_pheno.update(
         dtype=rasterio.float32,
         count=1,
         compress='lzw',
         nodata=NODATA_OUT
     )
-    if should_write(output_sos):
-        with rasterio.open(output_sos, 'w', **profile_sos) as dst:
-            dst.write(SOSav.astype(np.float32), 1)
-        print(f"  ✓ 已保存: {output_sos}")
-    else:
-        print(f"  ⚠ 跳过已存在: {output_sos}")
-
-    # 保存POSav
     output_pos = climatology_dir / "POSav.tif"
     if should_write(output_pos):
-        with rasterio.open(output_pos, 'w', **profile_sos) as dst:
+        with rasterio.open(output_pos, 'w', **profile_pheno) as dst:
             dst.write(POSav.astype(np.float32), 1)
         print(f"  ✓ 已保存: {output_pos}")
     else:
         print(f"  ⚠ 跳过已存在: {output_pos}")
+    # 保存EOSav
+    if should_write(output_eos):
+        with rasterio.open(output_eos, 'w', **profile_pheno) as dst:
+            dst.write(EOSav.astype(np.float32), 1)
+        print(f"  ✓ 已保存: {output_eos}")
+    else:
+        print(f"  ⚠ 跳过已存在: {output_eos}")
 
     print("\n" + "="*70)
     print("✓ 气候态数据计算完成！")
     print(f"输出目录: {climatology_dir}")
     print(f"  - TR_daily_climatology.tif (365波段)")
-    print(f"  - SOSav.tif")
     print(f"  - POSav.tif")
+    print(f"  - EOSav.tif")
     print("="*70)
 
 # ==================== 主处理流程 ====================
@@ -879,7 +874,7 @@ if __name__ == "__main__":
     if RUN_MODE == "skip" and outputs_complete(years):
         print("✓ Module 02 输出齐全，已跳过全部计算")
     else:
-        # 步骤1：计算年度TRc（SOS-POS累积蒸腾）
+        # 步骤1：计算年度TRc（POS-EOS累积蒸腾）
         # 方式1：串行处理（推荐，稳定可靠）
         main(use_block_processing=True)
 
@@ -898,8 +893,8 @@ if __name__ == "__main__":
         #
         # 此步骤将计算并保存：
         #   - TR_daily_climatology.tif (365波段，每个DOY的多年平均TR)
-        #   - SOSav.tif (多年平均SOS)
         #   - POSav.tif (多年平均POS)
+        #   - EOSav.tif (多年平均EOS)
         #
         # 输出目录：Wang2025_Analysis/Climatology/
         #

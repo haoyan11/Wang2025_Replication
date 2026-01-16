@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Pipeline: Wang (2025) 完整分析流程
+Master Pipeline: Wang (2025) EOS 完整分析流程
 按顺序执行所有分析模块
 """
 
@@ -20,7 +20,7 @@ LIVE_OUTPUT = True  # True时实时输出子进程日志
 DEFAULT_RUN_MODE = "skip"  # skip: 文件存在则跳过; overwrite: 覆盖重算
 
 # ==================== 配置日志 ====================
-LOG_DIR = Path(r"I:\F\Data4\Wang2025_Analysis\Logs")
+LOG_DIR = Path(r"I:\F\Data4\Wang2025_Analysis_EOS\Logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -49,7 +49,7 @@ MODULES = [
         'name': 'Module 02: TRc计算',
         'script': '02_TRc_calculation.py',
         'required': True,
-        'description': '计算SOS-POS窗口内累积蒸腾'
+        'description': '计算POS-EOS窗口内累积蒸腾'
     },
     {
         'name': 'Module 03c: 固定窗口分解',
@@ -64,22 +64,22 @@ MODULES = [
         'description': '固定窗口统计分析'
     },
     {
-        'name': 'Module 05b: SEM双时间尺度（SOS）',
-        'script': '05b_SEM_analysis_dual_timescale_SOS.R',
+        'name': 'Module 05b: SEM双时间尺度（EOS）',
+        'script': '05b_SEM_analysis_dual_timescale_EOS.R',
         'required': False,
-        'description': '双时间尺度SEM（SOS → GPP → Fixed_Trate）',
+        'description': '双时间尺度SEM（早/晚季气候 → EOS → GPP → Fixed_Trate）',
         'interpreter': 'Rscript'
     },
     {
         'name': 'Module 05c: SEM混合池（Pooled）',
-        'script': '05c_SEM_analysis_dual_timescale_robust_pooled_SOS.R',
+        'script': '05c_SEM_analysis_dual_timescale_robust_pooled_EOS.R',
         'required': False,
         'description': 'Pooled SEM（像元-年份）',
         'interpreter': 'Rscript'
     },
     {
         'name': 'Module 05d: SEM像元级对比（Lavaan）',
-        'script': '05d_SEM_analysis_dual_timescale_lavaan_compare_SOS.R',
+        'script': '05d_SEM_analysis_dual_timescale_lavaan_compare_EOS.R',
         'required': False,
         'description': '像元级SEM对比（Ours/Other）',
         'interpreter': 'Rscript'

@@ -40,6 +40,57 @@ suppressPackageStartupMessages({
   library(raster)
 })
 
+# ===【运行模式】===
+RUN_MODE <- tolower(Sys.getenv("WANG_RUN_MODE", "skip"))
+OVERWRITE <- identical(RUN_MODE, "overwrite")
+should_write <- function(path) {
+  OVERWRITE || !file.exists(path)
+}
+safe_write_csv <- function(df, path, ...) {
+  if (!should_write(path)) {
+    cat(sprintf("  [skip] %s\n", path))
+    return(invisible(FALSE))
+  }
+  write.csv(df, path, ...)
+  invisible(TRUE)
+}
+safe_write_lines <- function(lines, path) {
+  if (!should_write(path)) {
+    cat(sprintf("  [skip] %s\n", path))
+    return(invisible(FALSE))
+  }
+  writeLines(lines, path)
+  invisible(TRUE)
+}
+safe_write_raster <- function(r, path, ...) {
+  if (!should_write(path)) {
+    cat(sprintf("  [skip] %s\n", path))
+    return(invisible(FALSE))
+  }
+  writeRaster(r, path, overwrite = OVERWRITE, ...)
+  invisible(TRUE)
+}
+
+outputs_ready_annual <- function() {
+  required <- c(
+    file.path(DATA_DIR, "sem_data_raw.csv"),
+    file.path(DATA_DIR, "sem_data_standardized.csv"),
+    file.path(OUTPUT_DIR, "SEM_parameters.csv"),
+    file.path(OUTPUT_DIR, "SEM_fitindices.csv"),
+    file.path(OUTPUT_DIR, "SEM_R2.csv"),
+    file.path(OUTPUT_DIR, "SEM_summary.txt"),
+    file.path(OUTPUT_DIR, "SEM_pathdiagram.pdf")
+  )
+  all(file.exists(required))
+}
+
+outputs_ready_pixel <- function() {
+  required <- c(
+    file.path(PIXELWISE_DIR, "SEM_pixel_time_series_summary.csv")
+  )
+  all(file.exists(required))
+}
+
 # ==================== 全局配置 ====================
 # ⚠️ 重要：请根据您的数据路径修改以下配置！
 # 提示：这些路径应与 _config.py 中的配置一致
@@ -62,7 +113,7 @@ if (.Platform$OS.type == "windows") {
 
 # 自动生成的路径（通常不需要修改）
 OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis")
-PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology_EPSG4326")
+PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
 TRPRODUCT_DIR <- file.path(OUTPUT_ROOT, "Decomposition")
 MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
 
@@ -362,7 +413,7 @@ calc_seasonal_mean <- function(year, months, daily_dir, pattern, mask_r, cache_f
 
   if (USE_CACHE) {
     tryCatch({
-      writeRaster(out_r, cache_file, overwrite = TRUE, datatype = "FLT4S")
+      safe_write_raster(out_r, cache_file, datatype = "FLT4S")
     }, error = function(e) {
       warning(sprintf("写入缓存文件失败: %s\n错误: %s", cache_file, conditionMessage(e)))
     })
@@ -408,7 +459,7 @@ calc_lsp_mean <- function(year, sos_r, pos_r, daily_dir, pattern, mask_r, cache_
     out_r <- setValues(template, rep(NA_real_, ncell(template)))
     out_r <- mask_raster(out_r, mask_r)
     if (USE_CACHE) {
-      writeRaster(out_r, cache_file, overwrite = TRUE)
+      safe_write_raster(out_r, cache_file)
     }
     return(out_r)
   }
@@ -528,7 +579,7 @@ calc_lsp_mean <- function(year, sos_r, pos_r, daily_dir, pattern, mask_r, cache_
 
   if (USE_CACHE) {
     tryCatch({
-      writeRaster(out_r, cache_file, overwrite = TRUE, datatype = "FLT4S")
+      safe_write_raster(out_r, cache_file, datatype = "FLT4S")
     }, error = function(e) {
       warning(sprintf("写入缓存文件失败: %s\n错误: %s", cache_file, conditionMessage(e)))
     })
@@ -701,8 +752,8 @@ prepare_sem_data <- function(years, mask_r) {
   sem_vars <- setdiff(names(sem_data_std), "year")
   sem_data_std[sem_vars] <- scale(sem_data_std[sem_vars])
 
-  write.csv(sem_data, file.path(DATA_DIR, "sem_data_raw.csv"), row.names = FALSE)
-  write.csv(sem_data_std, file.path(DATA_DIR, "sem_data_standardized.csv"), row.names = FALSE)
+  safe_write_csv(sem_data, file.path(DATA_DIR, "sem_data_raw.csv"), row.names = FALSE)
+  safe_write_csv(sem_data_std, file.path(DATA_DIR, "sem_data_standardized.csv"), row.names = FALSE)
 
   cat("✓ SEM数据准备完成\n")
   sem_data_std
@@ -728,7 +779,7 @@ calculate_vif <- function(data) {
   }
 
   vif_df <- data.frame(Variable = names(vif_vals), VIF = vif_vals)
-  write.csv(vif_df, file.path(OUTPUT_DIR, "VIF_diagnostics.csv"), row.names = FALSE)
+  safe_write_csv(vif_df, file.path(OUTPUT_DIR, "VIF_diagnostics.csv"), row.names = FALSE)
 
   cat("\nVIF诊断结果:\n")
   print(vif_df)
@@ -776,35 +827,45 @@ run_sem_pooled <- function(data) {
   print(fit_summary)
 
   params <- parameterEstimates(fit, standardized = TRUE)
-  write.csv(params, file.path(OUTPUT_DIR, "SEM_parameters.csv"), row.names = FALSE)
+  safe_write_csv(params, file.path(OUTPUT_DIR, "SEM_parameters.csv"), row.names = FALSE)
 
   fit_measures <- fitMeasures(fit, c("chisq", "df", "pvalue", "cfi", "tli", "rmsea", "srmr"))
-  write.csv(t(as.data.frame(fit_measures)), file.path(OUTPUT_DIR, "SEM_fitindices.csv"))
+  safe_write_csv(t(as.data.frame(fit_measures)), file.path(OUTPUT_DIR, "SEM_fitindices.csv"))
 
   r2_vals <- inspect(fit, "r2")
-  write.csv(as.data.frame(r2_vals), file.path(OUTPUT_DIR, "SEM_R2.csv"))
+  safe_write_csv(as.data.frame(r2_vals), file.path(OUTPUT_DIR, "SEM_R2.csv"))
 
-  sink(file.path(OUTPUT_DIR, "SEM_summary.txt"))
-  print(fit_summary)
-  sink()
+  summary_path <- file.path(OUTPUT_DIR, "SEM_summary.txt")
+  if (should_write(summary_path)) {
+    sink(summary_path)
+    print(fit_summary)
+    sink()
+  } else {
+    cat(sprintf("  [skip] %s\n", summary_path))
+  }
 
   # 路径图
-  pdf(file.path(OUTPUT_DIR, "SEM_pathdiagram.pdf"), width = 10, height = 8)
-  semPaths(
-    fit,
-    what = "std",
-    edge.label.cex = 1.2,
-    curvePivot = TRUE,
-    layout = "tree2",
-    style = "lisrel",
-    edge.color = "black",
-    nodeLabels = c("TRproduct", "SOS", "Ta", "SMroot", "GPPspr", "GPPsum"),  # 修改：LSP改为SOS
-    sizeMan = 10,
-    residuals = FALSE,
-    exoCov = FALSE
-  )
-  title("SEM (Wang 2025 - SOS版本)", line = 3)
-  dev.off()
+  pdf_path <- file.path(OUTPUT_DIR, "SEM_pathdiagram.pdf")
+  if (should_write(pdf_path)) {
+    pdf(pdf_path, width = 10, height = 8)
+    semPaths(
+      fit,
+      what = "std",
+      edge.label.cex = 1.2,
+      curvePivot = TRUE,
+      layout = "tree2",
+      style = "lisrel",
+      edge.color = "black",
+      nodeLabels = c("TRproduct", "SOS", "Ta", "SMroot", "GPPspr", "GPPsum"),  # 修改：LSP改为SOS
+      sizeMan = 10,
+      residuals = FALSE,
+      exoCov = FALSE
+    )
+    title("SEM (Wang 2025 - SOS版本)", line = 3)
+    dev.off()
+  } else {
+    cat(sprintf("  [skip] %s\n", pdf_path))
+  }
 
   cat("✓ SEM全局分析完成\n")
   cat(sprintf("  输出目录: %s\n", OUTPUT_DIR))
@@ -1038,7 +1099,7 @@ run_sem_pixel_time_series <- function(years, mask_r) {
     sd_sig = sd_sig
   )
 
-  write.csv(summary_df, file.path(PIXELWISE_DIR, "SEM_pixel_time_series_summary.csv"), row.names = FALSE)
+  safe_write_csv(summary_df, file.path(PIXELWISE_DIR, "SEM_pixel_time_series_summary.csv"), row.names = FALSE)
 
   cat("\n像元时间序列SEM摘要:\n")
   print(summary_df)
@@ -1054,6 +1115,17 @@ main <- function() {
   cat(sprintf("分析模式: %s\n", SEM_SAMPLE_MODE))
   cat(sprintf("年份范围: %d-%d\n", YEAR_START, YEAR_END))
   cat("----------------------------------------------------------------------\n")
+
+  if (RUN_MODE == "skip") {
+    if (SEM_SAMPLE_MODE == "annual_mean" && outputs_ready_annual()) {
+      cat("  ✓ annual_mean 输出齐全，已跳过\n")
+      return(invisible(NULL))
+    }
+    if (SEM_SAMPLE_MODE == "pixel_time_series" && outputs_ready_pixel()) {
+      cat("  ✓ pixel_time_series 输出齐全，已跳过\n")
+      return(invisible(NULL))
+    }
+  }
 
   years <- YEAR_START:YEAR_END
 

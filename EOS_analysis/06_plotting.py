@@ -3,7 +3,7 @@
 """
 Module 06: 统一绘图入口
 04c 结果：偏相关/回归/趋势图使用“偏相关系数与显著性图”模板样式
-05b/05c/05d 结果：SEM 路径图使用“SOS-GPP全路径图像”模板样式
+05b/05c/05d 结果：SEM 路径图使用“EOS-GPP全路径图像”模板样式
 """
 
 from dataclasses import dataclass
@@ -38,7 +38,7 @@ ROOT = _pick_existing([
     Path(r"I:\F\Data4"),
     Path("/mnt/i/F/Data4"),
 ])
-ANALYSIS_DIR = ROOT / "Wang2025_Analysis"
+ANALYSIS_DIR = ROOT / "Wang2025_Analysis_EOS"
 OUTPUT_FIG_DIR = ANALYSIS_DIR / "Figures_All"
 OUTPUT_FIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -261,7 +261,7 @@ def _add_lat_labels(ax, lat_values=(45, 60, 75), lon_for_labels=-130, proj_src=c
 def _get_pair_short_labels(var_label):
     """
     从文件名中解析出 X ~ Y（与模板一致）
-    例如：SOS_vs_SpringET_controls_... → SOS ~ ET
+    例如：EOS_vs_SpringET_controls_... → EOS ~ ET
     """
     base = var_label
     if base.endswith("_pcorr_r"):
@@ -291,11 +291,11 @@ def _get_pair_short_labels(var_label):
 
     # 解析 X
     def map_x(raw):
-        # 物候：SOS / POS / EOS / deltaSOS
-        if raw in ["SOS", "POS", "EOS"]:
+        # 物候：EOS / POS / deltaEOS
+        if raw in ["EOS", "POS"]:
             return raw
-        if raw in ["deltaSOS", "DeltaSOS"]:
-            return "ΔSOS"
+        if raw in ["deltaEOS", "DeltaEOS"]:
+            return "ΔEOS"
         # 气象：Spring_Tem / Summer_Pre / Autumn_DSW
         parts = raw.split("_")
         if len(parts) == 2 and parts[1] in ["Tem", "Pre", "DSW"]:
@@ -595,7 +595,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
     r2_map = _load_r2(r2_file)
 
     r2_values = {
-        "SOS": r2_map.get("SOS", np.nan),
+        "EOS": r2_map.get("EOS", np.nan),
         "GPP": r2_map.get(middle_var, np.nan),
         "TRATE": r2_map.get(outcome_var, np.nan),
     }
@@ -607,17 +607,20 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
 
     direct_paths = {}
     for key, (lhs, rhs) in {
-        "SOS~P_pre": ("SOS", "P_pre"),
-        "SOS~T_pre": ("SOS", "T_pre"),
-        "SOS~SW_pre": ("SOS", "SW_pre"),
-        f"{middle_var}~SOS": (middle_var, "SOS"),
+        "EOS~P_pre": ("EOS", "P_pre"),
+        "EOS~T_pre": ("EOS", "T_pre"),
+        "EOS~SW_pre": ("EOS", "SW_pre"),
+        "EOS~P_season": ("EOS", "P_season"),
+        "EOS~T_season": ("EOS", "T_season"),
+        "EOS~SW_season": ("EOS", "SW_season"),
+        f"{middle_var}~EOS": (middle_var, "EOS"),
         f"{middle_var}~P_pre": (middle_var, "P_pre"),
         f"{middle_var}~T_pre": (middle_var, "T_pre"),
         f"{middle_var}~SW_pre": (middle_var, "SW_pre"),
         f"{middle_var}~P_season": (middle_var, "P_season"),
         f"{middle_var}~T_season": (middle_var, "T_season"),
         f"{middle_var}~SW_season": (middle_var, "SW_season"),
-        f"{outcome_var}~SOS": (outcome_var, "SOS"),
+        f"{outcome_var}~EOS": (outcome_var, "EOS"),
         f"{outcome_var}~{middle_var}": (outcome_var, middle_var),
         f"{outcome_var}~P_pre": (outcome_var, "P_pre"),
         f"{outcome_var}~T_pre": (outcome_var, "T_pre"),
@@ -643,7 +646,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
         "P_PRE": (1.5, 9.5),
         "T_PRE": (5.5, 9.5),
         "SW_PRE": (9.5, 9.5),
-        "SOS": (1.5, 5.5),
+        "EOS": (1.5, 5.5),
         "GPP": (5.5, 5.5),
         "TRATE": (9.5, 5.5),
         "P_SEASON": (1.5, 1.5),
@@ -655,7 +658,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
         "P_pre": "P_PRE",
         "T_pre": "T_PRE",
         "SW_pre": "SW_PRE",
-        "SOS": "SOS",
+        "EOS": "EOS",
         middle_var: "GPP",
         outcome_var: "TRATE",
         "P_season": "P_SEASON",
@@ -699,16 +702,16 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
             ax.text(x, y, label, ha="center", va="center",
                     fontsize=fontsize, fontweight="bold", color="black")
 
-    def draw_arrow(ax, start_pos, end_pos, coef, significant, start_name, end_name, is_sos_to_out=False):
+    def draw_arrow(ax, start_pos, end_pos, coef, significant, start_name, end_name, is_eos_to_out=False):
         x1, y1 = start_pos
         x2, y2 = end_pos
 
-        if start_name in ["SOS", "GPP", "TRATE"]:
+        if start_name in ["EOS", "GPP", "TRATE"]:
             start_width, start_height = 2.2, 1.4
         else:
             start_width, start_height = 2.0, 1.2
 
-        if end_name in ["SOS", "GPP", "TRATE"]:
+        if end_name in ["EOS", "GPP", "TRATE"]:
             end_width, end_height = 2.2, 1.4
         else:
             end_width, end_height = 2.0, 1.2
@@ -769,10 +772,10 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
 
         is_pre_to_mid = (end_name == "GPP" and start_name in ["P_PRE", "T_PRE", "SW_PRE"])
         is_season_to_mid = (end_name == "GPP" and start_name in ["P_SEASON", "T_SEASON", "SW_SEASON"])
-        is_sos_to_mid = (start_name == "SOS" and end_name == "GPP")
+        is_eos_to_mid = (start_name == "EOS" and end_name == "GPP")
         is_mid_to_out = (start_name == "GPP" and end_name == "TRATE")
 
-        if is_sos_to_out:
+        if is_eos_to_out:
             arrow = FancyArrowPatch(
                 (start_x, start_y), (end_x, end_y),
                 connectionstyle="arc3,rad=0.3",
@@ -808,7 +811,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
             if is_pre_to_mid or is_season_to_mid:
                 label_x = start_x + (end_x - start_x) * 0.33
                 label_y = start_y + (end_y - start_y) * 0.33
-            elif is_sos_to_mid or is_mid_to_out:
+            elif is_eos_to_mid or is_mid_to_out:
                 label_x = start_x + (end_x - start_x) * 0.5
                 label_y = start_y + (end_y - start_y) * 0.5
             else:
@@ -829,7 +832,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
                 zorder=100)
 
     for name, pos in positions.items():
-        is_outcome = name in ["SOS", "GPP", "TRATE"]
+        is_outcome = name in ["EOS", "GPP", "TRATE"]
         draw_box(ax1, name, pos, is_outcome)
 
     for path_key, path_data in direct_paths.items():
@@ -839,10 +842,10 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
             if start_var in var_to_pos and end_var in var_to_pos:
                 start_name = var_to_pos[start_var]
                 end_name = var_to_pos[end_var]
-                is_sos_out = (start_name == "SOS" and end_name == "TRATE")
+                is_eos_out = (start_name == "EOS" and end_name == "TRATE")
                 draw_arrow(ax1, positions[start_name], positions[end_name],
                            path_data["coef"], path_data["sig"],
-                           start_name, end_name, is_sos_out)
+                           start_name, end_name, is_eos_out)
 
     ax1.text(5.5, 11.2, title_text,
              fontsize=22, fontweight="bold", ha="center",
@@ -1091,7 +1094,7 @@ def plot_sem_all(only_group=None):
     sem_tasks = []
 
     sem_tasks.append({
-        "name": "05b_SOS_GPP_Trate",
+        "name": "05b_EOS_GPP_Trate",
         "group": "05b",
         "dir_name": "SEM_Results_Dual_Fixed",
         "param": "SEM_dual_timescale_parameters.csv",
@@ -1100,23 +1103,23 @@ def plot_sem_all(only_group=None):
         "outcome_var": "Fixed_Trate",
         "middle_label": "GPP",
         "outcome_label": r"T$_{rate}$",
-        "title": "SOS - Dual-Timescale SEM (Fixed Window, Full Paths)",
+        "title": "EOS - Dual-Timescale SEM (Fixed Window, Full Paths)",
         "bar_direct": "Direct (Season Climate → TRate)",
         "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
     })
 
     sem_tasks.append({
-        "name": "05c_Pooled_SOS",
+        "name": "05c_Pooled_EOS",
         "group": "05c",
-        "dir_name": "SEM_Results_Dual_Fixed_Robust_Pooled_SOS",
+        "dir_name": "SEM_Results_Dual_Fixed_Robust_Pooled_EOS",
         "param": "SEM_dual_timescale_parameters.csv",
         "r2": "SEM_dual_timescale_R2.csv",
         "middle_var": "GPP_season",
         "outcome_var": "Fixed_Trate",
         "middle_label": "GPP",
         "outcome_label": r"T$_{rate}$",
-        "title": "SOS - Pooled SEM (Pixel-Year, Full Paths)",
+        "title": "EOS - Pooled SEM (Pixel-Year, Full Paths)",
         "bar_direct": "Direct (Season Climate → TRate)",
         "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
@@ -1132,7 +1135,7 @@ def plot_sem_all(only_group=None):
         "outcome_var": "Fixed_Trate",
         "middle_label": "GPP",
         "outcome_label": r"T$_{rate}$",
-        "title": "SOS - Lavaan Pixelwise SEM (Ours)",
+        "title": "EOS - Lavaan Pixelwise SEM (Ours)",
         "bar_direct": "Direct (Season Climate → TRate)",
         "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
@@ -1149,7 +1152,7 @@ def plot_sem_all(only_group=None):
         "outcome_var": "Fixed_Trate",
         "middle_label": "GPP",
         "outcome_label": r"T$_{rate}$",
-        "title": "SOS - Lavaan Pixelwise SEM (Other)",
+        "title": "EOS - Lavaan Pixelwise SEM (Other)",
         "bar_direct": "Direct (Season Climate → TRate)",
         "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
