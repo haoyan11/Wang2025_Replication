@@ -55,7 +55,8 @@ import os
 from _config import (
     ROOT, PHENO_DIR, PHENO_FILE_FORMAT, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
     DECOMPOSITION_FIXED_DIR, YEAR_START, YEAR_END, NODATA_OUT, TR_DAILY_DIR,
-    TR_FILE_FORMAT, BLOCK_SIZE, MAX_WORKERS, TEMPLATE_RASTER, MASK_FILE
+    TR_FILE_FORMAT, BLOCK_SIZE, MAX_WORKERS, TEMPLATE_RASTER, MASK_FILE,
+    GPP_DAILY_DIR, GPP_DAILY_FORMAT
 )
 
 # GDAL缓存（MB），用于加速连续读取
@@ -106,7 +107,8 @@ def _is_valid_value(value, nodata):
 _GLOBAL_CTX = {}
 
 
-def _init_worker(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile):
+def _init_worker(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile,
+                 gppc_av, gpp_valid):
     global _GLOBAL_CTX
     _GLOBAL_CTX = {
         "trc_av": trc_av,
@@ -117,6 +119,8 @@ def _init_worker(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid,
         "mask": mask,
         "tr_valid": tr_valid,
         "profile": profile,
+        "gppc_av": gppc_av,
+        "gpp_valid": gpp_valid,
     }
 
 
@@ -127,11 +131,17 @@ def _process_year(year):
             OUTPUT_DIR / f"TR_fixed_window_{year}.tif",
             OUTPUT_DIR / f"TR_pos_change_{year}.tif",
             OUTPUT_DIR / f"TR_eos_change_{year}.tif",
+            OUTPUT_DIR / f"GPP_window_change_{year}.tif",
+            OUTPUT_DIR / f"GPP_fixed_window_{year}.tif",
+            OUTPUT_DIR / f"GPP_pos_change_{year}.tif",
+            OUTPUT_DIR / f"GPP_eos_change_{year}.tif",
+            OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif",
         ]
         if all(p.exists() for p in outputs):
             return year
     ctx = _GLOBAL_CTX
-    tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change = decompose_year(
+    (tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change,
+     gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change) = decompose_year(
         year,
         ctx["trc_av"],
         ctx["pos_av"],
@@ -140,12 +150,26 @@ def _process_year(year):
         ctx["nodata_eos"],
         ctx["mask"],
         ctx["tr_valid"],
-        ctx["profile"]
+        ctx["profile"],
+        ctx["gppc_av"],
+        ctx["gpp_valid"]
     )
     write_geotiff(OUTPUT_DIR / f"TR_window_change_{year}.tif", tr_window_change, ctx["profile"])
     write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, ctx["profile"])
     write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, ctx["profile"])
     write_geotiff(OUTPUT_DIR / f"TR_eos_change_{year}.tif", tr_eos_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"GPP_window_change_{year}.tif", gpp_window_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"GPP_fixed_window_{year}.tif", gpp_fixed_window, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"GPP_pos_change_{year}.tif", gpp_pos_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / f"GPP_eos_change_{year}.tif", gpp_eos_change, ctx["profile"])
+
+    # 计算并保存Fixed_GPPrate = GPP_fixed_window / Fixed_GPPWindow_Length
+    fixed_window_length, _, _ = read_geotiff(OUTPUT_DIR / "Fixed_GPPWindow_Length.tif")
+    fixed_gpp_rate = np.full_like(gpp_fixed_window, NODATA_OUT)
+    valid_rate = (gpp_fixed_window != NODATA_OUT) & (fixed_window_length > 0)
+    fixed_gpp_rate[valid_rate] = gpp_fixed_window[valid_rate] / fixed_window_length[valid_rate]
+    write_geotiff(OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif", fixed_gpp_rate, ctx["profile"])
+
     return year
 
 
@@ -208,6 +232,134 @@ def noleap_doy_from_date(date_obj):
         if doy > 60:
             return doy - 1
     return doy
+
+
+def accumulate_daily_gpp_sums(year, ref_profile, valid_base,
+                              pos_y_i, eos_y_i, pos_av_i, eos_av_i):
+    """
+    按日读取GPP并累积所需窗口总量，避免365天三维数组占用内存。
+    返回:
+      gppc_y_actual, gppc_y_fixed_actual, gpp_pos_advance, gpp_pos_delay,
+      gpp_eos_extend, gpp_eos_shorten, gpp_valid_y, gppc_y_count, gppc_y_fixed_count
+    """
+    height = ref_profile["height"]
+    width = ref_profile["width"]
+
+    gppc_y_actual = np.zeros((height, width), dtype=np.float32)
+    gppc_y_fixed_actual = np.zeros((height, width), dtype=np.float32)
+    gpp_pos_advance = np.zeros((height, width), dtype=np.float32)
+    gpp_pos_delay = np.zeros((height, width), dtype=np.float32)
+    gpp_eos_extend = np.zeros((height, width), dtype=np.float32)
+    gpp_eos_shorten = np.zeros((height, width), dtype=np.float32)
+    gpp_valid_y = np.zeros((height, width), dtype=bool)
+    gppc_y_count = np.zeros((height, width), dtype=np.int16)
+    gppc_y_fixed_count = np.zeros((height, width), dtype=np.int16)
+
+    block_windows = [
+        Window(col_off, row_off,
+               min(BLOCK_SIZE, width - col_off),
+               min(BLOCK_SIZE, height - row_off))
+        for row_off in range(0, height, BLOCK_SIZE)
+        for col_off in range(0, width, BLOCK_SIZE)
+    ]
+    block_has_valid = []
+    for win in block_windows:
+        r0, r1 = win.row_off, win.row_off + win.height
+        c0, c1 = win.col_off, win.col_off + win.width
+        block_has_valid.append(np.any(valid_base[r0:r1, c0:c1]))
+
+    days_in_year = 366 if is_leap_year(year) else 365
+    checked_ref = False
+
+    with rasterio.Env(GDAL_CACHEMAX=GDAL_CACHE_MAX_MB):
+        for day in range(1, days_in_year + 1):
+            date_obj = datetime(year, 1, 1) + timedelta(days=day - 1)
+            doy_noleap = noleap_doy_from_date(date_obj)
+            if doy_noleap is None:
+                continue
+
+            file_path = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
+            if not file_path.exists():
+                continue
+
+            with rasterio.open(file_path) as src:
+                profile = src.profile.copy()
+                nodata = src.nodata
+
+                if not checked_ref:
+                    check_spatial_consistency(ref_profile, file_path, profile,
+                                              f"GPP_daily_{date_obj.strftime('%Y%m%d')}")
+                    checked_ref = True
+
+                for win, has_valid in zip(block_windows, block_has_valid):
+                    if not has_valid:
+                        continue
+
+                    r0, r1 = win.row_off, win.row_off + win.height
+                    c0, c1 = win.col_off, win.col_off + win.width
+                    base_block = valid_base[r0:r1, c0:c1]
+                    if not np.any(base_block):
+                        continue
+
+                    data = src.read(1, window=win).astype(np.float32)
+                    if nodata is None or np.isnan(nodata):
+                        data[~np.isfinite(data)] = np.nan
+                    else:
+                        data[data == nodata] = np.nan
+                    data[data < 0] = np.nan
+
+                    valid_day = np.isfinite(data)
+                    if not np.any(valid_day):
+                        continue
+
+                    valid_day = valid_day & base_block
+                    if not np.any(valid_day):
+                        continue
+
+                    gpp_valid_y[r0:r1, c0:c1] |= valid_day
+                    doy = doy_noleap
+
+                    pos_y_block = pos_y_i[r0:r1, c0:c1]
+                    eos_y_block = eos_y_i[r0:r1, c0:c1]
+                    pos_av_block = pos_av_i[r0:r1, c0:c1]
+                    eos_av_block = eos_av_i[r0:r1, c0:c1]
+
+                    m_gppc = valid_day & (pos_y_block <= doy) & (eos_y_block >= doy)
+                    if np.any(m_gppc):
+                        gppc_block = gppc_y_actual[r0:r1, c0:c1]
+                        gppc_block[m_gppc] += data[m_gppc]
+                        gppc_count_block = gppc_y_count[r0:r1, c0:c1]
+                        gppc_count_block[m_gppc] += 1
+
+                    m_fixed = valid_day & (pos_av_block <= doy) & (eos_av_block >= doy)
+                    if np.any(m_fixed):
+                        fixed_block = gppc_y_fixed_actual[r0:r1, c0:c1]
+                        fixed_block[m_fixed] += data[m_fixed]
+                        fixed_count_block = gppc_y_fixed_count[r0:r1, c0:c1]
+                        fixed_count_block[m_fixed] += 1
+
+                    m_pos_adv = valid_day & (pos_y_block < pos_av_block) & (doy >= pos_y_block) & (doy < pos_av_block)
+                    if np.any(m_pos_adv):
+                        pos_adv_block = gpp_pos_advance[r0:r1, c0:c1]
+                        pos_adv_block[m_pos_adv] += data[m_pos_adv]
+
+                    m_pos_delay = valid_day & (pos_y_block > pos_av_block) & (doy >= pos_av_block) & (doy < pos_y_block)
+                    if np.any(m_pos_delay):
+                        pos_delay_block = gpp_pos_delay[r0:r1, c0:c1]
+                        pos_delay_block[m_pos_delay] += data[m_pos_delay]
+
+                    m_eos_extend = valid_day & (eos_y_block > eos_av_block) & (doy > eos_av_block) & (doy <= eos_y_block)
+                    if np.any(m_eos_extend):
+                        eos_ext_block = gpp_eos_extend[r0:r1, c0:c1]
+                        eos_ext_block[m_eos_extend] += data[m_eos_extend]
+
+                    m_eos_shorten = valid_day & (eos_y_block < eos_av_block) & (doy > eos_y_block) & (doy <= eos_av_block)
+                    if np.any(m_eos_shorten):
+                        eos_short_block = gpp_eos_shorten[r0:r1, c0:c1]
+                        eos_short_block[m_eos_shorten] += data[m_eos_shorten]
+
+    return (gppc_y_actual, gppc_y_fixed_actual, gpp_pos_advance, gpp_pos_delay,
+            gpp_eos_extend, gpp_eos_shorten, gpp_valid_y, gppc_y_count, gppc_y_fixed_count)
 
 
 def accumulate_daily_tr_sums(year, ref_profile, valid_base,
@@ -405,7 +557,8 @@ def load_climatology():
 
 
 def decompose_year(year, trc_av, pos_av, eos_av,
-                   nodata_pos, nodata_eos, mask, tr_valid, ref_profile):
+                   nodata_pos, nodata_eos, mask, tr_valid, ref_profile,
+                   gppc_av, gpp_valid):
     """
     方法2分解：固定窗口强度 + 实际窗口变化
 
@@ -415,18 +568,25 @@ def decompose_year(year, trc_av, pos_av, eos_av,
     tr_fixed_window : 固定窗口内的强度差异
     tr_pos_change : POS变化的贡献
     tr_eos_change : EOS变化的贡献
+    gpp_window_change : GPP窗口变化带来的实际累积
+    gpp_fixed_window : GPP固定窗口内的强度差异
+    gpp_pos_change : GPP POS变化的贡献
+    gpp_eos_change : GPP EOS变化的贡献
     """
     # 读取当年数据
     trc_file = TRC_DIR / f"TRc_{year}.tif"
+    gppc_file = TRC_DIR / f"GPPc_{year}.tif"  # GPPc也在TRc_annual目录
     pos_file = PHENO_DIR / PHENO_FILE_FORMAT["POS"].format(year=year)
     eos_file = PHENO_DIR / PHENO_FILE_FORMAT["EOS"].format(year=year)
 
     trc_y, trc_profile, nodata_trc = read_geotiff(trc_file)
+    gppc_y, gppc_profile, nodata_gppc = read_geotiff(gppc_file)
     pos_y, pos_profile, nodata_pos_y = read_geotiff(pos_file)
     eos_y, eos_profile, nodata_eos_y = read_geotiff(eos_file)
 
     # 空间一致性检查
     check_spatial_consistency(ref_profile, trc_file, trc_profile, f"TRc_{year}")
+    check_spatial_consistency(ref_profile, gppc_file, gppc_profile, f"GPPc_{year}")
     check_spatial_consistency(ref_profile, pos_file, pos_profile, f"POS({year})")
     check_spatial_consistency(ref_profile, eos_file, eos_profile, f"EOS({year})")
 
@@ -438,6 +598,8 @@ def decompose_year(year, trc_av, pos_av, eos_av,
     valid_base = (
         _is_valid_value(trc_y, nodata_trc) &
         (trc_av != NODATA_OUT) &
+        _is_valid_value(gppc_y, nodata_gppc) &
+        (gppc_av != NODATA_OUT) &
         _is_valid_value(pos_y, nodata_pos_y) &
         _is_valid_value(eos_y, nodata_eos_y) &
         _is_valid_value(pos_av, nodata_pos) &
@@ -449,7 +611,8 @@ def decompose_year(year, trc_av, pos_av, eos_av,
         (eos_y >= pos_y) &
         (eos_av >= pos_av) &
         mask &
-        tr_valid
+        tr_valid &
+        gpp_valid
     )
 
     # 初始化输出
@@ -457,9 +620,14 @@ def decompose_year(year, trc_av, pos_av, eos_av,
     tr_fixed_window = np.full((height, width), NODATA_OUT, dtype=np.float32)
     tr_pos_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
     tr_eos_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
+    gpp_window_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
+    gpp_fixed_window = np.full((height, width), NODATA_OUT, dtype=np.float32)
+    gpp_pos_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
+    gpp_eos_change = np.full((height, width), NODATA_OUT, dtype=np.float32)
 
     if not np.any(valid_base):
-        return tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change
+        return (tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change,
+                gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change)
 
     # Clip DOY to 1-365
     pos_y_i = np.clip(np.rint(pos_y).astype(np.int32), 1, 365)
@@ -471,31 +639,45 @@ def decompose_year(year, trc_av, pos_av, eos_av,
     valid_pos = valid_base & (eos_y_i >= pos_y_i) & (eos_av_i >= pos_av_i)
 
     if not np.any(valid_pos):
-        return tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change
+        return (tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change,
+                gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change)
 
     # ========== 核心计算（逐日累积，避免365天三维数组） ==========
+    # TR分解
     (trc_y_actual, trc_y_fixed_actual, tr_pos_advance, tr_pos_delay,
      tr_eos_extend, tr_eos_shorten, tr_valid_y, trc_y_count, trc_y_fixed_count) = accumulate_daily_tr_sums(
         year, ref_profile, valid_base, pos_y_i, eos_y_i, pos_av_i, eos_av_i
     )
 
-    valid_pos = valid_pos & tr_valid_y
+    # GPP分解
+    (gppc_y_actual, gppc_y_fixed_actual, gpp_pos_advance, gpp_pos_delay,
+     gpp_eos_extend, gpp_eos_shorten, gpp_valid_y, gppc_y_count, gppc_y_fixed_count) = accumulate_daily_gpp_sums(
+        year, ref_profile, valid_base, pos_y_i, eos_y_i, pos_av_i, eos_av_i
+    )
+
+    valid_pos = valid_pos & tr_valid_y & gpp_valid_y
     # 有效天数比例过滤（窗口内有效天数需 >= MIN_VALID_FRAC * 窗口长度）
     window_len_y = (eos_y_i - pos_y_i + 1).astype(np.int16)
     window_len_av = (eos_av_i - pos_av_i + 1).astype(np.int16)
     min_required_y = np.ceil(MIN_VALID_FRAC * window_len_y).astype(np.int16)
     min_required_av = np.ceil(MIN_VALID_FRAC * window_len_av).astype(np.int16)
-    valid_pos = valid_pos & (trc_y_count >= min_required_y) & (trc_y_fixed_count >= min_required_av)
+    valid_pos = valid_pos & (trc_y_count >= min_required_y) & (trc_y_fixed_count >= min_required_av) & \
+                            (gppc_y_count >= min_required_y) & (gppc_y_fixed_count >= min_required_av)
     if not np.any(valid_pos):
-        return tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change
+        return (tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change,
+                gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change)
 
     # 3. 固定窗口强度差异
     #    TR_fixed_window = sum_{POSav..EOSav} [B_y(t) - A(t)]
     tr_fixed_window[valid_pos] = (trc_y_fixed_actual - trc_av)[valid_pos]
+    #    GPP_fixed_window = sum_{POSav..EOSav} [G_y(t) - G_av(t)]
+    gpp_fixed_window[valid_pos] = (gppc_y_fixed_actual - gppc_av)[valid_pos]
 
     # 4. 窗口变化部分（残差）
     #    TR_window_change = TRc_y - sum_{POSav..EOSav} B_y(t)
     tr_window_change[valid_pos] = (trc_y_actual - trc_y_fixed_actual)[valid_pos]
+    #    GPP_window_change = GPPc_y - sum_{POSav..EOSav} G_y(t)
+    gpp_window_change[valid_pos] = (gppc_y_actual - gppc_y_fixed_actual)[valid_pos]
 
     # 5. 进一步分解窗口变化为POS和EOS部分
     #    这部分需要更详细的估算
@@ -513,6 +695,12 @@ def decompose_year(year, trc_av, pos_av, eos_av,
         -tr_pos_delay
     )[valid_pos]
 
+    gpp_pos_change[valid_pos] = np.where(
+        pos_before,
+        gpp_pos_advance,
+        -gpp_pos_delay
+    )[valid_pos]
+
     # EOS变化效应估算（类似POS）
     eos_after = eos_y_i > eos_av_i   # EOS延后
 
@@ -523,7 +711,14 @@ def decompose_year(year, trc_av, pos_av, eos_av,
         -tr_eos_shorten
     )[valid_pos]
 
-    return tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change
+    gpp_eos_change[valid_pos] = np.where(
+        eos_after,
+        gpp_eos_extend,
+        -gpp_eos_shorten
+    )[valid_pos]
+
+    return (tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change,
+            gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change)
 
 
 def main():
@@ -540,7 +735,9 @@ def main():
     if RUN_MODE == "skip":
         base_outputs = [
             OUTPUT_DIR / "TRc_av.tif",
+            CLIMATOLOGY_DIR / "GPPc_av.tif",  # GPPc_av在Climatology目录
             OUTPUT_DIR / "Fixed_Window_Length.tif",
+            OUTPUT_DIR / "Fixed_GPPWindow_Length.tif",
         ]
         year_outputs = []
         for year in years:
@@ -549,6 +746,11 @@ def main():
                 OUTPUT_DIR / f"TR_fixed_window_{year}.tif",
                 OUTPUT_DIR / f"TR_pos_change_{year}.tif",
                 OUTPUT_DIR / f"TR_eos_change_{year}.tif",
+                OUTPUT_DIR / f"GPP_window_change_{year}.tif",
+                OUTPUT_DIR / f"GPP_fixed_window_{year}.tif",
+                OUTPUT_DIR / f"GPP_pos_change_{year}.tif",
+                OUTPUT_DIR / f"GPP_eos_change_{year}.tif",
+                OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif",
             ])
         if all(p.exists() for p in base_outputs + year_outputs):
             print("  ✓ 输出齐全，跳过 Module 03c")
@@ -569,6 +771,14 @@ def main():
     tr_valid = np.any(np.isfinite(tr_daily_av), axis=0)
     tr_cum = np.nancumsum(tr_daily_av, axis=0).astype(np.float32)
 
+    # Load GPP climatology (GPPc_av在Climatology目录)
+    gppc_av_file = CLIMATOLOGY_DIR / "GPPc_av.tif"
+    if not gppc_av_file.exists():
+        raise FileNotFoundError(f"Missing GPP climatology: {gppc_av_file}")
+    gppc_av, gppc_av_profile, nodata_gppc_av = read_geotiff(gppc_av_file)
+    check_spatial_consistency(profile, gppc_av_file, gppc_av_profile, "GPPc_av")
+    gpp_valid = (gppc_av != NODATA_OUT) & _is_valid_value(gppc_av, nodata_gppc_av)
+
     # Compute TRc_av (固定窗口基线)
     pos_av_i = np.clip(np.rint(pos_av).astype(np.int32), 1, 365)
     eos_av_i = np.clip(np.rint(eos_av).astype(np.int32), 1, 365)
@@ -579,7 +789,7 @@ def main():
         (pos_av > 0) & (pos_av <= 366) &  # 允许闰年DOY=366，排除异常值
         (eos_av > 0) & (eos_av <= 366) &  # 允许闰年DOY=366，排除异常值
         (eos_av_i >= pos_av_i) &
-        mask & tr_valid
+        mask & tr_valid & gpp_valid
     )
     trc_av[valid_av] = _sum_cum_range(tr_cum, pos_av_i, eos_av_i)[valid_av]
     write_geotiff(OUTPUT_DIR / "TRc_av.tif", trc_av, profile)
@@ -589,41 +799,64 @@ def main():
     fixed_window_length[valid_av] = (eos_av_i - pos_av_i + 1)[valid_av]
     write_geotiff(OUTPUT_DIR / "Fixed_Window_Length.tif", fixed_window_length, profile)
 
-    # Decomeose each year
+    # 保存GPP固定窗口长度（与TR相同）
+    fixed_gpp_window_length = np.full(pos_av.shape, NODATA_OUT, dtype=np.float32)
+    fixed_gpp_window_length[valid_av] = (eos_av_i - pos_av_i + 1)[valid_av]
+    write_geotiff(OUTPUT_DIR / "Fixed_GPPWindow_Length.tif", fixed_gpp_window_length, profile)
+
+    # Decompose each year
     if PARALLEL_BY_YEAR and YEAR_WORKERS > 1:
         print(f"\n[Parallel] 按年并行分解: {YEAR_WORKERS} 进程")
         with ProcessPoolExecutor(
             max_workers=YEAR_WORKERS,
             initializer=_init_worker,
-            initargs=(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile)
+            initargs=(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile,
+                      gppc_av, gpp_valid)
         ) as executor:
             futures = {executor.submit(_process_year, year): year for year in years}
             for future in tqdm(as_completed(futures), total=len(futures),
-                               desc="Fixed-Window Decomeosition (parallel)"):
+                               desc="Fixed-Window Decomposition (parallel)"):
                 year = futures[future]
                 try:
                     _ = future.result()
                 except Exception as exc:
                     raise RuntimeError(f"Year {year} failed: {exc}") from exc
     else:
-        for year in tqdm(years, desc="Fixed-Window Decomeosition"):
+        for year in tqdm(years, desc="Fixed-Window Decomposition"):
             if not OVERWRITE:
                 outputs = [
                     OUTPUT_DIR / f"TR_window_change_{year}.tif",
                     OUTPUT_DIR / f"TR_fixed_window_{year}.tif",
                     OUTPUT_DIR / f"TR_pos_change_{year}.tif",
                     OUTPUT_DIR / f"TR_eos_change_{year}.tif",
+                    OUTPUT_DIR / f"GPP_window_change_{year}.tif",
+                    OUTPUT_DIR / f"GPP_fixed_window_{year}.tif",
+                    OUTPUT_DIR / f"GPP_pos_change_{year}.tif",
+                    OUTPUT_DIR / f"GPP_eos_change_{year}.tif",
+                    OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif",
                 ]
                 if all(p.exists() for p in outputs):
                     continue
-            tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change = decompose_year(
+            (tr_window_change, tr_fixed_window, tr_pos_change, tr_eos_change,
+             gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change) = decompose_year(
                 year, trc_av, pos_av, eos_av,
-                nodata_pos, nodata_eos, mask, tr_valid, profile
+                nodata_pos, nodata_eos, mask, tr_valid, profile,
+                gppc_av, gpp_valid
             )
             write_geotiff(OUTPUT_DIR / f"TR_window_change_{year}.tif", tr_window_change, profile)
             write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, profile)
             write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, profile)
             write_geotiff(OUTPUT_DIR / f"TR_eos_change_{year}.tif", tr_eos_change, profile)
+            write_geotiff(OUTPUT_DIR / f"GPP_window_change_{year}.tif", gpp_window_change, profile)
+            write_geotiff(OUTPUT_DIR / f"GPP_fixed_window_{year}.tif", gpp_fixed_window, profile)
+            write_geotiff(OUTPUT_DIR / f"GPP_pos_change_{year}.tif", gpp_pos_change, profile)
+            write_geotiff(OUTPUT_DIR / f"GPP_eos_change_{year}.tif", gpp_eos_change, profile)
+
+            # 计算并保存Fixed_GPPrate
+            fixed_gpp_rate = np.full_like(gpp_fixed_window, NODATA_OUT)
+            valid_rate = (gpp_fixed_window != NODATA_OUT) & (fixed_gpp_window_length > 0)
+            fixed_gpp_rate[valid_rate] = gpp_fixed_window[valid_rate] / fixed_gpp_window_length[valid_rate]
+            write_geotiff(OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif", fixed_gpp_rate, profile)
 
     # Quality check
     print("\n[Quality Check]")

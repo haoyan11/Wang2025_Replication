@@ -1663,15 +1663,16 @@ def section_3_3_driver_analysis(mask):
     # 定义变量（Wang 2025 Eq. 3）
     # 统一因变量：移除TR_fixed_window（固定窗口累积差异），仅保留TRc和Fixed_Trate（固定窗口速率异常）
     response_vars = ['TRc', 'Fixed_Trate']
-    # 注意：GPP_fixed 使用固定窗口[POSav, EOSav]内的日尺度GPP均值
-    predictor_vars = ['EOS', 'Ta', 'Rs', 'P', 'GPP_fixed']
+    # 注意：Fixed_GPPrate 是GPP固定窗口速率异常（GPP_anomaly），单位为gC/m²/day
+    predictor_vars = ['EOS', 'Ta', 'Rs', 'P', 'Fixed_GPPrate']
     available_vars = []
     missing_vars = []
     for var in predictor_vars:
         if var == 'EOS':
             available_vars.append(var)
             continue
-        if var == 'GPP_fixed':
+        if var == 'Fixed_GPPrate':
+            # Fixed_GPPrate将从Section 3.2计算的结果中获取（GPP_fixed_window / Fixed_Window_Length）
             if _has_gpp_files(years[0]) or _has_gpp_files(years[-1]):
                 available_vars.append(var)
             else:
@@ -1720,6 +1721,11 @@ def section_3_3_driver_analysis(mask):
     X_all_years_actual = {var: [] for var in predictor_vars}  # 实际窗口[POS_year, EOS_year]
     X_all_years_fixed = {var: [] for var in predictor_vars}   # 固定窗口[POSav, EOSav]
 
+    # 提前读取Fixed_Window_Length（用于Fixed_GPPrate计算）
+    fixed_window_length, _, nodata_fwl = read_geotiff(DECOMP_DIR / "Fixed_Window_Length.tif")
+    fixed_window_length = np.where(_is_valid_value(fixed_window_length, nodata_fwl),
+                                   fixed_window_length, np.nan)
+
     for year in tqdm(years, desc="预计算自变量"):
         # 读取POS和EOS
         pos_data, _, pos_nodata = read_geotiff(PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year))
@@ -1745,13 +1751,21 @@ def section_3_3_driver_analysis(mask):
             lsp_avg_fixed = calculate_lsp_period_average(var, year, pos_climatology, eos_climatology, cache_tag="fixed")
             X_all_years_fixed[var].append(lsp_avg_fixed)
 
-        # GPP_fixed（固定窗口[POSav, EOSav]，两套相同）
-        if 'GPP_fixed' in predictor_vars:
-            gpp_fixed = calculate_gpp_lsp_average(year, pos_climatology, eos_climatology, cache_tag="fixed")
-            if gpp_fixed is None:
-                gpp_fixed = np.full((height, width), np.nan, dtype=np.float32)
-            X_all_years_actual['GPP_fixed'].append(gpp_fixed)
-            X_all_years_fixed['GPP_fixed'].append(gpp_fixed)
+        # Fixed_GPPrate（GPP固定窗口速率异常，两套相同）
+        if 'Fixed_GPPrate' in predictor_vars:
+            # 读取GPP_fixed_window（从Section 3.1的分解结果）
+            gpp_fixed_window_file = DECOMP_DIR / f"GPP_fixed_window_{year}.tif"
+            if gpp_fixed_window_file.exists():
+                gpp_fw, _, nodata_gpp = read_geotiff(gpp_fixed_window_file)
+                gpp_fw_valid = np.where(_is_valid_value(gpp_fw, nodata_gpp), gpp_fw, np.nan)
+                # 计算Fixed_GPPrate = GPP_fixed_window / Fixed_Window_Length
+                fixed_gpprate = np.full((height, width), np.nan, dtype=np.float32)
+                valid_gpprate = np.isfinite(gpp_fw_valid) & np.isfinite(fixed_window_length) & (fixed_window_length > 0)
+                fixed_gpprate[valid_gpprate] = gpp_fw_valid[valid_gpprate] / fixed_window_length[valid_gpprate]
+            else:
+                fixed_gpprate = np.full((height, width), np.nan, dtype=np.float32)
+            X_all_years_actual['Fixed_GPPrate'].append(fixed_gpprate)
+            X_all_years_fixed['Fixed_GPPrate'].append(fixed_gpprate)
 
     # 转换为numpy数组
     for var in predictor_vars:
@@ -1766,11 +1780,7 @@ def section_3_3_driver_analysis(mask):
             X_all_years_actual[var] = detrend_stack(X_all_years_actual[var], years, DETREND_MIN_YEARS)
             X_all_years_fixed[var] = detrend_stack(X_all_years_fixed[var], years, DETREND_MIN_YEARS)
 
-    # 读取Fixed_Window_Length（用于计算Fixed_Trate）
-    fixed_window_length, _, nodata_fwl = read_geotiff(DECOMP_DIR / "Fixed_Window_Length.tif")
-    # 使用_is_valid_value过滤nodata
-    fixed_window_length = np.where(_is_valid_value(fixed_window_length, nodata_fwl),
-                                   fixed_window_length, np.nan)
+    # fixed_window_length已在Step 2开始时加载（用于Fixed_GPPrate和Fixed_Trate计算）
 
     # 对每个响应变量进行归因分析
     for response_var in response_vars:
@@ -2159,7 +2169,7 @@ def generate_section_3_2_summary(output_dir, mask=None):
     """
     print("\n[生成统计汇总] Section 3.2: Phenology Impact Analysis...")
 
-    # 响应变量列表
+    # 响应变量列表（TR变量 + GPP变量）
     response_vars = [
         'TRc',
         'TR_fixed_window',
@@ -2167,7 +2177,12 @@ def generate_section_3_2_summary(output_dir, mask=None):
         'TR_window_change',
         'TR_eos_change',
         'TR_pos_change',
-        'Trate'
+        'Trate',
+        'GPP_fixed_window',
+        'GPP_window_change',
+        'GPP_eos_change',
+        'GPP_pos_change',
+        'Fixed_GPPrate'
     ]
 
     results = []
@@ -2278,8 +2293,8 @@ def generate_section_3_3_full_period_summary(output_dir, mask=None):
     response_vars = ['TRc', 'TR_fixed_window', 'Fixed_Trate']
 
     # 预测变量列表（修复：与实际计算时的变量名一致）
-    # 实际计算时使用: ['EOS', 'Ta', 'Rs', 'P', 'GPP_fixed']
-    predictor_vars = ['EOS', 'Ta', 'Rs', 'P', 'GPP_fixed']
+    # 实际计算时使用: ['EOS', 'Ta', 'Rs', 'P', 'Fixed_GPPrate']
+    predictor_vars = ['EOS', 'Ta', 'Rs', 'P', 'Fixed_GPPrate']
 
     results = []
 
@@ -2403,10 +2418,8 @@ def generate_section_3_3_trends_summary(output_dir, mask=None):
     print("\n[生成统计汇总] Section 3.3: Sensitivity Trends Analysis...")
 
     response_vars = ['TRc', 'TR_fixed_window', 'Fixed_Trate']
-    predictor_vars = [
-        'deltaEOS', 'Tmean_pre', 'P_pre', 'SW_pre',
-        'Tmean_gs', 'P_gs', 'SW_gs', 'GPP_fixed'
-    ]
+    # 预测变量列表应与Section 3.3实际使用的一致
+    predictor_vars = ['EOS', 'Ta', 'Rs', 'P', 'Fixed_GPPrate']
 
     results = []
 
@@ -2520,9 +2533,10 @@ def save_all_statistics_to_csv(output_dir, mask=None):
     print("\n[生成综合汇总] Fixed Window Analysis Summary...")
     summary_rows = []
 
-    # 从Section 3.2提取核心指标
+    # 从Section 3.2提取核心指标（TR变量 + GPP变量）
     if section_3_2_dir.exists():
-        key_metrics = ['Fixed_Trate', 'TR_fixed_window', 'TR_window_change']
+        key_metrics = ['Fixed_Trate', 'TR_fixed_window', 'TR_window_change',
+                       'Fixed_GPPrate', 'GPP_fixed_window', 'GPP_window_change']
         for metric in key_metrics:
             slope_file = section_3_2_dir / f"{metric}_vs_deltaEOS_slope.tif"
             if slope_file.exists():
@@ -2549,7 +2563,7 @@ def save_all_statistics_to_csv(output_dir, mask=None):
         resp_var = 'Fixed_Trate'
         resp_dir = section_3_3_full_dir / resp_var
         if resp_dir.exists():
-            for pred_var in ['deltaEOS', 'Tmean_gs', 'GPP_fixed']:
+            for pred_var in ['EOS', 'Ta', 'Fixed_GPPrate']:
                 partial_r_file = resp_dir / f"partial_r_{pred_var}.tif"
                 if partial_r_file.exists():
                     with rasterio.open(partial_r_file) as src:
@@ -2704,6 +2718,21 @@ def _run_analysis():
     trc_stack = np.stack(trc_stack, axis=0).astype(np.float32)
     response_data['TRc'] = trc_stack
 
+    # 读取GPP分解组分
+    print("\n  读取 GPP分解组分...")
+    gpp_decomp_vars = ['GPP_fixed_window', 'GPP_window_change', 'GPP_eos_change', 'GPP_pos_change']
+    for resp_var in gpp_decomp_vars:
+        data_stack = []
+        for year in tqdm(years, desc=f"读取{resp_var}", leave=False):
+            gpp_file = DECOMP_DIR / f"{resp_var}_{year}.tif"
+            if gpp_file.exists():
+                data, _, nodata = read_geotiff(gpp_file)
+                data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan).astype(np.float32))
+            else:
+                print(f"  ⚠️ 文件不存在: {gpp_file}")
+                data_stack.append(np.full_like(eos_stack[0], np.nan, dtype=np.float32))
+        response_data[resp_var] = np.stack(data_stack, axis=0).astype(np.float32)  # (n_years, H, W)
+
     # Step 4: 计算速率指标
     print("\n[Step 4] 计算速率指标...")
 
@@ -2723,6 +2752,23 @@ def _run_analysis():
         )
 
     response_data['Fixed_Trate'] = fixed_trate_stack
+
+    # 4a2. GPP固定窗口速率（核心指标）
+    print("\n  计算 Fixed_GPPrate = GPP_fixed_window / Fixed_Window_Length（GPP固定窗口）...")
+    fixed_gpprate_stack = np.full_like(response_data['GPP_fixed_window'], np.nan, dtype=np.float32)
+
+    for i in range(n_years):
+        valid_gpprate = (
+            np.isfinite(response_data['GPP_fixed_window'][i]) &
+            np.isfinite(fixed_window_length) &
+            (fixed_window_length > 0)
+        )
+        fixed_gpprate_stack[i, valid_gpprate] = (
+            response_data['GPP_fixed_window'][i, valid_gpprate] /
+            fixed_window_length[valid_gpprate]
+        )
+
+    response_data['Fixed_GPPrate'] = fixed_gpprate_stack
 
     # 4b. 变化窗口速率（用于对比）
     print("\n  计算 Trate = TRc / GLS（变化窗口，用于对比）...")
@@ -2764,7 +2810,11 @@ def _run_analysis():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 完整的响应变量列表（按重要性排序）
-    all_response_vars = ['TRc', 'TR_fixed_window', 'TR_window_change', 'TR_eos_change', 'TR_pos_change', 'Fixed_Trate', 'Trate']
+    # TR变量 + GPP变量
+    all_response_vars = [
+        'TRc', 'TR_fixed_window', 'TR_window_change', 'TR_eos_change', 'TR_pos_change', 'Fixed_Trate', 'Trate',
+        'GPP_fixed_window', 'GPP_window_change', 'GPP_eos_change', 'GPP_pos_change', 'Fixed_GPPrate'
+    ]
 
     for resp_var in all_response_vars:
         print(f"\n  分析: {resp_var} ~ ΔEOS")
@@ -2777,6 +2827,10 @@ def _run_analysis():
         slope_threshold = 10.0  # TR_fixed_window/TR_window_change等的合理范围
         if resp_var in ['Fixed_Trate', 'Trate']:
             slope_threshold = 1.0  # 速率变量的斜率范围更小
+        elif resp_var == 'Fixed_GPPrate':
+            slope_threshold = 5.0  # GPP速率变量的斜率范围
+        elif resp_var in ['GPP_fixed_window', 'GPP_window_change', 'GPP_eos_change', 'GPP_pos_change']:
+            slope_threshold = 50.0  # GPP累积变量的合理范围（gC/m²）
 
         n_filtered, valid_mask, outlier_info = filter_statistical_outliers(
             slope_map, r2_map=r_squared_map, pvalue_map=pvalue_map,
@@ -2804,7 +2858,14 @@ def _run_analysis():
         write_geotiff(output_dir / f"{resp_var}_vs_deltaEOS_R2.tif", r2_map_save, profile)
 
         # 全面统计输出（全部有效像元 + 显著性像元）
-        unit = "mm/day per day ΔEOS" if resp_var in ['Fixed_Trate', 'Trate'] else "mm per day ΔEOS"
+        if resp_var in ['Fixed_Trate', 'Trate']:
+            unit = "mm/day per day ΔEOS"
+        elif resp_var == 'Fixed_GPPrate':
+            unit = "gC/m²/day per day ΔEOS"
+        elif resp_var in ['GPP_fixed_window', 'GPP_window_change', 'GPP_eos_change', 'GPP_pos_change']:
+            unit = "gC/m² per day ΔEOS"
+        else:
+            unit = "mm per day ΔEOS"
         print_comprehensive_statistics(
             slope_map_clean, pvalue_map_clean, valid_mask,
             var_name=f"{resp_var} ~ ΔEOS 回归斜率",
@@ -2871,13 +2932,18 @@ def _run_analysis():
     print("  │   ├── TR_eos_change_vs_deltaEOS_slope.tif")
     print("  │   ├── TR_pos_change_vs_deltaEOS_slope.tif")
     print("  │   ├── Fixed_Trate_vs_deltaEOS_slope.tif [MOST IMPORTANT]")
-    print("  │   └── Trate_vs_deltaEOS_slope.tif")
+    print("  │   ├── Trate_vs_deltaEOS_slope.tif")
+    print("  │   ├── GPP_fixed_window_vs_deltaEOS_slope.tif")
+    print("  │   ├── GPP_window_change_vs_deltaEOS_slope.tif")
+    print("  │   ├── GPP_eos_change_vs_deltaEOS_slope.tif")
+    print("  │   ├── GPP_pos_change_vs_deltaEOS_slope.tif")
+    print("  │   └── Fixed_GPPrate_vs_deltaEOS_slope.tif")
     print("  ├── Section_3.3_Drivers/")
     print("  │   ├── Full_Period/")
     print("  │   │   ├── TRc/")
     print("  │   │   ├── TR_fixed_window/")
     print("  │   │   └── Fixed_Trate/")
-    print("  │   │       ├── partial_r_{var}.tif (EOS, Ta, Rs, P, GPP_fixed)")
+    print("  │   │       ├── partial_r_{var}.tif (EOS, Ta, Rs, P, Fixed_GPPrate)")
     print("  │   │       ├── partial_p_{var}.tif")
     print("  │   │       ├── vif_retained_{var}.tif")
     print("  │   │       └── R_squared.tif")
