@@ -25,11 +25,11 @@ warnings.filterwarnings('ignore')
 
 # 导入配置（固定使用_config.py）
 from _config import (
-    ROOT, OUTPUT_ROOT, LAT_MIN, FOREST_CLASSES, NODATA_OUT,
+    ROOT, LAT_MIN, FOREST_CLASSES, NODATA_OUT,
     USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, PHENO_DIR,
     YEAR_START, YEAR_END, PHENO_FILE_FORMAT,
     GPP_DAILY_DIR, SM_DAILY_DIR, TR_FILE_FORMAT, get_TR_file_path,
-    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path
+    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path, OUTPUT_ROOT
 )
 
 # 运行开关
