@@ -20,7 +20,7 @@ LIVE_OUTPUT = True  # True时实时输出子进程日志
 DEFAULT_RUN_MODE = "skip"  # skip: 文件存在则跳过; overwrite: 覆盖重算
 
 # ==================== 配置日志 ====================
-LOG_DIR = Path(r"I:\F\Data4\Wang2025_Analysis\Logs")
+LOG_DIR = Path(r"I:\F\Data4\Wang2025_Analysis_SOS\Logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -83,6 +83,12 @@ MODULES = [
         'required': False,
         'description': '像元级SEM对比（Ours/Other）',
         'interpreter': 'Rscript'
+    },
+    {
+        'name': 'Module 06: 绘图',
+        'script': '06_plotting.py',
+        'required': False,
+        'description': '生成结果可视化图像（已存在则跳过）'
     }
 ]
 

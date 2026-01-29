@@ -88,6 +88,13 @@ def outputs_complete(output_dir):
     key2 = output_dir / "Section_3.3_Drivers" / "Full_Period" / "Fixed_Trate" / "R_squared.tif"
     return key1.exists() and key2.exists()
 
+def section_3_4_outputs_complete(output_dir):
+    """检查Section 3.4贡献率分析输出是否已存在"""
+    contrib_dir = output_dir / "Section_3.4_Contribution"
+    key1 = contrib_dir / "window_contrib_signed.tif"
+    key2 = contrib_dir / "dominant_factor.tif"
+    return key1.exists() and key2.exists()
+
 def csv_outputs_complete(output_dir):
     """检查统计汇总CSV文件是否已存在"""
     csv1 = output_dir / "Section_3.2_Phenology_Impact_Statistics.csv"
@@ -2090,6 +2097,657 @@ def section_3_3_driver_analysis(mask):
     print("\n  ✓ Section 3.3 分析完成")
     print(f"  输出目录: {OUTPUT_DIR / 'Section_3.3_Drivers'}")
 
+
+def section_3_4_contribution_analysis(response_data, mask, profile, output_dir, is_detrended=False):
+    """
+    Section 3.4: 窗口变化与速率变化对TRc变化的贡献率分析
+
+    计算方法（四种方法全面对比）：
+
+    方法1 - 带符号贡献率（均值法）：保留方向信息，两者之和=100%
+       - window_contrib = mean(TR_window_change) / mean(ΔTRc) × 100%
+       - rate_contrib = mean(TR_fixed_window) / mean(ΔTRc) × 100%
+       - 回答：各分量对"多年平均净变化"的贡献
+       - 注意：仅适用于Raw数据，Detrended后mean≈0无意义
+
+    方法2 - 绝对贡献率（均值法）：只看贡献大小，忽略方向
+       - window_contrib_abs = mean(|TR_window_change|) / Σmean(|comp|) × 100%
+       - rate_contrib_abs = mean(|TR_fixed_window|) / Σmean(|comp|) × 100%
+       - 回答：各分量在"年际波动幅度"中的占比
+       - 适用于Raw和Detrended数据
+
+    方法3 - 方差贡献率：基于方差分解
+       - window_var_contrib = Var(TR_window_change) / Var(ΔTRc) × 100%
+       - rate_var_contrib = Var(TR_fixed_window) / Var(ΔTRc) × 100%
+       - 回答：各分量解释了ΔTRc"年际变异"的多少
+       - 注意：两者之和≠100%（因为有协方差项）
+       - 适用于Raw和Detrended数据
+
+    方法4 - 趋势贡献率：基于线性趋势分解
+       - window_trend_contrib = Trend(TR_window_change) / Trend(ΔTRc) × 100%
+       - rate_trend_contrib = Trend(TR_fixed_window) / Trend(ΔTRc) × 100%
+       - 回答：各分量对ΔTRc"长期线性趋势"的贡献
+       - 注意：两者之和精确=100%（恒等式性质）
+       - 注意：仅适用于Raw数据，Detrended后Trend≈0无意义
+
+    主导因子分类：
+       - 1 = 窗口主导（|TR_window_change| > |TR_fixed_window|）
+       - 2 = 速率主导（|TR_fixed_window| > |TR_window_change|）
+
+    变化方向分类：
+       - 1 = 同向增加（TR_window_change > 0 且 TR_fixed_window > 0）
+       - 2 = 同向减少（TR_window_change < 0 且 TR_fixed_window < 0）
+       - 3 = 异向（窗口正，速率负）
+       - 4 = 异向（窗口负，速率正）
+
+    Parameters
+    ----------
+    response_data : dict
+        包含 'TR_window_change' 和 'TR_fixed_window' 的数据字典，shape=(n_years, H, W)
+    mask : np.ndarray
+        有效像元掩膜
+    profile : dict
+        栅格profile用于输出
+    output_dir : Path
+        输出目录
+    is_detrended : bool
+        是否为去趋势数据。若为True，则只计算方法2和方法3
+    """
+    from scipy.stats import linregress
+
+    print("\n" + "=" * 70)
+    if is_detrended:
+        print("Section 3.4: 贡献率分析（Detrended - 仅方法2、3）")
+    else:
+        print("Section 3.4: 贡献率分析（Raw - 四种方法对比）")
+    print("=" * 70)
+    print("\n分析内容：")
+    if not is_detrended:
+        print("  - 方法1: 带符号贡献率（均值法） - 对多年平均净变化的贡献")
+    print("  - 方法2: 绝对贡献率（均值法） - 对年际波动幅度的贡献")
+    print("  - 方法3: 方差贡献率 - 对年际变异的解释力")
+    if not is_detrended:
+        print("  - 方法4: 趋势贡献率 - 对长期线性趋势的贡献")
+    print("  - 主导因子空间分布")
+    print("  - 变化方向分类统计")
+
+    contrib_dir = output_dir / "Section_3.4_Contribution"
+    contrib_dir.mkdir(parents=True, exist_ok=True)
+
+    # 获取数据
+    tr_window_change = response_data['TR_window_change']  # (n_years, H, W)
+    tr_fixed_window = response_data['TR_fixed_window']    # (n_years, H, W)
+    n_years, height, width = tr_window_change.shape
+
+    print(f"\n  数据维度: {n_years}年 × {height} × {width}")
+
+    # ===== 1. 计算多年平均 =====
+    print("\n[Step 1] 计算多年平均贡献率...")
+
+    # 多年平均分解组分（用于带符号贡献率 - 反映长期趋势）
+    mean_window_change = np.nanmean(tr_window_change, axis=0)  # (H, W)
+    mean_fixed_window = np.nanmean(tr_fixed_window, axis=0)    # (H, W)
+
+    # ΔTRc多年平均
+    delta_trc_mean = mean_window_change + mean_fixed_window
+
+    # 绝对值的多年平均（用于年际变异贡献率）
+    # 注意：mean(|x|) 而非 |mean(x)|，避免正负抵消
+    mean_abs_window = np.nanmean(np.abs(tr_window_change), axis=0)  # (H, W)
+    mean_abs_fixed = np.nanmean(np.abs(tr_fixed_window), axis=0)    # (H, W)
+    abs_sum = mean_abs_window + mean_abs_fixed
+
+    # 方法1: 带符号贡献率（多年平均）- 反映对长期趋势的贡献
+    # 注意：去趋势后数据的多年平均接近0，方法1无意义，仅对Raw数据计算
+    window_contrib_signed = None
+    rate_contrib_signed = None
+
+    if not is_detrended:
+        print("  [方法1] 计算带符号贡献率...")
+        window_contrib_signed = np.full((height, width), np.nan, dtype=np.float32)
+        rate_contrib_signed = np.full((height, width), np.nan, dtype=np.float32)
+
+        valid_signed = np.isfinite(delta_trc_mean) & (np.abs(delta_trc_mean) > 1e-6)
+        if mask is not None:
+            valid_signed = valid_signed & mask
+
+        window_contrib_signed[valid_signed] = (mean_window_change[valid_signed] /
+                                                delta_trc_mean[valid_signed] * 100)
+        rate_contrib_signed[valid_signed] = (mean_fixed_window[valid_signed] /
+                                              delta_trc_mean[valid_signed] * 100)
+    else:
+        print("  [方法1] 跳过（去趋势数据mean≈0，方法1无意义）")
+
+    # 方法2: 绝对贡献率（年际变异）- 使用 mean(|x|) 反映对年际变异的贡献
+    window_contrib_abs = np.full((height, width), np.nan, dtype=np.float32)
+    rate_contrib_abs = np.full((height, width), np.nan, dtype=np.float32)
+
+    valid_abs = np.isfinite(abs_sum) & (abs_sum > 1e-6)
+    if mask is not None:
+        valid_abs = valid_abs & mask
+
+    window_contrib_abs[valid_abs] = (mean_abs_window[valid_abs] /
+                                      abs_sum[valid_abs] * 100)
+    rate_contrib_abs[valid_abs] = (mean_abs_fixed[valid_abs] /
+                                    abs_sum[valid_abs] * 100)
+
+    # ===== 方法3: 方差贡献率 =====
+    print("\n  [方法3] 计算方差贡献率...")
+
+    # 计算沿时间维度的方差
+    var_window = np.nanvar(tr_window_change, axis=0, ddof=1)  # (H, W)
+    var_fixed = np.nanvar(tr_fixed_window, axis=0, ddof=1)    # (H, W)
+
+    # ΔTRc = TR_window_change + TR_fixed_window
+    delta_trc = tr_window_change + tr_fixed_window  # (n_years, H, W)
+    var_delta = np.nanvar(delta_trc, axis=0, ddof=1)  # (H, W)
+
+    # 协方差项（用于验证）
+    # Var(A+B) = Var(A) + Var(B) + 2*Cov(A,B)
+    cov_window_fixed = np.full((height, width), np.nan, dtype=np.float32)
+    for i in range(height):
+        for j in range(width):
+            w_ts = tr_window_change[:, i, j]
+            f_ts = tr_fixed_window[:, i, j]
+            valid_ts = np.isfinite(w_ts) & np.isfinite(f_ts)
+            if np.sum(valid_ts) > 2:
+                cov_window_fixed[i, j] = np.cov(w_ts[valid_ts], f_ts[valid_ts])[0, 1]
+
+    # 方差贡献率
+    window_var_contrib = np.full((height, width), np.nan, dtype=np.float32)
+    rate_var_contrib = np.full((height, width), np.nan, dtype=np.float32)
+
+    valid_var = np.isfinite(var_delta) & (var_delta > 1e-10)
+    if mask is not None:
+        valid_var = valid_var & mask
+
+    window_var_contrib[valid_var] = (var_window[valid_var] / var_delta[valid_var] * 100)
+    rate_var_contrib[valid_var] = (var_fixed[valid_var] / var_delta[valid_var] * 100)
+
+    # ===== 方法4: 趋势贡献率 =====
+    # 注意：去趋势后数据的趋势接近0，方法4无意义，仅对Raw数据计算
+    window_trend_contrib = None
+    rate_trend_contrib = None
+    trend_window = None
+    trend_fixed = None
+    trend_delta = None
+
+    if not is_detrended:
+        print("  [方法4] 计算趋势贡献率...")
+
+        years_arr = np.arange(n_years)
+
+        # 逐像元计算线性趋势斜率
+        trend_window = np.full((height, width), np.nan, dtype=np.float32)
+        trend_fixed = np.full((height, width), np.nan, dtype=np.float32)
+        trend_delta = np.full((height, width), np.nan, dtype=np.float32)
+
+        # 使用向量化方法加速计算（仅对有效像元）
+        valid_trend_mask = np.ones((height, width), dtype=bool)
+        if mask is not None:
+            valid_trend_mask = mask.copy()
+
+        # 统计有效像元数量
+        n_valid_pixels = np.sum(valid_trend_mask)
+        print(f"    计算 {n_valid_pixels} 个有效像元的线性趋势...")
+
+        # 逐像元计算趋势（这里用简化版本，避免过慢）
+        for i in range(height):
+            for j in range(width):
+                if not valid_trend_mask[i, j]:
+                    continue
+
+                w_ts = tr_window_change[:, i, j]
+                f_ts = tr_fixed_window[:, i, j]
+                d_ts = delta_trc[:, i, j]
+
+                valid_ts = np.isfinite(w_ts) & np.isfinite(f_ts) & np.isfinite(d_ts)
+                if np.sum(valid_ts) < 5:  # 至少5个有效点
+                    continue
+
+                try:
+                    # 窗口变化趋势
+                    slope_w, _, _, _, _ = linregress(years_arr[valid_ts], w_ts[valid_ts])
+                    trend_window[i, j] = slope_w
+
+                    # 速率变化趋势
+                    slope_f, _, _, _, _ = linregress(years_arr[valid_ts], f_ts[valid_ts])
+                    trend_fixed[i, j] = slope_f
+
+                    # ΔTRc趋势
+                    slope_d, _, _, _, _ = linregress(years_arr[valid_ts], d_ts[valid_ts])
+                    trend_delta[i, j] = slope_d
+                except:
+                    pass
+
+        # 趋势贡献率
+        window_trend_contrib = np.full((height, width), np.nan, dtype=np.float32)
+        rate_trend_contrib = np.full((height, width), np.nan, dtype=np.float32)
+
+        valid_trend = np.isfinite(trend_delta) & (np.abs(trend_delta) > 1e-10)
+        if mask is not None:
+            valid_trend = valid_trend & mask
+
+        window_trend_contrib[valid_trend] = (trend_window[valid_trend] /
+                                              trend_delta[valid_trend] * 100)
+        rate_trend_contrib[valid_trend] = (trend_fixed[valid_trend] /
+                                            trend_delta[valid_trend] * 100)
+    else:
+        print("  [方法4] 跳过（去趋势数据trend≈0，方法4无意义）")
+
+    # 主导因子（1=窗口主导，2=速率主导）- 基于年际变异贡献率
+    dominant_factor = np.full((height, width), np.nan, dtype=np.float32)
+    valid_dom = valid_abs
+    window_dom = valid_dom & (mean_abs_window > mean_abs_fixed)
+    rate_dom = valid_dom & (mean_abs_fixed >= mean_abs_window)
+    dominant_factor[window_dom] = 1
+    dominant_factor[rate_dom] = 2
+
+    # 变化方向分类
+    direction_class = np.full((height, width), np.nan, dtype=np.float32)
+    valid_dir = np.isfinite(mean_window_change) & np.isfinite(mean_fixed_window)
+    if mask is not None:
+        valid_dir = valid_dir & mask
+
+    # 1 = 同向增加
+    same_increase = valid_dir & (mean_window_change > 0) & (mean_fixed_window > 0)
+    # 2 = 同向减少
+    same_decrease = valid_dir & (mean_window_change < 0) & (mean_fixed_window < 0)
+    # 3 = 异向（窗口正，速率负）
+    opposite_wpos = valid_dir & (mean_window_change > 0) & (mean_fixed_window < 0)
+    # 4 = 异向（窗口负，速率正）
+    opposite_wneg = valid_dir & (mean_window_change < 0) & (mean_fixed_window > 0)
+
+    direction_class[same_increase] = 1
+    direction_class[same_decrease] = 2
+    direction_class[opposite_wpos] = 3
+    direction_class[opposite_wneg] = 4
+
+    # 保存多年平均结果
+    mean_dir = contrib_dir / "Mean"
+    mean_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_contrib_raster(data, filename, apply_mask=True):
+        """保存贡献率栅格"""
+        data_save = np.where(np.isfinite(data), data, NODATA_OUT)
+        if apply_mask and mask is not None:
+            data_save[~mask] = NODATA_OUT
+        write_geotiff(mean_dir / filename, data_save, profile)
+
+    # 方法1: 带符号贡献率（仅Raw数据）
+    if not is_detrended and window_contrib_signed is not None:
+        save_contrib_raster(window_contrib_signed, "window_contrib_signed.tif")
+        save_contrib_raster(rate_contrib_signed, "rate_contrib_signed.tif")
+
+    # 方法2: 绝对贡献率（Raw和Detrended都计算）
+    save_contrib_raster(window_contrib_abs, "window_contrib_abs.tif")
+    save_contrib_raster(rate_contrib_abs, "rate_contrib_abs.tif")
+
+    # 方法3: 方差贡献率（Raw和Detrended都计算）
+    save_contrib_raster(window_var_contrib, "window_var_contrib.tif")
+    save_contrib_raster(rate_var_contrib, "rate_var_contrib.tif")
+    save_contrib_raster(var_window, "var_TR_window_change.tif")
+    save_contrib_raster(var_fixed, "var_TR_fixed_window.tif")
+    save_contrib_raster(var_delta, "var_delta_TRc.tif")
+    save_contrib_raster(cov_window_fixed, "cov_window_fixed.tif")
+
+    # 方法4: 趋势贡献率（仅Raw数据）
+    if not is_detrended and window_trend_contrib is not None:
+        save_contrib_raster(window_trend_contrib, "window_trend_contrib.tif")
+        save_contrib_raster(rate_trend_contrib, "rate_trend_contrib.tif")
+        save_contrib_raster(trend_window, "trend_TR_window_change.tif")
+        save_contrib_raster(trend_fixed, "trend_TR_fixed_window.tif")
+        save_contrib_raster(trend_delta, "trend_delta_TRc.tif")
+
+    # 主导因子与方向分类
+    save_contrib_raster(dominant_factor, "dominant_factor.tif")
+    save_contrib_raster(direction_class, "direction_class.tif")
+    save_contrib_raster(mean_window_change, "mean_TR_window_change.tif")
+    save_contrib_raster(mean_fixed_window, "mean_TR_fixed_window.tif")
+    save_contrib_raster(delta_trc_mean, "mean_delta_TRc.tif")
+
+    # ===== 2. 统计汇总 =====
+    print("\n[Step 2] 统计汇总...")
+
+    # 方法1: 带符号贡献率统计 - 反映长期趋势（仅Raw数据）
+    if not is_detrended and window_contrib_signed is not None:
+        valid_stats = np.isfinite(delta_trc_mean) & (np.abs(delta_trc_mean) > 1e-6)
+        if mask is not None:
+            valid_stats = valid_stats & mask
+        if np.any(valid_stats):
+            print("\n  方法1 - 带符号贡献率（长期趋势贡献）：")
+            print(f"    窗口贡献率: 均值={np.nanmean(window_contrib_signed[valid_stats]):.1f}%, "
+                  f"中位数={np.nanmedian(window_contrib_signed[valid_stats]):.1f}%")
+            print(f"    速率贡献率: 均值={np.nanmean(rate_contrib_signed[valid_stats]):.1f}%, "
+                  f"中位数={np.nanmedian(rate_contrib_signed[valid_stats]):.1f}%")
+
+            # 检查异向情况（贡献率>100%或<0%）
+            n_window_over100 = np.sum(window_contrib_signed[valid_stats] > 100)
+            n_window_under0 = np.sum(window_contrib_signed[valid_stats] < 0)
+            n_total = np.sum(valid_stats)
+            print(f"\n    异向抵消情况：")
+            print(f"      窗口贡献>100%: {n_window_over100} ({n_window_over100/n_total*100:.1f}%)")
+            print(f"      窗口贡献<0%: {n_window_under0} ({n_window_under0/n_total*100:.1f}%)")
+
+    # 方法2: 绝对贡献率统计 - 反映年际变异（使用 mean(|x|) 方法）
+    valid_abs_stats = valid_abs
+    if np.any(valid_abs_stats):
+        print("\n  方法2 - 绝对贡献率（年际波动幅度贡献，mean(|x|)方法）：")
+        print(f"    窗口贡献率: 均值={np.nanmean(window_contrib_abs[valid_abs_stats]):.1f}%, "
+              f"中位数={np.nanmedian(window_contrib_abs[valid_abs_stats]):.1f}%")
+        print(f"    速率贡献率: 均值={np.nanmean(rate_contrib_abs[valid_abs_stats]):.1f}%, "
+              f"中位数={np.nanmedian(rate_contrib_abs[valid_abs_stats]):.1f}%")
+
+    # 方法3: 方差贡献率统计
+    valid_var_stats = valid_var
+    if np.any(valid_var_stats):
+        print("\n  方法3 - 方差贡献率（年际变异解释力）：")
+        mean_w_var = np.nanmean(window_var_contrib[valid_var_stats])
+        mean_r_var = np.nanmean(rate_var_contrib[valid_var_stats])
+        print(f"    窗口贡献率: 均值={mean_w_var:.1f}%, "
+              f"中位数={np.nanmedian(window_var_contrib[valid_var_stats]):.1f}%")
+        print(f"    速率贡献率: 均值={mean_r_var:.1f}%, "
+              f"中位数={np.nanmedian(rate_var_contrib[valid_var_stats]):.1f}%")
+        print(f"    注意：两者之和={mean_w_var + mean_r_var:.1f}%（≠100%因存在协方差项）")
+
+        # 协方差统计
+        valid_cov = np.isfinite(cov_window_fixed)
+        if mask is not None:
+            valid_cov = valid_cov & mask
+        if np.any(valid_cov):
+            mean_cov = np.nanmean(cov_window_fixed[valid_cov])
+            pct_pos_cov = np.sum(cov_window_fixed[valid_cov] > 0) / np.sum(valid_cov) * 100
+            print(f"    协方差: 均值={mean_cov:.2f}, 正协方差像元占比={pct_pos_cov:.1f}%")
+
+    # 方法4: 趋势贡献率统计（仅Raw数据）
+    if not is_detrended and window_trend_contrib is not None and trend_delta is not None:
+        valid_trend_stats = np.isfinite(trend_delta) & (np.abs(trend_delta) > 1e-10)
+        if mask is not None:
+            valid_trend_stats = valid_trend_stats & mask
+        if np.any(valid_trend_stats):
+            print("\n  方法4 - 趋势贡献率（长期线性趋势贡献）：")
+            mean_w_trend = np.nanmean(window_trend_contrib[valid_trend_stats])
+            mean_r_trend = np.nanmean(rate_trend_contrib[valid_trend_stats])
+            print(f"    窗口贡献率: 均值={mean_w_trend:.1f}%, "
+                  f"中位数={np.nanmedian(window_trend_contrib[valid_trend_stats]):.1f}%")
+            print(f"    速率贡献率: 均值={mean_r_trend:.1f}%, "
+                  f"中位数={np.nanmedian(rate_trend_contrib[valid_trend_stats]):.1f}%")
+            print(f"    验证：两者之和={mean_w_trend + mean_r_trend:.1f}%（应≈100%）")
+
+            # 趋势方向统计
+            pos_trend_delta = np.sum(trend_delta[valid_trend_stats] > 0)
+            neg_trend_delta = np.sum(trend_delta[valid_trend_stats] < 0)
+            n_trend = np.sum(valid_trend_stats)
+            print(f"    ΔTRc趋势方向: 正趋势={pos_trend_delta}({pos_trend_delta/n_trend*100:.1f}%), "
+                  f"负趋势={neg_trend_delta}({neg_trend_delta/n_trend*100:.1f}%)")
+
+    # 主导因子统计
+    if np.any(valid_dom):
+        n_window_dom = np.sum(window_dom)
+        n_rate_dom = np.sum(rate_dom)
+        n_total_dom = n_window_dom + n_rate_dom
+        print(f"\n  主导因子分布：")
+        print(f"    窗口主导: {n_window_dom} ({n_window_dom/n_total_dom*100:.1f}%)")
+        print(f"    速率主导: {n_rate_dom} ({n_rate_dom/n_total_dom*100:.1f}%)")
+
+    # 变化方向统计
+    if np.any(valid_dir):
+        n_same_inc = np.sum(same_increase)
+        n_same_dec = np.sum(same_decrease)
+        n_opp_wpos = np.sum(opposite_wpos)
+        n_opp_wneg = np.sum(opposite_wneg)
+        n_total_dir = n_same_inc + n_same_dec + n_opp_wpos + n_opp_wneg
+
+        print(f"\n  变化方向分类：")
+        print(f"    同向增加 (窗口+, 速率+): {n_same_inc} ({n_same_inc/n_total_dir*100:.1f}%)")
+        print(f"    同向减少 (窗口-, 速率-): {n_same_dec} ({n_same_dec/n_total_dir*100:.1f}%)")
+        print(f"    异向 (窗口+, 速率-): {n_opp_wpos} ({n_opp_wpos/n_total_dir*100:.1f}%)")
+        print(f"    异向 (窗口-, 速率+): {n_opp_wneg} ({n_opp_wneg/n_total_dir*100:.1f}%)")
+        print(f"    异向合计: {n_opp_wpos + n_opp_wneg} ({(n_opp_wpos + n_opp_wneg)/n_total_dir*100:.1f}%)")
+
+    # ===== 3. 逐年贡献率（可选，用于时间序列分析） =====
+    print("\n[Step 3] 计算逐年贡献率...")
+
+    annual_dir = contrib_dir / "Annual"
+    annual_dir.mkdir(parents=True, exist_ok=True)
+
+    years = list(range(YEAR_START, YEAR_END + 1))
+
+    # 逐年绝对贡献率（用于趋势分析）
+    window_contrib_annual = np.full((n_years, height, width), np.nan, dtype=np.float32)
+    rate_contrib_annual = np.full((n_years, height, width), np.nan, dtype=np.float32)
+
+    for i, year in enumerate(years):
+        wc = tr_window_change[i]
+        fw = tr_fixed_window[i]
+        abs_sum_y = np.abs(wc) + np.abs(fw)
+
+        valid_y = np.isfinite(abs_sum_y) & (abs_sum_y > 1e-6)
+        if mask is not None:
+            valid_y = valid_y & mask
+
+        window_contrib_annual[i, valid_y] = np.abs(wc[valid_y]) / abs_sum_y[valid_y] * 100
+        rate_contrib_annual[i, valid_y] = np.abs(fw[valid_y]) / abs_sum_y[valid_y] * 100
+
+    # 保存逐年结果（只保存第一年和最后一年作为示例）
+    for i, year in enumerate([years[0], years[-1]]):
+        idx = 0 if year == years[0] else -1
+        year_dir = annual_dir / str(year)
+        year_dir.mkdir(parents=True, exist_ok=True)
+
+        wc_save = np.where(np.isfinite(window_contrib_annual[idx]),
+                           window_contrib_annual[idx], NODATA_OUT)
+        rc_save = np.where(np.isfinite(rate_contrib_annual[idx]),
+                           rate_contrib_annual[idx], NODATA_OUT)
+        if mask is not None:
+            wc_save[~mask] = NODATA_OUT
+            rc_save[~mask] = NODATA_OUT
+
+        write_geotiff(year_dir / f"window_contrib_{year}.tif", wc_save, profile)
+        write_geotiff(year_dir / f"rate_contrib_{year}.tif", rc_save, profile)
+
+    # ===== 4. 生成统计汇总CSV =====
+    print("\n[Step 4] 生成统计汇总CSV...")
+
+    stats_data = []
+
+    # 方法1: 带符号贡献率统计（仅Raw数据）
+    if not is_detrended and window_contrib_signed is not None:
+        valid_stats_csv = np.isfinite(delta_trc_mean) & (np.abs(delta_trc_mean) > 1e-6)
+        if mask is not None:
+            valid_stats_csv = valid_stats_csv & mask
+        if np.any(valid_stats_csv):
+            stats_data.append({
+                'Metric': 'M1_Window_Contrib_Signed_Mean',
+                'Value': np.nanmean(window_contrib_signed[valid_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method1_SignedMean'
+            })
+            stats_data.append({
+                'Metric': 'M1_Window_Contrib_Signed_Median',
+                'Value': np.nanmedian(window_contrib_signed[valid_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method1_SignedMean'
+            })
+            stats_data.append({
+                'Metric': 'M1_Rate_Contrib_Signed_Mean',
+                'Value': np.nanmean(rate_contrib_signed[valid_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method1_SignedMean'
+            })
+            stats_data.append({
+                'Metric': 'M1_Rate_Contrib_Signed_Median',
+                'Value': np.nanmedian(rate_contrib_signed[valid_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method1_SignedMean'
+            })
+
+    # 方法2: 绝对贡献率统计
+    if np.any(valid_abs_stats):
+        stats_data.append({
+            'Metric': 'M2_Window_Contrib_Abs_Mean',
+            'Value': np.nanmean(window_contrib_abs[valid_abs_stats]),
+            'Unit': '%',
+            'Method': 'Method2_MeanAbs'
+        })
+        stats_data.append({
+            'Metric': 'M2_Window_Contrib_Abs_Median',
+            'Value': np.nanmedian(window_contrib_abs[valid_abs_stats]),
+            'Unit': '%',
+            'Method': 'Method2_MeanAbs'
+        })
+        stats_data.append({
+            'Metric': 'M2_Rate_Contrib_Abs_Mean',
+            'Value': np.nanmean(rate_contrib_abs[valid_abs_stats]),
+            'Unit': '%',
+            'Method': 'Method2_MeanAbs'
+        })
+        stats_data.append({
+            'Metric': 'M2_Rate_Contrib_Abs_Median',
+            'Value': np.nanmedian(rate_contrib_abs[valid_abs_stats]),
+            'Unit': '%',
+            'Method': 'Method2_MeanAbs'
+        })
+
+    # 方法3: 方差贡献率统计
+    if np.any(valid_var_stats):
+        stats_data.append({
+            'Metric': 'M3_Window_Var_Contrib_Mean',
+            'Value': np.nanmean(window_var_contrib[valid_var_stats]),
+            'Unit': '%',
+            'Method': 'Method3_Variance'
+        })
+        stats_data.append({
+            'Metric': 'M3_Window_Var_Contrib_Median',
+            'Value': np.nanmedian(window_var_contrib[valid_var_stats]),
+            'Unit': '%',
+            'Method': 'Method3_Variance'
+        })
+        stats_data.append({
+            'Metric': 'M3_Rate_Var_Contrib_Mean',
+            'Value': np.nanmean(rate_var_contrib[valid_var_stats]),
+            'Unit': '%',
+            'Method': 'Method3_Variance'
+        })
+        stats_data.append({
+            'Metric': 'M3_Rate_Var_Contrib_Median',
+            'Value': np.nanmedian(rate_var_contrib[valid_var_stats]),
+            'Unit': '%',
+            'Method': 'Method3_Variance'
+        })
+        # 协方差信息
+        valid_cov_csv = np.isfinite(cov_window_fixed)
+        if mask is not None:
+            valid_cov_csv = valid_cov_csv & mask
+        if np.any(valid_cov_csv):
+            stats_data.append({
+                'Metric': 'M3_Covariance_Mean',
+                'Value': np.nanmean(cov_window_fixed[valid_cov_csv]),
+                'Unit': 'mm²',
+                'Method': 'Method3_Variance'
+            })
+            stats_data.append({
+                'Metric': 'M3_Positive_Cov_Fraction',
+                'Value': np.sum(cov_window_fixed[valid_cov_csv] > 0) / np.sum(valid_cov_csv) * 100,
+                'Unit': '%',
+                'Method': 'Method3_Variance'
+            })
+
+    # 方法4: 趋势贡献率统计（仅Raw数据）
+    if not is_detrended and window_trend_contrib is not None and trend_delta is not None:
+        valid_trend_stats_csv = np.isfinite(trend_delta) & (np.abs(trend_delta) > 1e-10)
+        if mask is not None:
+            valid_trend_stats_csv = valid_trend_stats_csv & mask
+        if np.any(valid_trend_stats_csv):
+            stats_data.append({
+                'Metric': 'M4_Window_Trend_Contrib_Mean',
+                'Value': np.nanmean(window_trend_contrib[valid_trend_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method4_Trend'
+            })
+            stats_data.append({
+                'Metric': 'M4_Window_Trend_Contrib_Median',
+                'Value': np.nanmedian(window_trend_contrib[valid_trend_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method4_Trend'
+            })
+            stats_data.append({
+                'Metric': 'M4_Rate_Trend_Contrib_Mean',
+                'Value': np.nanmean(rate_trend_contrib[valid_trend_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method4_Trend'
+            })
+            stats_data.append({
+                'Metric': 'M4_Rate_Trend_Contrib_Median',
+                'Value': np.nanmedian(rate_trend_contrib[valid_trend_stats_csv]),
+                'Unit': '%',
+                'Method': 'Method4_Trend'
+            })
+            # ΔTRc趋势方向统计
+            stats_data.append({
+                'Metric': 'M4_Positive_Trend_Fraction',
+                'Value': np.sum(trend_delta[valid_trend_stats_csv] > 0) / np.sum(valid_trend_stats_csv) * 100,
+                'Unit': '%',
+                'Method': 'Method4_Trend'
+            })
+
+    # 主导因子统计
+    if np.any(valid_dom):
+        stats_data.append({
+            'Metric': 'Window_Dominant_Fraction',
+            'Value': n_window_dom / n_total_dom * 100,
+            'Unit': '%'
+        })
+        stats_data.append({
+            'Metric': 'Rate_Dominant_Fraction',
+            'Value': n_rate_dom / n_total_dom * 100,
+            'Unit': '%'
+        })
+
+    # 方向分类统计
+    if np.any(valid_dir):
+        stats_data.append({
+            'Metric': 'Same_Direction_Increase',
+            'Value': n_same_inc / n_total_dir * 100,
+            'Unit': '%'
+        })
+        stats_data.append({
+            'Metric': 'Same_Direction_Decrease',
+            'Value': n_same_dec / n_total_dir * 100,
+            'Unit': '%'
+        })
+        stats_data.append({
+            'Metric': 'Opposite_Direction_Total',
+            'Value': (n_opp_wpos + n_opp_wneg) / n_total_dir * 100,
+            'Unit': '%'
+        })
+
+    # 保存CSV
+    if stats_data:
+        stats_df = pd.DataFrame(stats_data)
+        csv_path = contrib_dir / "contribution_statistics.csv"
+        stats_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        print(f"  统计汇总已保存: {csv_path}")
+
+    print("\n  ✓ Section 3.4 贡献率分析完成（四种方法）")
+    print(f"  输出目录: {contrib_dir}")
+    print("\n  输出文件结构：")
+    print("    ├── Mean/")
+    print("    │   ├── [方法1] window/rate_contrib_signed.tif  # 均值法带符号贡献率")
+    print("    │   ├── [方法2] window/rate_contrib_abs.tif     # 均值法绝对贡献率")
+    print("    │   ├── [方法3] window/rate_var_contrib.tif     # 方差贡献率")
+    print("    │   ├── [方法3] var_*.tif, cov_*.tif            # 方差/协方差数据")
+    print("    │   ├── [方法4] window/rate_trend_contrib.tif   # 趋势贡献率")
+    print("    │   ├── [方法4] trend_*.tif                     # 趋势斜率数据")
+    print("    │   ├── dominant_factor.tif                     # 主导因子(1=窗口,2=速率)")
+    print("    │   ├── direction_class.tif                     # 方向分类(1-4)")
+    print("    │   └── mean_*.tif                              # 多年平均分解组分")
+    print("    ├── Annual/")
+    print("    │   └── {year}/")
+    print("    │       └── *_contrib_{year}.tif                # 逐年贡献率")
+    print("    └── contribution_statistics.csv                 # 四种方法统计汇总")
+
+
 # ============================================================================
 # 统计汇总CSV生成模块
 # ============================================================================
@@ -2582,20 +3240,82 @@ def save_all_statistics_to_csv(output_dir, mask=None):
     print("=" * 80)
 
 
+def _load_decomposition_data(mask):
+    """
+    加载03c分解结果数据（用于Section 3.4单独运行）
+
+    Parameters:
+    -----------
+    mask : ndarray
+        有效像元掩膜
+
+    Returns:
+    --------
+    response_data : dict or None
+        包含 'TR_window_change' 和 'TR_fixed_window' 的数据字典
+    """
+    years = list(range(YEAR_START, YEAR_END + 1))
+
+    print("\n[加载分解数据] 读取03c固定窗口分解组分...")
+    decomp_vars = ['TR_fixed_window', 'TR_window_change']
+    response_data = {}
+
+    for resp_var in decomp_vars:
+        data_stack = []
+        for year in tqdm(years, desc=f"读取{resp_var}", leave=False):
+            file_path = DECOMP_DIR / f"{resp_var}_{year}.tif"
+            if not file_path.exists():
+                print(f"  ✗ 分解文件不存在: {file_path}")
+                return None
+            data, _, nodata = read_geotiff(file_path)
+            data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan).astype(np.float32))
+        response_data[resp_var] = np.stack(data_stack, axis=0).astype(np.float32)
+
+    print(f"  ✓ 分解数据加载完成: {len(years)}年")
+    return response_data
 
 
 def _run_analysis():
     print("\n" + "=" * 80)
-    print("Fixed-Window Method: Statistical Analysis (Sections 3.2 & 3.3)")
+    print("Fixed-Window Method: Statistical Analysis (Sections 3.2, 3.3 & 3.4)")
     print("=" * 80)
 
     # 检查TIF和CSV文件
     tif_exists = outputs_complete(OUTPUT_DIR)
     csv_exists = csv_outputs_complete(OUTPUT_DIR)
+    sec34_exists = section_3_4_outputs_complete(OUTPUT_DIR)
 
     if RUN_MODE == "skip":
-        if tif_exists and csv_exists:
-            print("  ✓ TIF和CSV输出齐全，跳过 Module 04c")
+        if tif_exists and csv_exists and sec34_exists:
+            print("  ✓ TIF、CSV及贡献率输出齐全，跳过 Module 04c")
+            return
+        elif tif_exists and csv_exists and not sec34_exists:
+            # Section 3.2/3.3已完成，但Section 3.4缺失，只运行Section 3.4
+            print("  ℹ️  Section 3.2/3.3已完成，仅执行Section 3.4贡献率分析")
+            data_first, profile, _ = read_geotiff(TEMPLATE_RASTER)
+            mask_file = MASK_FILE
+            if not mask_file.exists():
+                print(f"  [WARNING] 掩膜文件不存在: {mask_file}")
+                mask = np.ones(data_first.shape, dtype=bool)
+            else:
+                mask_data, _, mask_nodata = read_geotiff(mask_file)
+                mask = _is_valid_value(mask_data, mask_nodata) & (mask_data > 0)
+                print(f"  [OK] 掩膜读取成功，有效像元数: {np.sum(mask)}")
+
+            # 加载03c分解结果用于Section 3.4
+            response_data = _load_decomposition_data(mask)
+            if response_data is None:
+                print("  ✗ 无法加载分解数据，Section 3.4跳过")
+                return
+
+            print("\n" + "=" * 80)
+            try:
+                section_3_4_contribution_analysis(response_data, mask, profile, OUTPUT_DIR,
+                                                   is_detrended=DETREND_ENABLE)
+            except Exception as e:
+                print(f"\n  ✗ Section 3.4 贡献率分析失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
             return
         elif tif_exists and not csv_exists:
             print("  ℹ️  TIF文件已存在，跳过TIF生成，仅生成CSV统计文件")
@@ -2618,6 +3338,19 @@ def _run_analysis():
                 print(f"\n  ⚠️  统计汇总CSV生成失败: {str(e)}")
                 import traceback
                 traceback.print_exc()
+
+            # 如果Section 3.4缺失，也要运行
+            if not sec34_exists:
+                response_data = _load_decomposition_data(mask)
+                if response_data is not None:
+                    print("\n" + "=" * 80)
+                    try:
+                        section_3_4_contribution_analysis(response_data, mask, profile, OUTPUT_DIR,
+                                                           is_detrended=DETREND_ENABLE)
+                    except Exception as e:
+                        print(f"\n  ✗ Section 3.4 贡献率分析失败: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
             return
         else:
             print("  ℹ️  检测到缺失输出，执行完整分析")
@@ -2860,6 +3593,16 @@ def _run_analysis():
         import traceback
         traceback.print_exc()
 
+    # Section 3.4: 贡献率分析
+    print("\n" + "=" * 80)
+    try:
+        section_3_4_contribution_analysis(response_data, mask, profile, OUTPUT_DIR,
+                                           is_detrended=DETREND_ENABLE)
+    except Exception as e:
+        print(f"\n  ✗ Section 3.4 贡献率分析失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
     print("\n" + "="*80)
     print("✓ 统计分析模块执行完成！")
     print(f"输出目录: {OUTPUT_DIR}")
@@ -2888,6 +3631,17 @@ def _run_analysis():
     print("  │       └── TR_fixed_window/")
     print("  │           ├── {var}_trend_slope.tif")
     print("  │           └── {var}_trend_pvalue.tif")
+    print("  └── Section_3.4_Contribution/")
+    print("      ├── Mean/")
+    print("      │   ├── window_contrib_signed.tif    # 带符号窗口贡献率")
+    print("      │   ├── rate_contrib_signed.tif      # 带符号速率贡献率")
+    print("      │   ├── window_contrib_abs.tif       # 绝对窗口贡献率")
+    print("      │   ├── rate_contrib_abs.tif         # 绝对速率贡献率")
+    print("      │   ├── dominant_factor.tif          # 主导因子(1=窗口,2=速率)")
+    print("      │   └── direction_class.tif          # 方向分类(1-4)")
+    print("      ├── Annual/")
+    print("      │   └── {year}/window_contrib_{year}.tif")
+    print("      └── contribution_statistics.csv")
     print("\n核心结果解读：")
     print("  Section 3.2:")
     print("    - Fixed_Trate_slope < 0: 春季提前时，固定窗口内速率降低（符合Wang 2025假设）")
@@ -2896,6 +3650,10 @@ def _run_analysis():
     print("  Section 3.3:")
     print("    - 识别驱动TR_fixed_window变化的主要因子（|R| > 0.1）")
     print("    - 分析驱动因子的时间演变趋势")
+    print("  Section 3.4:")
+    print("    - 窗口变化 vs 速率变化对ΔTRc的贡献率")
+    print("    - 主导因子空间分布")
+    print("    - 同向/异向变化分类统计")
     print("="*80)
 
     # 生成统计汇总CSV文件

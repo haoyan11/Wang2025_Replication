@@ -28,8 +28,9 @@ from _config import (
     ROOT, LAT_MIN, FOREST_CLASSES, NODATA_OUT,
     USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, PHENO_DIR,
     YEAR_START, YEAR_END, PHENO_FILE_FORMAT,
-    GPP_DAILY_DIR, SM_DAILY_DIR, TR_FILE_FORMAT, get_TR_file_path,
-    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path, OUTPUT_ROOT
+    NDVI_DAILY_DIR, SM_DAILY_DIR, TR_FILE_FORMAT, get_TR_file_path,
+    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path, OUTPUT_ROOT,
+    NDVI_DAILY_FORMAT  # NDVI日尺度文件命名格式
 )
 
 # 运行开关
@@ -272,7 +273,7 @@ def fast_grid_consistency_check(template_profile):
     快速一致性检查（fail-fast）：
     mask/SOS/POS/GPP/SM/土地覆盖 与模板网格一致性
     """
-    global GPP_DAILY_DIR
+    global NDVI_DAILY_DIR
     global SM_DAILY_DIR
     global TR_DAILY_DIR
     global PHENO_AUTO_FIXED
@@ -319,26 +320,26 @@ def fast_grid_consistency_check(template_profile):
     if PHENO_AUTO_FIXED or (pheno_checked and pheno_all_match):
         print("  ⚠ 物候已一致/修正，按统一auto-fix流程跳过重投影/掩膜步骤")
 
-    # GPP日尺度样本
-    gpp_dates = [datetime(1982, 1, 15), datetime(2000, 7, 1), datetime(2018, 10, 1)]
-    gpp_sample = None
-    for date_obj in gpp_dates:
-        cand = GPP_DAILY_DIR / f"GPP_{date_obj.strftime('%Y%m%d')}.tif"
+    # NDVI日尺度样本
+    ndvi_dates = [datetime(1982, 1, 15), datetime(2000, 7, 1), datetime(2018, 10, 1)]
+    ndvi_sample = None
+    for date_obj in ndvi_dates:
+        cand = NDVI_DAILY_DIR / NDVI_DAILY_FORMAT.format(date=date_obj.strftime('%Y%m%d'))
         if cand.exists():
-            gpp_sample = cand
+            ndvi_sample = cand
             break
-    if gpp_sample is None:
-        print("  ⚠ 未找到GPP样本，跳过一致性检查")
+    if ndvi_sample is None:
+        print("  ⚠ 未找到NDVI样本，跳过一致性检查")
     else:
-        prev_dir = GPP_DAILY_DIR
-        fixed_dir, gpp_sample = _auto_fix_dataset(
-            gpp_sample, GPP_DAILY_DIR, "GPP_*.tif", template_profile, "GPP日尺度"
+        prev_dir = NDVI_DAILY_DIR
+        fixed_dir, ndvi_sample = _auto_fix_dataset(
+            ndvi_sample, NDVI_DAILY_DIR, "NDVI_*.tif", template_profile, "NDVI日尺度"
         )
-        if fixed_dir != GPP_DAILY_DIR:
-            GPP_DAILY_DIR = fixed_dir
-            print(f"  ⚠ 已切换GPP_DAILY_DIR到: {GPP_DAILY_DIR}")
+        if fixed_dir != NDVI_DAILY_DIR:
+            NDVI_DAILY_DIR = fixed_dir
+            print(f"  ⚠ 已切换NDVI_DAILY_DIR到: {NDVI_DAILY_DIR}")
             if not AUTO_REPROJECT_INPLACE:
-                print(f"  ⚠ 请同步更新 _config.py 中的 GPP_DAILY_DIR: {prev_dir} -> {GPP_DAILY_DIR}")
+                print(f"  ⚠ 请同步更新 _config.py 中的 NDVI_DAILY_DIR: {prev_dir} -> {NDVI_DAILY_DIR}")
 
     # TR日尺度样本
     tr_sample = _find_first_tr_file()
@@ -576,16 +577,16 @@ def _find_first_tr_file():
     return None
 
 
-def _find_first_gpp_file():
+def _find_first_ndvi_file():
     # 从YEAR_START年起，寻找最早可用的GPP日文件
     for day_offset in range(0, 31):
         date_obj = datetime(YEAR_START, 1, 1) + timedelta(days=day_offset)
-        cand = GPP_DAILY_DIR / f"GPP_{date_obj.strftime('%Y%m%d')}.tif"
+        cand = NDVI_DAILY_DIR / NDVI_DAILY_FORMAT.format(date=date_obj.strftime('%Y%m%d'))
         if cand.exists():
             return cand
-        gpp_file = get_GPP_file_path(date_obj, daily=True)
-        if gpp_file and gpp_file.exists():
-            return gpp_file
+        ndvi_file = get_GPP_file_path(date_obj, daily=True)
+        if ndvi_file and ndvi_file.exists():
+            return ndvi_file
     return None
 
 
@@ -620,12 +621,12 @@ def _apply_data_intersection_mask(combined_mask, template_profile):
     sos_file = PHENO_DIR / PHENO_FILE_FORMAT["SOS"].format(year=YEAR_START)
     pos_file = PHENO_DIR / PHENO_FILE_FORMAT["POS"].format(year=YEAR_START)
     tr_file = _find_first_tr_file()
-    gpp_file = _find_first_gpp_file()
+    ndvi_file = _find_first_ndvi_file()
 
     if tr_file is None:
         raise FileNotFoundError("未找到可用TR日尺度文件用于掩膜交集")
-    if gpp_file is None:
-        raise FileNotFoundError("未找到可用GPP日尺度文件用于掩膜交集")
+    if ndvi_file is None:
+        raise FileNotFoundError("未找到可用NDVI日尺度文件用于掩膜交集")
     if not sos_file.exists():
         raise FileNotFoundError(f"未找到SOS文件: {sos_file}")
     if not pos_file.exists():
@@ -637,11 +638,11 @@ def _apply_data_intersection_mask(combined_mask, template_profile):
                                       value_range=(1, 365))
     tr_valid = _valid_mask_from_file(tr_file, template_profile, "TR",
                                      non_negative=True)
-    gpp_valid = _valid_mask_from_file(gpp_file, template_profile, "GPP",
+    ndvi_valid = _valid_mask_from_file(ndvi_file, template_profile, "GPP",
                                       non_negative=True)
 
     before = np.sum(combined_mask)
-    combined_mask = combined_mask & sos_valid & pos_valid & tr_valid & gpp_valid
+    combined_mask = combined_mask & sos_valid & pos_valid & tr_valid & ndvi_valid
     after = np.sum(combined_mask)
     print(f"  数据交集: {before} -> {after} (移除 {before - after})")
     return combined_mask
@@ -687,7 +688,7 @@ def check_data_availability(years=[2000, 2010, 2018]):
             results['pheno']['missing'] += 1
 
     # 检查TR数据（抽样检查每年1月15日）
-    print("\n  TR数据 (每年1月15日抽样 - ERA5-Land):")
+    print("\n  TR数据 (每年1月15日抽样 - GLEAM):")
     for year in years:
         test_date = datetime(year, 1, 15)
         tr_file = get_TR_file_path(test_date)
@@ -764,7 +765,7 @@ def check_phenology_data():
 
 def check_TR_data():
     """检查TR数据（抽样检查）"""
-    print("\n[3] 检查TR数据 (ERA5-Land格式，抽样检查):")
+    print("\n[3] 检查TR数据 (GLEAM格式，抽样检查):")
 
     test_years = [1982, 1990, 2000, 2010, 2018]
     available = 0
@@ -788,9 +789,9 @@ def check_TR_data():
     return False
 
 
-def check_GPP_data():
-    """检查GPP数据（抽样检查）"""
-    print("\n[4] 检查GPP数据 (日尺度，抽样检查):")
+def check_NDVI_data():
+    """检查NDVI数据（抽样检查）"""
+    print("\n[4] 检查NDVI数据 (日尺度，抽样检查):")
 
     test_dates = [
         datetime(1982, 1, 1),
@@ -800,13 +801,13 @@ def check_GPP_data():
 
     available = 0
     for test_date in test_dates:
-        gpp_file = GPP_DAILY_DIR / f"GPP_{test_date.strftime('%Y%m%d')}.tif"
+        ndvi_file = NDVI_DAILY_DIR / NDVI_DAILY_FORMAT.format(date=test_date.strftime('%Y%m%d'))
 
-        if gpp_file.exists():
-            print(f"  ✓ {test_date.date()}: {gpp_file.name}")
+        if ndvi_file.exists():
+            print(f"  ✓ {test_date.date()}: {ndvi_file.name}")
             available += 1
         else:
-            print(f"  ✗ {test_date.date()}: {gpp_file.name}")
+            print(f"  ✗ {test_date.date()}: {ndvi_file.name}")
 
     if available == len(test_dates):
         print(f"  ✓ 抽样检查通过 ({available}/{len(test_dates)})")
@@ -856,7 +857,7 @@ def run_data_verification():
     all_checks.append(check_directory(ROOT, "根目录"))
     all_checks.append(check_directory(TR_DAILY_DIR, "TR数据目录"))
     all_checks.append(check_directory(PHENO_DIR, "物候数据目录"))
-    all_checks.append(check_directory(GPP_DAILY_DIR, "GPP数据目录"))
+    all_checks.append(check_directory(NDVI_DAILY_DIR, "NDVI数据目录"))
     all_checks.append(check_directory(SM_DAILY_DIR, "土壤水分目录"))
 
     print(f"\n  土地覆盖数据 (USE_FOREST_MASK={USE_FOREST_MASK}):")
@@ -867,7 +868,7 @@ def run_data_verification():
 
     all_checks.append(check_phenology_data())
     all_checks.append(check_TR_data())
-    all_checks.append(check_GPP_data())
+    all_checks.append(check_NDVI_data())
     all_checks.append(check_SM_data())
 
     print("\n" + "=" * 70)

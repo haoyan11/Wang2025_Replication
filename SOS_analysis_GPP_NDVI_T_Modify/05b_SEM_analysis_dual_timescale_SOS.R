@@ -20,7 +20,7 @@
 # 1. TRproduct → Fixed_Trate（数据源：TR_fixed_window_{year}.tif，临时计算）
 # 2. Fixed_Trate = TR_fixed_window / Fixed_Window_Length（与04c一致）
 # 3. 生长季气候：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
-# 4. 生长季GPP：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
+# 4. 生长季NDVI：当年SOS-POS窗口 → 多年平均固定窗口[SOSav, POSav]
 # 5. 季前气候：保持不变（基于SOSav前3个月）
 #
 # Version: 2.0.1 (Bug Fix 5)
@@ -101,8 +101,8 @@ if (.Platform$OS.type == "windows") {
 }
 
 # 自动生成的路径
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS_GPP_Modify")
-PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
+OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS_GPP_NDVI_GLEAM")
+PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "NDVI_phenology")
 # ===【修改1】Fixed_Trate数据源（04c固定窗口方法）===
 # 原路径: Decomposition/TRproduct_{year}.tif（03a模块输出）
 # 新路径: Decomposition_FixedWindow/TR_fixed_window_{year}.tif（03c模块输出）
@@ -112,7 +112,7 @@ MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
 TEMPLATE_FILE <- file.path(OUTPUT_ROOT, "masks", "template_grid.tif")
 
 # 日尺度数据路径
-GPP_DAILY_DIR <- file.path(ROOT, "GLASS_GPP", "GLASS_GPP_daily_interpolated")
+GPP_DAILY_DIR <- file.path(ROOT, "GIMMS_NDVI", "GIMMS_NDVI_daily_interpolated")
 PRECIP_DAILY_DIR <- file.path(ROOT, "Meteorological Data", "ERA5_Land", "Pre", "Pre_Daily", "Pre_Daily_2")
 TA_DAILY_DIR <- file.path(ROOT, "Meteorological Data", "ERA5_Land", "Tem", "Tem_Daily", "Tem_Daily_2")
 SW_DAILY_DIR <- file.path(ROOT, "Meteorological Data", "ERA5_Land", "DSW", "DSW_Daily", "DSW_Daily_2")
@@ -224,8 +224,13 @@ PIXELWISE_BOOTSTRAP_ENABLE <- TRUE   # 像元系数均值 bootstrap CI
 PIXELWISE_BOOTSTRAP_N <- 800         # bootstrap次数（像元均值）
 PIXELWISE_BOOTSTRAP_SEED <- 202501   # bootstrap随机种子
 
+# ==================== 输出文件名配置（与Python _config.py对应） ====================
+# 修改此处可全局更改输出文件名中的"GPP"为"NDVI"
+MIDDLE_VAR_NAME <- "NDVI"  # 可选: "GPP" 或 "NDVI"
+FIXED_RATE_PATTERN <- sprintf("Fixed_%srate_%%d.tif", MIDDLE_VAR_NAME)  # Fixed_NDVIrate_%d.tif
+
 # 日尺度文件命名模式
-GPP_DAILY_PATTERN <- "GPP_{date}.tif"
+GPP_DAILY_PATTERN <- "NDVI_{date}.tif"
 PRECIP_DAILY_PATTERN <- "ERA5L_PrecipDaily_mm_{date}.tif"
 TA_DAILY_PATTERN <- "ERA5L_T2mDaily_C_{date}.tif"
 SW_DAILY_PATTERN <- "ERA5L_SWDaily_MJ_{date}.tif"
@@ -598,8 +603,8 @@ check_raster_alignment <- function(template_r, mask_r, year) {
   sample_files <- list(
     list(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)), "TR_fixed_window"),
     list(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "Fixed_Window_Length"),
-    list(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year)), "SOS"),
-    list(file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year)), "POS")
+    list(file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year)), "SOS"),
+    list(file.path(PHENO_DIR, sprintf("pos_doy_ndvi_%d.tif", year)), "POS")
   )
 
   for (item in sample_files) {
@@ -918,7 +923,7 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
   }
 
   # 读取当年物候数据（用于SEM中的SOS变量）
-  sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
+  sos_file <- file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year))
 
   if (!file.exists(sos_file)) {
     cat(sprintf("  跳过: SOS文件不存在\n"))
@@ -1007,7 +1012,7 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
 
   # ===【修改3b】计算固定窗口生长季气候因子 =====
   cat("  [2/7] 生长季气候因子（固定窗口[SOSav, POSav]）:\n")
-  cat("  [3/7] 生长季GPP（固定窗口[SOSav, POSav]）:\n")
+  cat("  [3/7] 生长季NDVI（固定窗口[SOSav, POSav]）:\n")
 
   # ===【并行化优化】生长季4个变量并行计算===
   if (parallel_inner && PARALLEL_CORES > 1) {
@@ -1062,7 +1067,7 @@ prepare_dual_timescale_data <- function(year, sos_climatology_r, pos_climatology
   }
 
   # ===【关键修改】从DECOMP_DIR读取03c生成的Fixed_GPPrate（而非重新计算）===
-  fixed_gpprate_file <- file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year))
+  fixed_gpprate_file <- file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year))
   if (!file.exists(fixed_gpprate_file)) {
     cat(sprintf("  警告: Fixed_GPPrate文件不存在 (%s)，将返回NULL\n", basename(fixed_gpprate_file)))
     return(NULL)
@@ -1108,7 +1113,8 @@ prepare_sem_caches <- function(years, sos_climatology_r, pos_climatology_r,
         "GPP_DAILY_DIR", "GPP_DAILY_PATTERN",
         "PRECIP_DAILY_DIR", "PRECIP_DAILY_PATTERN",
         "TA_DAILY_DIR", "TA_DAILY_PATTERN",
-        "SW_DAILY_DIR", "SW_DAILY_PATTERN"),
+        "SW_DAILY_DIR", "SW_DAILY_PATTERN",
+        "MIDDLE_VAR_NAME", "FIXED_RATE_PATTERN"),
       envir = environment()
     )
     res_list <- parLapply(cl, years, function(year) {
@@ -1201,8 +1207,8 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
   # 构建文件列表
   files <- list(
     TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),  # 修改：TRc → TR_fixed_window
-    SOS = file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", years)),
-    Fixed_GPPrate = file.path(DERIVED_DIR, sprintf("Fixed_GPPrate_%d.tif", years)),
+    SOS = file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", years)),
+    Fixed_GPPrate = file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, years)),  # 修复：从DECOMP_DIR读取03c生成的文件
     P_pre = file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", years)),
     T_pre = file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", years)),
     SW_pre = file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", years)),
@@ -1326,7 +1332,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     sos_block <- t(getValues(stacks$SOS, row = row, nrows = nrows))
     sos_block <- sanitize_values(sos_block, na_values$SOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$Fixed_GPPrate, row = row, nrows = nrows))
-    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = FALSE)
+    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = TRUE)  # Fixed_NDVIrate是异常值，可以为负
     p_pre_block <- t(getValues(stacks$P_pre, row = row, nrows = nrows))
     p_pre_block <- sanitize_values(p_pre_block, na_values$P_pre, allow_negative = FALSE)
     t_pre_block <- t(getValues(stacks$T_pre, row = row, nrows = nrows))
@@ -1790,8 +1796,8 @@ run_dual_timescale_sem <- function(years, mask_r) {
   n_loaded_pos <- 0
 
   for (year in years) {
-    sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
-    pos_file <- file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year))
+    sos_file <- file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year))
+    pos_file <- file.path(PHENO_DIR, sprintf("pos_doy_ndvi_%d.tif", year))
 
     if (file.exists(sos_file)) {
       sos_r <- raster(sos_file)
@@ -1924,7 +1930,8 @@ run_dual_timescale_sem <- function(years, mask_r) {
         "GPP_DAILY_DIR", "GPP_DAILY_PATTERN",
         "PRECIP_DAILY_DIR", "PRECIP_DAILY_PATTERN",
         "TA_DAILY_DIR", "TA_DAILY_PATTERN",
-        "SW_DAILY_DIR", "SW_DAILY_PATTERN"),
+        "SW_DAILY_DIR", "SW_DAILY_PATTERN",
+        "MIDDLE_VAR_NAME", "FIXED_RATE_PATTERN"),
       envir = environment()
     )
     res_list <- parLapply(cl, years, function(year) {
@@ -2489,7 +2496,7 @@ main <- function() {
   cat("\n[测试读取日尺度文件]\n")
   test_dates <- c("19820301", "19820701", "19821001")
   for (date_str in test_dates) {
-    test_gpp_file <- file.path(GPP_DAILY_DIR, sprintf("GPP_%s.tif", date_str))
+    test_gpp_file <- file.path(GPP_DAILY_DIR, gsub("\\{date\\}", date_str, GPP_DAILY_PATTERN))
     cat(sprintf("  测试文件: %s\n", basename(test_gpp_file)))
     cat(sprintf("  文件存在: %s\n", ifelse(file.exists(test_gpp_file), "是", "否")))
 
@@ -2613,8 +2620,8 @@ main <- function() {
       n_loaded_pos <- 0
 
       for (year in years) {
-        sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
-        pos_file <- file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year))
+        sos_file <- file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year))
+        pos_file <- file.path(PHENO_DIR, sprintf("pos_doy_ndvi_%d.tif", year))
 
         if (file.exists(sos_file)) {
           sos_r <- raster(sos_file)

@@ -77,7 +77,7 @@ if (.Platform$OS.type == "windows") {
   }
 }
 
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis")
+OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS")
 PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
 DECOMP_DIR <- file.path(OUTPUT_ROOT, "Decomposition_FixedWindow")
 MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")

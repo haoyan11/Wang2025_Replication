@@ -60,7 +60,7 @@ else:
     OUTPUT_PHENO_DIR = PHENO_DIR.parent / f"{PHENO_DIR_NAME}_EPSG4326"
 
 # 输出目录
-OUTPUT_DIR = ROOT / "Wang2025_Analysis" / "masks"
+OUTPUT_DIR = ROOT / "Wang2025_Analysis_SOS" / "masks"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 交集掩膜配置（按首个有效文件做交集）

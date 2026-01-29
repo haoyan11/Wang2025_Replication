@@ -1202,7 +1202,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
   files <- list(
     TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),  # 修改：TRc → TR_fixed_window
     SOS = file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", years)),
-    Fixed_GPPrate = file.path(DERIVED_DIR, sprintf("Fixed_GPPrate_%d.tif", years)),
+    Fixed_GPPrate = file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", years)),  # 修复：从DECOMP_DIR读取（03c生成）
     P_pre = file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", years)),
     T_pre = file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", years)),
     SW_pre = file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", years)),
@@ -1326,7 +1326,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     sos_block <- t(getValues(stacks$SOS, row = row, nrows = nrows))
     sos_block <- sanitize_values(sos_block, na_values$SOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$Fixed_GPPrate, row = row, nrows = nrows))
-    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = FALSE)
+    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = TRUE)  # Fixed_GPPrate是异常值，可以为负
     p_pre_block <- t(getValues(stacks$P_pre, row = row, nrows = nrows))
     p_pre_block <- sanitize_values(p_pre_block, na_values$P_pre, allow_negative = FALSE)
     t_pre_block <- t(getValues(stacks$T_pre, row = row, nrows = nrows))

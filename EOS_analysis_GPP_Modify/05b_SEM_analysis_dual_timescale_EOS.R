@@ -1193,7 +1193,7 @@ run_sem_pixel_time_series <- function(years, sos_climatology_r, fixed_window_len
     eos_block <- t(getValues(stacks$EOS, row = row, nrows = nrows))
     eos_block <- sanitize_values(eos_block, na_values$EOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$Fixed_GPPrate, row = row, nrows = nrows))
-    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = FALSE)
+    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = TRUE)  # Fixed_GPPrate是异常值，可以为负
     p_pre_block <- t(getValues(stacks$P_pre, row = row, nrows = nrows))
     p_pre_block <- sanitize_values(p_pre_block, na_values$P_pre, allow_negative = FALSE)
     t_pre_block <- t(getValues(stacks$T_pre, row = row, nrows = nrows))

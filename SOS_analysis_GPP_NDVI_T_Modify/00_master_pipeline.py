@@ -13,6 +13,9 @@ from pathlib import Path
 from datetime import datetime
 import logging
 
+# 从配置文件导入输出根目录
+from _config import OUTPUT_ROOT
+
 # ==================== 配置 ====================
 # R环境路径（如果Rscript不在PATH中，请设置完整路径）
 RSCRIPT_PATH = r"D:\R\R-4.4.1\bin\x64\Rscript.exe"  # R 4.4.1 x64
@@ -20,7 +23,7 @@ LIVE_OUTPUT = True  # True时实时输出子进程日志
 DEFAULT_RUN_MODE = "skip"  # skip: 文件存在则跳过; overwrite: 覆盖重算
 
 # ==================== 配置日志 ====================
-LOG_DIR = Path(r"I:\F\Data4\Wang2025_Analysis_SOS_GPP_Modify\Logs")
+LOG_DIR = OUTPUT_ROOT / "Logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

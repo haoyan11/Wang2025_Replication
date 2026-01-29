@@ -64,7 +64,9 @@ from _config import (
     ROOT, OUTPUT_ROOT, PHENO_DIR, TRC_ANNUAL_DIR, DECOMPOSITION_FIXED_DIR,
     GPP_DAILY_DIR, CLIMATOLOGY_DIR, STATISTICAL_FIXED_DIR,
     YEAR_START, YEAR_END, NODATA_OUT, PHENO_FILE_FORMAT, get_GPP_file_path,
-    TEMPLATE_RASTER, MASK_FILE
+    TEMPLATE_RASTER, MASK_FILE,
+    OUTPUT_DECOMP_FORMAT, OUTPUT_CACHE_FORMAT,  # 输出文件名格式
+    MIDDLE_VAR_NAME  # 中间变量名称（NDVI/GPP）
 )
 
 # 确保输出目录存在
@@ -149,7 +151,7 @@ FILTER_PARTIAL_P_INVALID = True
 MAX_IO_WORKERS = 10  # 固定10核
 
 # 2. 缓存配置（辅助方案）
-#    - LSP/GPP计算需要读取大量小文件（每年数百个日尺度文件）
+#    - LSP/{MIDDLE_VAR_NAME}计算需要读取大量小文件（每年数百个日尺度文件）
 #    - 启用缓存可显著加速重复运行（首次运行会慢，后续快）
 #
 # 注意事项：
@@ -157,7 +159,7 @@ MAX_IO_WORKERS = 10  # 固定10核
 #   - 如果输入数据更新，需手动删除缓存目录
 #   - 缓存文件较大（每个变量/年约几MB），注意磁盘空间
 USE_LSP_CACHE = True    # 启用LSP期间气象变量均值缓存（推荐开启）
-USE_GPP_CACHE = True    # 启用季节GPP均值缓存（推荐开启）
+USE_GPP_CACHE = True    # 启用季节{MIDDLE_VAR_NAME}均值缓存（推荐开启）
 CACHE_DIR = ANALYSIS_DIR / "Statistical_Analysis_FixedWindow" / "Cache"
 if USE_LSP_CACHE or USE_GPP_CACHE:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -231,7 +233,7 @@ def _has_daily_files(var_name, year):
 
 @lru_cache(maxsize=None)
 def _has_gpp_files(year):
-    """快速检测某年日尺度GPP文件是否存在"""
+    """快速检测某年日尺度{MIDDLE_VAR_NAME}文件是否存在"""
     for doy in (90, 120, 180, 220):
         date_obj = noleap_doy_to_date(year, doy)
         if date_obj is None:
@@ -1332,8 +1334,8 @@ def calculate_vif(X):
     return vif
 
 def calculate_seasonal_gpp(year, season='spring'):
-    """
-    计算季节平均GPP（从日GPP数据）
+    f"""
+    计算季节平均{MIDDLE_VAR_NAME}（从日{MIDDLE_VAR_NAME}数据）
 
     优化策略：多线程并行读取日文件，显著加速I/O
 
@@ -1347,11 +1349,11 @@ def calculate_seasonal_gpp(year, season='spring'):
     Returns:
     --------
     sif_seasonal : ndarray
-        季节平均GPP (H, W)
+        季节平均{MIDDLE_VAR_NAME} (H, W)
     """
     # 缓存检查（可选优化）
     if USE_GPP_CACHE:
-        cache_file = CACHE_DIR / f"GPP_{season}_{year}.tif"
+        cache_file = CACHE_DIR / OUTPUT_CACHE_FORMAT['season'].format(season=season, year=year)
         if use_cache(cache_file):
             data, _, _ = read_geotiff(cache_file)
             return data
@@ -1409,7 +1411,7 @@ def calculate_seasonal_gpp(year, season='spring'):
 
     # 保存缓存（可选优化）
     if USE_GPP_CACHE and profile_template is not None:
-        cache_file = CACHE_DIR / f"GPP_{season}_{year}.tif"
+        cache_file = CACHE_DIR / OUTPUT_CACHE_FORMAT['season'].format(season=season, year=year)
         if should_write(cache_file):
             write_geotiff(cache_file, gpp_seasonal, profile_template)
 
@@ -1417,12 +1419,12 @@ def calculate_seasonal_gpp(year, season='spring'):
 
 
 def calculate_gpp_lsp_average(year, sos_map, pos_map, cache_tag="fixed"):
-    """
-    计算GPP在LSP窗口内的平均值（基于日尺度GPP）
+    f"""
+    计算{MIDDLE_VAR_NAME}在LSP窗口内的平均值（基于日尺度{MIDDLE_VAR_NAME}）
     cache_tag: 用于区分不同窗口类型的缓存文件名
     """
     if USE_GPP_CACHE:
-        cache_file = CACHE_DIR / f"GPP_LSP_{cache_tag}_{year}.tif"
+        cache_file = CACHE_DIR / OUTPUT_CACHE_FORMAT['lsp'].format(tag=cache_tag, year=year)
         if use_cache(cache_file):
             data, _, _ = read_geotiff(cache_file)
             return data
@@ -1497,7 +1499,7 @@ def calculate_gpp_lsp_average(year, sos_map, pos_map, cache_tag="fixed"):
     gpp_avg[valid_cnt] = total_sum[valid_cnt] / total_cnt[valid_cnt]
 
     if USE_GPP_CACHE and profile_template is not None:
-        cache_file = CACHE_DIR / f"GPP_LSP_{cache_tag}_{year}.tif"
+        cache_file = CACHE_DIR / OUTPUT_CACHE_FORMAT['lsp'].format(tag=cache_tag, year=year)
         if should_write(cache_file):
             write_geotiff(cache_file, gpp_avg, profile_template)
 
@@ -1663,7 +1665,7 @@ def section_3_3_driver_analysis(mask):
     # 定义变量（Wang 2025 Eq. 3）
     # 统一因变量：移除TR_fixed_window（固定窗口累积差异），仅保留TRc和Fixed_Trate（固定窗口速率异常）
     response_vars = ['TRc', 'Fixed_Trate']
-    # 注意：Fixed_GPPrate 是GPP固定窗口速率异常（GPP_anomaly），单位为gC/m²/day
+    # 注意：Fixed_GPPrate 是{MIDDLE_VAR_NAME}固定窗口速率异常，单位为gC/m²/day（或NDVI单位）
     predictor_vars = ['SOS', 'Ta', 'Rs', 'P', 'Fixed_GPPrate']
     available_vars = []
     missing_vars = []
@@ -1672,7 +1674,7 @@ def section_3_3_driver_analysis(mask):
             available_vars.append(var)
             continue
         if var == 'Fixed_GPPrate':
-            # Fixed_GPPrate将从Section 3.2计算的结果中获取（GPP_fixed_window / Fixed_Window_Length）
+            # Fixed_GPPrate将从Section 3.2计算的结果中获取（{MIDDLE_VAR_NAME}_fixed_window / Fixed_Window_Length）
             if _has_gpp_files(years[0]) or _has_gpp_files(years[-1]):
                 available_vars.append(var)
             else:
@@ -1751,14 +1753,14 @@ def section_3_3_driver_analysis(mask):
             lsp_avg_fixed = calculate_lsp_period_average(var, year, sos_climatology, pos_climatology, cache_tag="fixed")
             X_all_years_fixed[var].append(lsp_avg_fixed)
 
-        # Fixed_GPPrate（GPP固定窗口速率异常，两套相同）
+        # Fixed_GPPrate（{MIDDLE_VAR_NAME}固定窗口速率异常，两套相同）
         if 'Fixed_GPPrate' in predictor_vars:
-            # 读取GPP_fixed_window（从Section 3.1的分解结果）
-            gpp_fixed_window_file = DECOMP_DIR / f"GPP_fixed_window_{year}.tif"
+            # 读取{MIDDLE_VAR_NAME}_fixed_window（从Section 3.1的分解结果）
+            gpp_fixed_window_file = DECOMP_DIR / OUTPUT_DECOMP_FORMAT['fixed_window'].format(year=year)
             if gpp_fixed_window_file.exists():
                 gpp_fw, _, nodata_gpp = read_geotiff(gpp_fixed_window_file)
                 gpp_fw_valid = np.where(_is_valid_value(gpp_fw, nodata_gpp), gpp_fw, np.nan)
-                # 计算Fixed_GPPrate = GPP_fixed_window / Fixed_Window_Length
+                # 计算Fixed_GPPrate = {MIDDLE_VAR_NAME}_fixed_window / Fixed_Window_Length
                 fixed_gpprate = np.full((height, width), np.nan, dtype=np.float32)
                 valid_gpprate = np.isfinite(gpp_fw_valid) & np.isfinite(fixed_window_length) & (fixed_window_length > 0)
                 fixed_gpprate[valid_gpprate] = gpp_fw_valid[valid_gpprate] / fixed_window_length[valid_gpprate]
@@ -2169,7 +2171,7 @@ def generate_section_3_2_summary(output_dir, mask=None):
     """
     print("\n[生成统计汇总] Section 3.2: Phenology Impact Analysis...")
 
-    # 响应变量列表（TR变量 + GPP变量）
+    # 响应变量列表（TR变量 + {MIDDLE_VAR_NAME}变量）
     response_vars = [
         'TRc',
         'TR_fixed_window',
@@ -2178,10 +2180,10 @@ def generate_section_3_2_summary(output_dir, mask=None):
         'TR_sos_change',
         'TR_pos_change',
         'Trate',
-        'GPP_fixed_window',
-        'GPP_window_change',
-        'GPP_sos_change',
-        'GPP_pos_change',
+        f'{MIDDLE_VAR_NAME}_fixed_window',
+        f'{MIDDLE_VAR_NAME}_window_change',
+        f'{MIDDLE_VAR_NAME}_sos_change',
+        f'{MIDDLE_VAR_NAME}_pos_change',
         'Fixed_GPPrate'
     ]
 
@@ -2533,10 +2535,10 @@ def save_all_statistics_to_csv(output_dir, mask=None):
     print("\n[生成综合汇总] Fixed Window Analysis Summary...")
     summary_rows = []
 
-    # 从Section 3.2提取核心指标（TR变量 + GPP变量）
+    # 从Section 3.2提取核心指标（TR变量 + {MIDDLE_VAR_NAME}变量）
     if section_3_2_dir.exists():
         key_metrics = ['Fixed_Trate', 'TR_fixed_window', 'TR_window_change',
-                       'Fixed_GPPrate', 'GPP_fixed_window', 'GPP_window_change']
+                       'Fixed_GPPrate', f'{MIDDLE_VAR_NAME}_fixed_window', f'{MIDDLE_VAR_NAME}_window_change']
         for metric in key_metrics:
             slope_file = section_3_2_dir / f"{metric}_vs_deltaSOS_slope.tif"
             if slope_file.exists():
@@ -2563,7 +2565,7 @@ def save_all_statistics_to_csv(output_dir, mask=None):
         resp_var = 'Fixed_Trate'
         resp_dir = section_3_3_full_dir / resp_var
         if resp_dir.exists():
-            for pred_var in ['SOS', 'Ta', 'Fixed_GPPrate']:
+            for pred_var in ['SOS', 'Ta', f'Fixed_{MIDDLE_VAR_NAME}rate']:
                 partial_r_file = resp_dir / f"partial_r_{pred_var}.tif"
                 if partial_r_file.exists():
                     with rasterio.open(partial_r_file) as src:
@@ -2718,13 +2720,19 @@ def _run_analysis():
     trc_stack = np.stack(trc_stack, axis=0).astype(np.float32)
     response_data['TRc'] = trc_stack
 
-    # 读取GPP分解组分
-    print("\n  读取 GPP分解组分...")
-    gpp_decomp_vars = ['GPP_fixed_window', 'GPP_window_change', 'GPP_sos_change', 'GPP_pos_change']
-    for resp_var in gpp_decomp_vars:
+    # 读取{MIDDLE_VAR_NAME}分解组分
+    print(f"\n  读取 {MIDDLE_VAR_NAME}分解组分...")
+    # 变量名到OUTPUT_DECOMP_FORMAT键的映射
+    gpp_decomp_mapping = {
+        f'{MIDDLE_VAR_NAME}_fixed_window': 'fixed_window',
+        f'{MIDDLE_VAR_NAME}_window_change': 'window_change',
+        f'{MIDDLE_VAR_NAME}_sos_change': 'sos_change',
+        f'{MIDDLE_VAR_NAME}_pos_change': 'pos_change'
+    }
+    for resp_var, format_key in gpp_decomp_mapping.items():
         data_stack = []
         for year in tqdm(years, desc=f"读取{resp_var}", leave=False):
-            gpp_file = DECOMP_DIR / f"{resp_var}_{year}.tif"
+            gpp_file = DECOMP_DIR / OUTPUT_DECOMP_FORMAT[format_key].format(year=year)
             if gpp_file.exists():
                 data, _, nodata = read_geotiff(gpp_file)
                 data_stack.append(np.where(_is_valid_value(data, nodata), data, np.nan).astype(np.float32))
@@ -2753,22 +2761,22 @@ def _run_analysis():
 
     response_data['Fixed_Trate'] = fixed_trate_stack
 
-    # 4a2. GPP固定窗口速率（核心指标）
-    print("\n  计算 Fixed_GPPrate = GPP_fixed_window / Fixed_Window_Length（GPP固定窗口）...")
-    fixed_gpprate_stack = np.full_like(response_data['GPP_fixed_window'], np.nan, dtype=np.float32)
+    # 4a2. {MIDDLE_VAR_NAME}固定窗口速率（核心指标）
+    print(f"\n  计算 Fixed_{MIDDLE_VAR_NAME}rate = {MIDDLE_VAR_NAME}_fixed_window / Fixed_Window_Length...")
+    fixed_gpprate_stack = np.full_like(response_data[f'{MIDDLE_VAR_NAME}_fixed_window'], np.nan, dtype=np.float32)
 
     for i in range(n_years):
         valid_gpprate = (
-            np.isfinite(response_data['GPP_fixed_window'][i]) &
+            np.isfinite(response_data[f'{MIDDLE_VAR_NAME}_fixed_window'][i]) &
             np.isfinite(fixed_window_length) &
             (fixed_window_length > 0)
         )
         fixed_gpprate_stack[i, valid_gpprate] = (
-            response_data['GPP_fixed_window'][i, valid_gpprate] /
+            response_data[f'{MIDDLE_VAR_NAME}_fixed_window'][i, valid_gpprate] /
             fixed_window_length[valid_gpprate]
         )
 
-    response_data['Fixed_GPPrate'] = fixed_gpprate_stack
+    response_data[f'Fixed_{MIDDLE_VAR_NAME}rate'] = fixed_gpprate_stack
 
     # 4b. 变化窗口速率（用于对比）
     print("\n  计算 Trate = TRc / GLS（变化窗口，用于对比）...")
@@ -2810,10 +2818,10 @@ def _run_analysis():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 完整的响应变量列表（按重要性排序）
-    # TR变量 + GPP变量
+    # TR变量 + {MIDDLE_VAR_NAME}变量
     all_response_vars = [
         'TRc', 'TR_fixed_window', 'TR_window_change', 'TR_sos_change', 'TR_pos_change', 'Fixed_Trate', 'Trate',
-        'GPP_fixed_window', 'GPP_window_change', 'GPP_sos_change', 'GPP_pos_change', 'Fixed_GPPrate'
+        f'{MIDDLE_VAR_NAME}_fixed_window', f'{MIDDLE_VAR_NAME}_window_change', f'{MIDDLE_VAR_NAME}_sos_change', f'{MIDDLE_VAR_NAME}_pos_change', f'Fixed_{MIDDLE_VAR_NAME}rate'
     ]
 
     for resp_var in all_response_vars:
@@ -2827,10 +2835,10 @@ def _run_analysis():
         slope_threshold = 10.0  # TR_fixed_window/TR_window_change等的合理范围
         if resp_var in ['Fixed_Trate', 'Trate']:
             slope_threshold = 1.0  # 速率变量的斜率范围更小
-        elif resp_var == 'Fixed_GPPrate':
-            slope_threshold = 5.0  # GPP速率变量的斜率范围
-        elif resp_var in ['GPP_fixed_window', 'GPP_window_change', 'GPP_sos_change', 'GPP_pos_change']:
-            slope_threshold = 50.0  # GPP累积变量的合理范围（gC/m²）
+        elif resp_var == f'Fixed_{MIDDLE_VAR_NAME}rate':
+            slope_threshold = 5.0  # {MIDDLE_VAR_NAME}速率变量的斜率范围
+        elif resp_var in [f'{MIDDLE_VAR_NAME}_fixed_window', f'{MIDDLE_VAR_NAME}_window_change', f'{MIDDLE_VAR_NAME}_sos_change', f'{MIDDLE_VAR_NAME}_pos_change']:
+            slope_threshold = 50.0  # {MIDDLE_VAR_NAME}累积变量的合理范围
 
         n_filtered, valid_mask, outlier_info = filter_statistical_outliers(
             slope_map, r2_map=r_squared_map, pvalue_map=pvalue_map,
@@ -2860,10 +2868,10 @@ def _run_analysis():
         # 全面统计输出（全部有效像元 + 显著性像元）
         if resp_var in ['Fixed_Trate', 'Trate']:
             unit = "mm/day per day ΔSOS"
-        elif resp_var == 'Fixed_GPPrate':
-            unit = "gC/m²/day per day ΔSOS"
-        elif resp_var in ['GPP_fixed_window', 'GPP_window_change', 'GPP_sos_change', 'GPP_pos_change']:
-            unit = "gC/m² per day ΔSOS"
+        elif resp_var == f'Fixed_{MIDDLE_VAR_NAME}rate':
+            unit = f"{MIDDLE_VAR_NAME} rate per day ΔSOS"
+        elif resp_var in [f'{MIDDLE_VAR_NAME}_fixed_window', f'{MIDDLE_VAR_NAME}_window_change', f'{MIDDLE_VAR_NAME}_sos_change', f'{MIDDLE_VAR_NAME}_pos_change']:
+            unit = f"{MIDDLE_VAR_NAME} per day ΔSOS"
         else:
             unit = "mm per day ΔSOS"
         print_comprehensive_statistics(
@@ -2933,11 +2941,11 @@ def _run_analysis():
     print("  │   ├── TR_pos_change_vs_deltaSOS_slope.tif")
     print("  │   ├── Fixed_Trate_vs_deltaSOS_slope.tif [MOST IMPORTANT]")
     print("  │   ├── Trate_vs_deltaSOS_slope.tif")
-    print("  │   ├── GPP_fixed_window_vs_deltaSOS_slope.tif")
-    print("  │   ├── GPP_window_change_vs_deltaSOS_slope.tif")
-    print("  │   ├── GPP_sos_change_vs_deltaSOS_slope.tif")
-    print("  │   ├── GPP_pos_change_vs_deltaSOS_slope.tif")
-    print("  │   └── Fixed_GPPrate_vs_deltaSOS_slope.tif")
+    print(f"  │   ├── {MIDDLE_VAR_NAME}_fixed_window_vs_deltaSOS_slope.tif")
+    print(f"  │   ├── {MIDDLE_VAR_NAME}_window_change_vs_deltaSOS_slope.tif")
+    print(f"  │   ├── {MIDDLE_VAR_NAME}_sos_change_vs_deltaSOS_slope.tif")
+    print(f"  │   ├── {MIDDLE_VAR_NAME}_pos_change_vs_deltaSOS_slope.tif")
+    print(f"  │   └── Fixed_{MIDDLE_VAR_NAME}rate_vs_deltaSOS_slope.tif")
     print("  ├── Section_3.3_Drivers/")
     print("  │   ├── Full_Period/")
     print("  │   │   ├── TRc/")

@@ -101,7 +101,7 @@ if (.Platform$OS.type == "windows") {
 }
 
 # 自动生成的路径
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis")
+OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS")
 PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
 # ===【修改1】Fixed_Trate数据源（04c固定窗口方法）===
 # 原路径: Decomposition/TRproduct_{year}.tif（03a模块输出）

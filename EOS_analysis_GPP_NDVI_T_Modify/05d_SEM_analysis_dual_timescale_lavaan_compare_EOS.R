@@ -77,8 +77,8 @@ if (.Platform$OS.type == "windows") {
   }
 }
 
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_EOS_GPP_Modify")
-PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
+OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_EOS_GPP_NDVI_GLEAM")
+PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "NDVI_phenology")
 DECOMP_DIR <- file.path(OUTPUT_ROOT, "Decomposition_FixedWindow")
 MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
 TEMPLATE_FILE <- file.path(OUTPUT_ROOT, "masks", "template_grid.tif")
@@ -156,6 +156,11 @@ SEM_R2_MAX <- 1
 # "Other" screening
 OTHER_GFI_MIN <- 0.90
 OTHER_P_THRESHOLD <- 0.05
+
+# ==================== 输出文件名配置（与Python _config.py对应） ====================
+# 修改此处可全局更改输出文件名中的"GPP"为"NDVI"
+MIDDLE_VAR_NAME <- "NDVI"  # 可选: "GPP" 或 "NDVI"
+FIXED_RATE_PATTERN <- sprintf("Fixed_%srate_%%d.tif", MIDDLE_VAR_NAME)  # Fixed_NDVIrate_%d.tif
 
 # ==================== Helpers ====================
 check_file <- function(file_path, description) {
@@ -760,8 +765,8 @@ run_pixel_sem_lavaan_compare <- function(years, mask_r, fixed_window_length_r,
 
   files <- list(
     TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),
-    EOS = file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", years)),
-    Fixed_GPPrate = file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", years)),
+    EOS = file.path(PHENO_DIR, sprintf("eos_ndvi_%d.tif", years)),
+    Fixed_GPPrate = file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, years)),
     P_pre = file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", years)),
     T_pre = file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", years)),
     SW_pre = file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", years)),
@@ -860,7 +865,7 @@ run_pixel_sem_lavaan_compare <- function(years, mask_r, fixed_window_length_r,
     eos_block <- t(getValues(stacks$EOS, row = row, nrows = nrows))
     eos_block <- sanitize_values(eos_block, na_values$EOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$Fixed_GPPrate, row = row, nrows = nrows))
-    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = FALSE)
+    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = TRUE)  # Fixed_NDVIrate是异常值，可以为负
     p_pre_block <- t(getValues(stacks$P_pre, row = row, nrows = nrows))
     p_pre_block <- sanitize_values(p_pre_block, na_values$P_pre, allow_negative = FALSE)
     t_pre_block <- t(getValues(stacks$T_pre, row = row, nrows = nrows))
@@ -1373,8 +1378,8 @@ main <- function() {
   for (year in years) {
     files_to_check <- c(
       file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)),
-      file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", year)),
-      file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year)),
+      file.path(PHENO_DIR, sprintf("eos_ndvi_%d.tif", year)),
+      file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year)),
       file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year)),
       file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", year)),
       file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", year)),
@@ -1417,8 +1422,8 @@ main <- function() {
   sample_rasters <- list(
     fixed_window_length_r,
     raster(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", YEAR_START))),
-    raster(file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", YEAR_START))),
-    raster(file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", YEAR_START))),
+    raster(file.path(PHENO_DIR, sprintf("eos_ndvi_%d.tif", YEAR_START))),
+    raster(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, YEAR_START))),
     raster(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", YEAR_START)))
   )
   tryCatch({

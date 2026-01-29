@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-配置文件: Wang (2025) EOS分析流程
+配置文件: Wang (2025) 分析流程
 NDVI物候 + GLEAM蒸腾版本
 """
 
@@ -26,9 +26,9 @@ SM_DAILY_DIR = GLEAM_ROOT / "SMrz" / "SMrz_Daily_1"    # 深层土壤水分（�
 # NDVI数据路径（替代GPP）
 NDVI_DAILY_DIR = ROOT / "GIMMS_NDVI" / "GIMMS_NDVI_daily_interpolated"  # NDVI日数据（已插值）
 
-# GPP数据路径（保留但不使用）
-GPP_DAILY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_daily_interpolated"  # GPP日数据（已插值）
-GPP_8DAY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_8days_1"              # GPP 8天数据（原始）
+# GPP数据路径（重定向到NDVI，保持向后兼容）
+GPP_DAILY_DIR = NDVI_DAILY_DIR  # 重定向到NDVI日数据（02-06模块使用）
+GPP_8DAY_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_8days_1"  # 8天数据保留原路径（未使用）
 
 # SIF数据路径（如需要可配置）
 SIF_DAILY_DIR = ROOT / "SIF_Data" / "CSIF_daily"       # 日尺度SIF（暂未使用）
@@ -40,8 +40,8 @@ PHENO_DIR = ROOT / "Phenology_Output_1" / "NDVI_phenology"
 # 土地覆盖数据
 LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"
 
-# 输出目录（EOS分析 NDVI+GLEAM版本）
-OUTPUT_ROOT = ROOT / "Wang2025_Analysis_EOS_NDVI_GLEAM"
+# 输出目录（NDVI+GLEAM版本）
+OUTPUT_ROOT = ROOT / "Wang2025_Analysis_EOS_GPP_NDVI_GLEAM"
 TRC_ANNUAL_DIR = OUTPUT_ROOT / "TRc_annual"              # TRc年度输出（02代码）
 CLIMATOLOGY_DIR = OUTPUT_ROOT / "Climatology"            # 气候态数据（02代码）
 DECOMPOSITION_DIR = OUTPUT_ROOT / "Decomposition"        # 分解结果（03a代码）
@@ -88,7 +88,7 @@ MIN_VALID_FRAC = 0.60    # 最小有效数据比例（趋势分析）
 
 # 物候提取参数
 PHENO_THRESHOLD = 0.20   # 物候提取阈值（20%）
-EOS_MIN_DOY = 200        # EOS最小DOY（约束条件）
+EOS_MIN_DOY = 200        # EOS最小DOY（约束条件，经验值）
 
 # 统计分析参数
 TREND_PVALUE_THRESHOLD = 0.05      # 趋势显著性阈值
@@ -105,13 +105,13 @@ TR_FILE_FORMAT = "Et_{date}.tif"  # {date} = YYYYMMDD
 # 格式: SMrz_YYYYMMDD.tif (日尺度)
 SM_FILE_FORMAT = "SMrz_{date}.tif"  # 日尺度，{date} = YYYYMMDD
 
-# NDVI文件命名格式（替代GPP）
+# NDVI文件命名格式
 # 日尺度（插值后）: NDVI_YYYYMMDD.tif
 NDVI_DAILY_FORMAT = "NDVI_{date}.tif"  # {date} = YYYYMMDD, 如: NDVI_19820101.tif
 
-# GPP文件命名格式（保留但不使用）
-GPP_DAILY_FORMAT = "GPP_{date}.tif"  # {date} = YYYYMMDD
-GPP_8DAY_FORMAT = "GLASS_GPP_{year}{doy:03d}.tif"
+# GPP文件命名格式（重定向到NDVI格式，保持向后兼容）
+GPP_DAILY_FORMAT = NDVI_DAILY_FORMAT  # 重定向到NDVI格式（02-06模块使用）
+GPP_8DAY_FORMAT = "GLASS_GPP_{year}{doy:03d}.tif"  # 8天格式保留（未使用）
 
 # 物候文件命名格式 - NDVI物候
 PHENO_FILE_FORMAT = {
@@ -129,11 +129,86 @@ ANNUAL_FILE_FORMAT = {
     'TRc': 'TRc_{year}.tif'
 }
 
+# ==================== 输出文件命名格式（集中配置） ====================
+# 修改此处可全局更改输出文件名中的"GPP"为"NDVI"
+
+# 中间变量名称（用于输出文件名）
+MIDDLE_VAR_NAME = "NDVI"  # 可选: "GPP" 或 "NDVI"
+
+# ==================== 通用数据路径（根据MIDDLE_VAR_NAME自动选择） ====================
+# 07模块等需要灵活切换数据源的模块使用这些通用配置
+# 注意：这里不使用 GPP_DAILY_DIR（它被重定向到NDVI供其他模块使用）
+if MIDDLE_VAR_NAME == "NDVI":
+    DAILY_DATA_DIR = NDVI_DAILY_DIR
+    DAILY_DATA_FORMAT = NDVI_DAILY_FORMAT
+    PHENO_SOURCE_DIR = ROOT / "Phenology_Output_1" / "NDVI_phenology"
+    PHENO_SOURCE_FORMAT = {
+        'SOS': 'sos_ndvi_{year}.tif',
+        'POS': 'pos_doy_ndvi_{year}.tif',
+        'EOS': 'eos_ndvi_{year}.tif',
+        'POS_VALUE': 'pos_value_ndvi_{year}.tif',
+        'QUALITY': 'quality_flags_ndvi_{year}.tif'
+    }
+elif MIDDLE_VAR_NAME == "GPP":
+    # 直接指定真实的GPP路径（不使用重定向的GPP_DAILY_DIR）
+    DAILY_DATA_DIR = ROOT / "GLASS_GPP" / "GLASS_GPP_daily_interpolated"
+    DAILY_DATA_FORMAT = "GPP_{date}.tif"
+    PHENO_SOURCE_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
+    PHENO_SOURCE_FORMAT = {
+        'SOS': 'sos_gpp_{year}.tif',
+        'POS': 'pos_doy_gpp_{year}.tif',
+        'EOS': 'eos_gpp_{year}.tif',
+        'POS_VALUE': 'pos_value_gpp_{year}.tif',
+        'QUALITY': 'quality_flags_gpp_{year}.tif'
+    }
+else:
+    # 默认使用NDVI
+    DAILY_DATA_DIR = NDVI_DAILY_DIR
+    DAILY_DATA_FORMAT = NDVI_DAILY_FORMAT
+    PHENO_SOURCE_DIR = PHENO_DIR
+    PHENO_SOURCE_FORMAT = PHENO_FILE_FORMAT
+
+# 02模块输出（累积值）
+OUTPUT_CUMULATIVE_FORMAT = f"{MIDDLE_VAR_NAME}c_{{year}}.tif"  # NDVIc_2000.tif
+
+# 02模块气候态
+OUTPUT_CLIMATOLOGY_FORMAT = {
+    'daily': f"{MIDDLE_VAR_NAME}_daily_climatology.tif",  # NDVI_daily_climatology.tif
+    'cumulative_av': f"{MIDDLE_VAR_NAME}c_av.tif",        # NDVIc_av.tif
+}
+
+# 03c模块分解输出
+OUTPUT_DECOMP_FORMAT = {
+    'window_change': f"{MIDDLE_VAR_NAME}_window_change_{{year}}.tif",
+    'fixed_window': f"{MIDDLE_VAR_NAME}_fixed_window_{{year}}.tif",
+    'eos_change': f"{MIDDLE_VAR_NAME}_eos_change_{{year}}.tif",
+    'pos_change': f"{MIDDLE_VAR_NAME}_pos_change_{{year}}.tif",
+    'fixed_rate': f"Fixed_{MIDDLE_VAR_NAME}rate_{{year}}.tif",
+    'fixed_window_length': f"Fixed_{MIDDLE_VAR_NAME}Window_Length.tif",
+}
+
+# 04c模块缓存文件
+OUTPUT_CACHE_FORMAT = {
+    'season': f"{MIDDLE_VAR_NAME}_{{season}}_{{year}}.tif",
+    'lsp': f"{MIDDLE_VAR_NAME}_LSP_{{tag}}_{{year}}.tif",
+}
+
 # ==================== 绘图参数配置 ====================
 
 # 图形尺寸
 FIG_DPI = 300
 FIG_FORMAT = 'png'  # 或 'pdf', 'svg'
+
+# 绘图输出目录（06/07模块共用）
+FIGURES_DIR = OUTPUT_ROOT / "Figures_All"
+
+# 07模块输出文件名格式（物候异常分组生长曲线）
+# 使用MIDDLE_VAR_NAME实现变量替换
+OUTPUT_COMPOSITE_CURVES_FORMAT = {
+    'english': f"phenology_composite_{MIDDLE_VAR_NAME}_curves_EN.png",
+    'chinese': f"phenology_composite_{MIDDLE_VAR_NAME}_curves_CN.png",
+    'decomposition': f"phenology_composite_{MIDDLE_VAR_NAME}_curves_with_decomp.png",
+}
 
 # 地图范围（经度，纬度）
 MAP_EXTENT = [-180, 180, 30, 90]  # [lon_min, lon_max, lat_min, lat_max]
@@ -142,7 +217,7 @@ MAP_EXTENT = [-180, 180, 30, 90]  # [lon_min, lon_max, lat_min, lat_max]
 CBAR_RANGES = {
     'TRc': [0, 500],              # mm
     'LSP': [60, 150],             # days
-    'EOS': [250, 330],            # DOY (EOS通常在秋季)
+    'EOS': [200, 300],            # DOY
     'trend': [-20, 20],           # mm/decade
     'attribution': [-0.5, 0.5]    # standardized coefficient
 }
@@ -352,7 +427,7 @@ def validate_config():
 def print_config():
     """打印当前配置"""
     print("\n" + "="*70)
-    print("当前配置信息 (EOS分析 - NDVI物候 + GLEAM蒸腾版本)")
+    print("当前配置信息 (NDVI物候 + GLEAM蒸腾版本)")
     print("="*70)
     print(f"\n数据路径:")
     print(f"  根目录: {ROOT}")

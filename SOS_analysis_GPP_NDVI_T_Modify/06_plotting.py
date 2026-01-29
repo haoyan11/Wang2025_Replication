@@ -3,7 +3,7 @@
 """
 Module 06: 统一绘图入口
 04c 结果：偏相关/回归/趋势图使用“偏相关系数与显著性图”模板样式
-05b/05c/05d 结果：SEM 路径图使用“SOS-GPP全路径图像”模板样式
+05b/05c/05d 结果：SEM 路径图使用"SOS-NDVI全路径图像"模板样式
 """
 
 from dataclasses import dataclass
@@ -26,20 +26,32 @@ import cartopy.feature as cfeature
 from osgeo import gdal
 
 
+# ==================== 运行模式配置 ====================
+# 支持环境变量控制是否覆盖已存在的图片
+# 方式1: 设置 WANG_OVERWRITE=true 强制重新绘制所有图片
+# 方式2: 设置 WANG_RUN_MODE=overwrite (与pipeline保持一致)
+_overwrite_flag = os.getenv("WANG_OVERWRITE", "false").lower() in ("true", "1", "yes")
+_run_mode = os.getenv("WANG_RUN_MODE", "skip").lower()
+OVERWRITE = _overwrite_flag or (_run_mode == "overwrite")
+
+
+def should_plot(out_path):
+    """检查是否应该绘图（如果文件已存在且非覆盖模式则跳过）"""
+    out_path = Path(out_path)
+    if OVERWRITE:
+        return True
+    if out_path.exists():
+        print(f"  [skip] 已存在: {out_path.name}")
+        return False
+    return True
+
+
+# 导入配置中的变量名和输出根目录
+from _config import MIDDLE_VAR_NAME, OUTPUT_ROOT, FIGURES_DIR
+
 # ==================== 路径与全局配置 ====================
-def _pick_existing(paths):
-    for p in paths:
-        if p.exists():
-            return p
-    return paths[0]
-
-
-ROOT = _pick_existing([
-    Path(r"I:\F\Data4"),
-    Path("/mnt/i/F/Data4"),
-])
-ANALYSIS_DIR = ROOT / "Wang2025_Analysis_SOS_GPP_Modify"
-OUTPUT_FIG_DIR = ANALYSIS_DIR / "Figures_All"
+ANALYSIS_DIR = OUTPUT_ROOT
+OUTPUT_FIG_DIR = FIGURES_DIR  # 使用_config.py中的统一配置
 OUTPUT_FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 SEM_FALLBACK_DIRS = [
@@ -331,6 +343,8 @@ def _make_bright_diverging_cmap():
 
 def plot_corr_style_map(r_file, p_file, out_figure, var_label,
                         cbar_title=None, value_range=None, auto_range=None):
+    if not should_plot(out_figure):
+        return
     if not Path(r_file).exists():
         print(f"相关系数文件不存在，跳过: {r_file}")
         return
@@ -586,6 +600,8 @@ def _build_path(coef_map, lhs, rhs):
 def plot_sem_full_path(param_file, r2_file, out_png, title_text,
                        middle_var, outcome_var, middle_label, outcome_label,
                        bar_direct_label, bar_indirect_label, bar_ylabel):
+    if not should_plot(out_png):
+        return
     if not param_file.exists() or not r2_file.exists():
         print(f"SEM文件缺失，跳过: {param_file}")
         return
@@ -596,12 +612,12 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
 
     r2_values = {
         "SOS": r2_map.get("SOS", np.nan),
-        "GPP": r2_map.get(middle_var, np.nan),
+        "NDVI": r2_map.get(middle_var, np.nan),
         "TRATE": r2_map.get(outcome_var, np.nan),
     }
 
     display_labels = {
-        "GPP": middle_label,
+        "NDVI": middle_label,
         "TRATE": outcome_label,
     }
 
@@ -644,7 +660,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
         "T_PRE": (5.5, 9.5),
         "SW_PRE": (9.5, 9.5),
         "SOS": (1.5, 5.5),
-        "GPP": (5.5, 5.5),
+        "NDVI": (5.5, 5.5),
         "TRATE": (9.5, 5.5),
         "P_SEASON": (1.5, 1.5),
         "T_SEASON": (5.5, 1.5),
@@ -656,7 +672,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
         "T_pre": "T_PRE",
         "SW_pre": "SW_PRE",
         "SOS": "SOS",
-        middle_var: "GPP",
+        middle_var: "NDVI",
         outcome_var: "TRATE",
         "P_season": "P_SEASON",
         "T_season": "T_SEASON",
@@ -703,12 +719,12 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
         x1, y1 = start_pos
         x2, y2 = end_pos
 
-        if start_name in ["SOS", "GPP", "TRATE"]:
+        if start_name in ["SOS", "NDVI", "TRATE"]:
             start_width, start_height = 2.2, 1.4
         else:
             start_width, start_height = 2.0, 1.2
 
-        if end_name in ["SOS", "GPP", "TRATE"]:
+        if end_name in ["SOS", "NDVI", "TRATE"]:
             end_width, end_height = 2.2, 1.4
         else:
             end_width, end_height = 2.0, 1.2
@@ -767,10 +783,10 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
             linewidth = 2
             alpha = 0.6
 
-        is_pre_to_mid = (end_name == "GPP" and start_name in ["P_PRE", "T_PRE", "SW_PRE"])
-        is_season_to_mid = (end_name == "GPP" and start_name in ["P_SEASON", "T_SEASON", "SW_SEASON"])
-        is_sos_to_mid = (start_name == "SOS" and end_name == "GPP")
-        is_mid_to_out = (start_name == "GPP" and end_name == "TRATE")
+        is_pre_to_mid = (end_name == "NDVI" and start_name in ["P_PRE", "T_PRE", "SW_PRE"])
+        is_season_to_mid = (end_name == "NDVI" and start_name in ["P_SEASON", "T_SEASON", "SW_SEASON"])
+        is_sos_to_mid = (start_name == "SOS" and end_name == "NDVI")
+        is_mid_to_out = (start_name == "NDVI" and end_name == "TRATE")
 
         if is_sos_to_out:
             arrow = FancyArrowPatch(
@@ -829,7 +845,7 @@ def plot_sem_full_path(param_file, r2_file, out_png, title_text,
                 zorder=100)
 
     for name, pos in positions.items():
-        is_outcome = name in ["SOS", "GPP", "TRATE"]
+        is_outcome = name in ["SOS", "NDVI", "TRATE"]
         draw_box(ax1, name, pos, is_outcome)
 
     for path_key, path_data in direct_paths.items():
@@ -1091,18 +1107,18 @@ def plot_sem_all(only_group=None):
     sem_tasks = []
 
     sem_tasks.append({
-        "name": "05b_SOS_GPP_Trate",
+        "name": f"05b_SOS_{MIDDLE_VAR_NAME}_Trate",
         "group": "05b",
         "dir_name": "SEM_Results_Dual_Fixed",
         "param": "SEM_dual_timescale_parameters.csv",
         "r2": "SEM_dual_timescale_R2.csv",
         "middle_var": "Fixed_GPPrate",
         "outcome_var": "Fixed_Trate",
-        "middle_label": "GPP",
+        "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
         "title": "SOS - Dual-Timescale SEM (Fixed Window, Full Paths)",
         "bar_direct": "Direct (Season Climate → TRate)",
-        "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
+        "bar_indirect": f"Indirect (Season Climate → {MIDDLE_VAR_NAME} → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
     })
 
@@ -1114,11 +1130,11 @@ def plot_sem_all(only_group=None):
         "r2": "SEM_dual_timescale_R2.csv",
         "middle_var": "Fixed_GPPrate",
         "outcome_var": "Fixed_Trate",
-        "middle_label": "GPP",
+        "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
         "title": "SOS - Pooled SEM (Pixel-Year, Full Paths)",
         "bar_direct": "Direct (Season Climate → TRate)",
-        "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
+        "bar_indirect": f"Indirect (Season Climate → {MIDDLE_VAR_NAME} → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
     })
 
@@ -1130,11 +1146,11 @@ def plot_sem_all(only_group=None):
         "r2": "SEM_dual_timescale_R2.csv",
         "middle_var": "Fixed_GPPrate",
         "outcome_var": "Fixed_Trate",
-        "middle_label": "GPP",
+        "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
         "title": "SOS - Lavaan Pixelwise SEM (Ours)",
         "bar_direct": "Direct (Season Climate → TRate)",
-        "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
+        "bar_indirect": f"Indirect (Season Climate → {MIDDLE_VAR_NAME} → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
         "pixel_only": True,
     })
@@ -1147,11 +1163,11 @@ def plot_sem_all(only_group=None):
         "r2": "SEM_dual_timescale_R2.csv",
         "middle_var": "Fixed_GPPrate",
         "outcome_var": "Fixed_Trate",
-        "middle_label": "GPP",
+        "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
         "title": "SOS - Lavaan Pixelwise SEM (Other)",
         "bar_direct": "Direct (Season Climate → TRate)",
-        "bar_indirect": "Indirect (Season Climate → GPP → TRate)",
+        "bar_indirect": f"Indirect (Season Climate → {MIDDLE_VAR_NAME} → TRate)",
         "bar_ylabel": "Standardized Effect on TRate",
         "pixel_only": True,
     })
