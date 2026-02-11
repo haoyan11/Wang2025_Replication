@@ -13,8 +13,8 @@ from pathlib import Path
 from datetime import datetime
 import logging
 
-# 从配置文件导入输出根目录
-from _config import OUTPUT_ROOT
+# 从配置文件导入输出根目录和数据模式
+from _config import OUTPUT_ROOT, DATA_MODE, TR_MODE
 
 # ==================== 配置 ====================
 # R环境路径（如果Rscript不在PATH中，请设置完整路径）
@@ -71,21 +71,24 @@ MODULES = [
         'script': '05b_SEM_analysis_dual_timescale_SOS.R',
         'required': False,
         'description': '双时间尺度SEM（SOS → GPP → Fixed_Trate）',
-        'interpreter': 'Rscript'
+        'interpreter': 'Rscript',
+        'mode_loop': True   # R脚本需通过环境变量WANG_DATA_MODE按模式遍历
     },
     {
         'name': 'Module 05c: SEM混合池（Pooled）',
         'script': '05c_SEM_analysis_dual_timescale_robust_pooled_SOS.R',
         'required': False,
         'description': 'Pooled SEM（像元-年份）',
-        'interpreter': 'Rscript'
+        'interpreter': 'Rscript',
+        'mode_loop': True
     },
     {
         'name': 'Module 05d: SEM像元级对比（Lavaan）',
         'script': '05d_SEM_analysis_dual_timescale_lavaan_compare_SOS.R',
         'required': False,
         'description': '像元级SEM对比（Ours/Other）',
-        'interpreter': 'Rscript'
+        'interpreter': 'Rscript',
+        'mode_loop': True
     },
     {
         'name': 'Module 06: 统一绘图',
@@ -96,10 +99,21 @@ MODULES = [
 ]
 
 # ==================== 执行函数 ====================
-def run_module(module_info, run_mode):
-    """执行单个模块"""
+def run_module(module_info, run_mode, data_mode=None, tr_mode=None):
+    """执行单个模块
+
+    Parameters
+    ----------
+    data_mode : str or None
+        传递给R脚本的WANG_DATA_MODE环境变量。Python模块内部自行处理模式遍历。
+    tr_mode : str or None
+        传递给R脚本的WANG_TR_MODE环境变量。
+    """
+    mode_tag = ""
+    if data_mode:
+        mode_tag = f" [{data_mode}+{tr_mode}]" if tr_mode else f" [{data_mode}]"
     logger.info("="*70)
-    logger.info(f"开始执行: {module_info['name']}")
+    logger.info(f"开始执行: {module_info['name']}{mode_tag}")
     logger.info(f"描述: {module_info['description']}")
     logger.info("="*70)
 
@@ -116,6 +130,10 @@ def run_module(module_info, run_mode):
         # 执行脚本
         env = os.environ.copy()
         env["WANG_RUN_MODE"] = run_mode
+        if data_mode:
+            env["WANG_DATA_MODE"] = data_mode
+        if tr_mode:
+            env["WANG_TR_MODE"] = tr_mode
         if interpreter == 'Rscript':
             cmd = [RSCRIPT_PATH, str(script_path)]
         else:
@@ -257,7 +275,19 @@ def main(skip_modules=None, only_modules=None, run_mode=DEFAULT_RUN_MODE):
     logger.info(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"日志文件: {log_file}")
     logger.info(f"运行模式: {run_mode} (skip: 跳过已存在, overwrite: 覆盖重算)")
+    logger.info(f"数据模式: {DATA_MODE}, TR模式: {TR_MODE}")
     logger.info("")
+
+    # 确定R脚本需要遍历的模式组合列表（DATA_MODE × TR_MODE）
+    if DATA_MODE == "BOTH":
+        _data_list = ["NDVI", "GPP"]
+    else:
+        _data_list = [DATA_MODE]
+    if TR_MODE == "BOTH":
+        _tr_list = ["GLEAM", "ERA5"]
+    else:
+        _tr_list = [TR_MODE]
+    r_mode_combos = [(d, t) for d in _data_list for t in _tr_list]
 
     # 检查依赖
     check_dependencies()
@@ -278,8 +308,18 @@ def main(skip_modules=None, only_modules=None, run_mode=DEFAULT_RUN_MODE):
             logger.info(f"跳过 {module_info['name']} (非指定模块)")
             continue
 
-        # 执行模块
-        success = run_module(module_info, run_mode)
+        # R脚本按模式遍历（Python模块内部自行处理模式循环）
+        if module_info.get('mode_loop', False):
+            all_ok = True
+            for data_m, tr_m in r_mode_combos:
+                combo_label = f"{data_m}+{tr_m}"
+                logger.info(f"--- {module_info['name']} 模式: {combo_label} ---")
+                ok = run_module(module_info, run_mode, data_mode=data_m, tr_mode=tr_m)
+                if not ok:
+                    all_ok = False
+            success = all_ok
+        else:
+            success = run_module(module_info, run_mode)
 
         if success:
             success_count += 1

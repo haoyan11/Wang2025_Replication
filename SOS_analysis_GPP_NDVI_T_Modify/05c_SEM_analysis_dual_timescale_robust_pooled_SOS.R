@@ -44,11 +44,31 @@ OVERWRITE <- identical(RUN_MODE, "overwrite")
 should_write <- function(path) {
   OVERWRITE || !file.exists(path)
 }
+normalize_fixed_rate_labels <- function(df) {
+  if (!is.data.frame(df)) {
+    return(df)
+  }
+  new_name <- sprintf("Fixed_%srate", MIDDLE_VAR_NAME)
+  names(df) <- gsub("Fixed_GPPrate", new_name, names(df))
+  if (!is.null(rownames(df))) {
+    rownames(df) <- gsub("Fixed_GPPrate", new_name, rownames(df))
+  }
+  for (col in names(df)) {
+    if (is.factor(df[[col]])) {
+      df[[col]] <- as.character(df[[col]])
+    }
+    if (is.character(df[[col]])) {
+      df[[col]] <- gsub("Fixed_GPPrate", new_name, df[[col]])
+    }
+  }
+  df
+}
 safe_write_csv <- function(df, path, ...) {
   if (!should_write(path)) {
     cat(sprintf("  [skip] %s\n", path))
     return(invisible(FALSE))
   }
+  df <- normalize_fixed_rate_labels(df)
   write.csv(df, path, ...)
   invisible(TRUE)
 }
@@ -70,31 +90,21 @@ safe_write_raster <- function(r, path, ...) {
 }
 
 # ==================== 配置 ====================
-
-# 根目录（自动检测）
-if (.Platform$OS.type == "windows") {
-  ROOT <- "I:/F/Data4"
-} else {
-  if (dir.exists("/mnt/i/F/Data4")) {
-    ROOT <- "/mnt/i/F/Data4"
-  } else {
-    ROOT <- "I:/F/Data4"
+# 加载统一配置（路径、模式、常量等）
+.script_dir <- tryCatch(
+  dirname(normalizePath(sys.frame(1)$ofile)),
+  error = function(e) {
+    args <- commandArgs(trailingOnly = FALSE)
+    f <- grep("--file=", args, value = TRUE)
+    if (length(f)) dirname(normalizePath(sub("--file=", "", f))) else getwd()
   }
-}
+)
+source(file.path(.script_dir, "_config.R"))
 
-# 路径配置
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS_GPP_NDVI_GLEAM")
-PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "NDVI_phenology")
-DECOMP_DIR <- file.path(OUTPUT_ROOT, "Decomposition_FixedWindow")
-MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
-TEMPLATE_FILE <- file.path(OUTPUT_ROOT, "masks", "template_grid.tif")
-
-# 缓存数据路径（来自05b）
-DERIVED_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed", "Derived")
-
-# 输出目录（与05b命名风格保持一致：SEM_Data_*/SEM_Results_*）
-DATA_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed_Robust_Pooled_SOS")
-OUTPUT_DIR <- file.path(OUTPUT_ROOT, "SEM_Results_Dual_Fixed_Robust_Pooled_SOS")
+# ===== 05c模块专用输出目录 =====
+# DERIVED_DIR 来自_config.R（05b生成的缓存数据）
+DATA_DIR <- file.path(MODE_ROOT, "SEM_Data_Dual_Fixed_Robust_Pooled_SOS")
+OUTPUT_DIR <- file.path(MODE_ROOT, "SEM_Results_Dual_Fixed_Robust_Pooled_SOS")
 
 # 创建输出目录
 dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -140,13 +150,7 @@ outputs_ready <- function(suffix = "") {
   all(file.exists(required))
 }
 
-# 年份范围
-YEAR_START <- 1982
-YEAR_END <- 2018
-
-# 常量
-NODATA_OUT <- -9999
-NODATA_ABS_MAX <- 1e20
+# ===== 05c控制选项 =====
 FILTER_SEM_OUTLIERS <- TRUE  # 输出结果异常值过滤（类似04c）
 SEM_COEF_ABS_MAX <- 5        # 系数绝对值阈值（标准化系数）
 SEM_P_MIN <- 0               # p值下限
@@ -162,11 +166,6 @@ BOOTSTRAP_ESTIMATOR <- SEM_ESTIMATOR
 # 有效性阈值（与05b一致）
 # 注：pooled 模式不使用窗口内日尺度有效比例过滤（仅按年份比例筛选）
 MIN_VALID_YEAR_FRAC <- 0.60
-
-# ==================== 输出文件名配置（与Python _config.py对应） ====================
-# 修改此处可全局更改输出文件名中的"GPP"为"NDVI"
-MIDDLE_VAR_NAME <- "NDVI"  # 可选: "GPP" 或 "NDVI"
-FIXED_RATE_PATTERN <- sprintf("Fixed_%srate_%%d.tif", MIDDLE_VAR_NAME)  # Fixed_NDVIrate_%d.tif
 
 # ==================== 统一并行配置 ====================
 PARALLEL_ENABLE <- TRUE       # 并行总开关
@@ -204,8 +203,8 @@ check_raster_alignment <- function(template_r, year) {
     list(MASK_FILE, "mask", TRUE),
     list(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)), "TR_fixed_window", FALSE),
     list(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "Fixed_Window_Length", FALSE),
-    list(file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year)), "SOS", FALSE),
-    list(file.path(PHENO_DIR, sprintf("pos_doy_ndvi_%d.tif", year)), "POS", FALSE),
+    list(file.path(PHENO_DIR, sprintf(SOS_PATTERN, year)), "SOS", FALSE),
+    list(file.path(PHENO_DIR, sprintf(POS_PATTERN, year)), "POS", FALSE),
     list(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year)), "Fixed_GPPrate", FALSE),  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
     list(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year)), "P_pre", TRUE)
   )
@@ -436,8 +435,7 @@ for (year in years) {
   }
 
   # 检查SOS（物候数据）
-  sos_pattern <- sprintf("sos_%s_%%d.tif", tolower(MIDDLE_VAR_NAME))
-  sos_file <- file.path(PHENO_DIR, sprintf(sos_pattern, year))
+  sos_file <- file.path(PHENO_DIR, sprintf(SOS_PATTERN, year))
   if (!file.exists(sos_file)) {
     cat(sprintf("  ✗ 缺失: %s\n", basename(sos_file)))
     missing_files <- missing_files + 1
@@ -497,7 +495,7 @@ cat(sprintf("    掩膜有效像元数: %d (%.2f%%)\n",
 # 读取1982年数据快速筛选
 year_test <- years[1]  # 1982
 tr_test_r <- raster(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year_test)))
-sos_test_r <- raster(file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year_test)))
+sos_test_r <- raster(file.path(PHENO_DIR, sprintf(SOS_PATTERN, year_test)))
 gpp_test_r <- raster(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year_test)))  # 从DECOMP_DIR读取
 p_pre_test_r <- raster(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year_test)))
 t_pre_test_r <- raster(file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", year_test)))
@@ -585,7 +583,7 @@ cat(sprintf("    （相比全量检查减少了 %.1f%% 的计算量）\n\n",
 read_year_data <- function(year, candidate_cells, fixed_len_vals_all, fixed_len_nodata) {
   # 读取该年的所有变量
   tr_fixed_r <- raster(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)))
-  sos_r <- raster(file.path(PHENO_DIR, sprintf("sos_ndvi_%d.tif", year)))
+  sos_r <- raster(file.path(PHENO_DIR, sprintf(SOS_PATTERN, year)))
   gpp_season_r <- raster(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year)))  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
   p_pre_r <- raster(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year)))
   t_pre_r <- raster(file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", year)))
@@ -644,7 +642,7 @@ if (PARALLEL_ENABLE && PARALLEL_CORES > 1) {
                       "DECOMP_DIR", "PHENO_DIR", "DERIVED_DIR",
                       "sanitize_values", "get_nodata", "read_year_data",
                       "NODATA_OUT", "NODATA_ABS_MAX",
-                      "MIDDLE_VAR_NAME", "FIXED_RATE_PATTERN"),
+                      "MIDDLE_VAR_NAME", "FIXED_RATE_PATTERN", "SOS_PATTERN", "POS_PATTERN"),
                 envir = environment())
 
   year_list <- parLapply(cl, years, function(year) {

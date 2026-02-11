@@ -20,6 +20,7 @@ import rasterio
 from pathlib import Path
 from datetime import datetime, timedelta
 from tqdm import tqdm
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from scipy.signal import savgol_filter
@@ -27,26 +28,38 @@ from scipy.optimize import curve_fit
 import warnings
 warnings.filterwarnings('ignore')
 
+# 全局字体配置（与06_plotting.py一致）
+mpl.rcParams.update({
+    "font.family": "Arial",
+    "axes.unicode_minus": False,
+    "mathtext.fontset": "stixsans",
+    "mathtext.default": "regular",
+    "figure.dpi": 300,
+    "savefig.bbox": "tight",
+})
+
 # 导入配置
 from _config import (
     PHENO_SOURCE_DIR, DAILY_DATA_DIR, DAILY_DATA_FORMAT, OUTPUT_ROOT,
     YEAR_START, YEAR_END, NODATA_OUT, MASK_FILE, TEMPLATE_RASTER,
-    PHENO_SOURCE_FORMAT, MIDDLE_VAR_NAME, FIGURES_DIR
+    PHENO_SOURCE_FORMAT, MIDDLE_VAR_NAME, FIGURES_DIR,
+    RUN_CONFIGS_07
 )
 
 # ==================== 配置 ====================
 # 输出目录（与06_plotting.py相同）
 OUTPUT_FIG_DIR = FIGURES_DIR / "Phenology_Composite"
-OUTPUT_FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+def ensure_output_fig_dir():
+    OUTPUT_FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # 平滑参数
 SG_WINDOW = 15  # Savitzky-Golay滤波窗口
 SG_POLYORDER = 3
 
-# 物候分类阈值
-# 筛选相较于多年平均偏离至少 PHENO_THRESHOLD_PCT 的年份
-# 设为 0.10 表示 ±10%，设为 0 表示无阈值（原有逻辑）
-PHENO_THRESHOLD_PCT = 0.02  # 2%
+# 物候分类阈值列表（会依次运行每个阈值）
+# 0 表示无阈值（原有逻辑），0.02 表示 ±2%
+PHENO_THRESHOLD_LIST = [0, 0.02, 0.05]
 
 # 颜色配置
 COLORS = {
@@ -106,9 +119,18 @@ def load_mask():
     return mask
 
 
-def load_phenology_all_years(years):
+def load_phenology_all_years(years, pheno_dir=None, pheno_format=None):
     """
     加载所有年份的物候数据
+
+    Parameters:
+    -----------
+    years : list
+        年份列表
+    pheno_dir : Path, optional
+        物候数据目录，默认使用全局PHENO_SOURCE_DIR
+    pheno_format : dict, optional
+        物候文件命名格式，默认使用全局PHENO_SOURCE_FORMAT
 
     Returns:
     --------
@@ -116,13 +138,18 @@ def load_phenology_all_years(years):
     eos_stack : ndarray, shape (n_years, H, W)
     valid_years : list
     """
+    if pheno_dir is None:
+        pheno_dir = PHENO_SOURCE_DIR
+    if pheno_format is None:
+        pheno_format = PHENO_SOURCE_FORMAT
+
     sos_list = []
     eos_list = []
     valid_years = []
 
     for year in tqdm(years, desc="加载物候数据"):
-        sos_file = PHENO_SOURCE_DIR / PHENO_SOURCE_FORMAT['SOS'].format(year=year)
-        eos_file = PHENO_SOURCE_DIR / PHENO_SOURCE_FORMAT['EOS'].format(year=year)
+        sos_file = pheno_dir / pheno_format['SOS'].format(year=year)
+        eos_file = pheno_dir / pheno_format['EOS'].format(year=year)
 
         if not sos_file.exists() or not eos_file.exists():
             continue
@@ -235,23 +262,38 @@ def _read_daily_file(args):
         return None, None
 
 
-def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_workers=8):
+def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_workers=8,
+                                    daily_dir=None, daily_format=None, var_label=None,
+                                    threshold_pct=0):
     """
     计算每个类别的像元级多年平均日数据，然后空间平均
 
-    优化：
-    1. 缓存中间结果到.npy文件
-    2. 多线程并行读取文件
-    3. 向量化空间平均计算
+    Parameters:
+    -----------
+    daily_dir : Path, optional
+        日尺度数据目录，默认使用全局DAILY_DATA_DIR
+    daily_format : str, optional
+        日尺度数据文件命名格式，默认使用全局DAILY_DATA_FORMAT
+    var_label : str, optional
+        变量标签（用于缓存文件名和打印），默认使用全局MIDDLE_VAR_NAME
+    threshold_pct : float
+        物候阈值。>0时基准曲线只用四类并集的像元年份
     """
     from concurrent.futures import ThreadPoolExecutor
     import hashlib
 
+    if daily_dir is None:
+        daily_dir = DAILY_DATA_DIR
+    if daily_format is None:
+        daily_format = DAILY_DATA_FORMAT
+    if var_label is None:
+        var_label = MIDDLE_VAR_NAME
+
     H, W = mask.shape
     n_years = len(years)
 
-    # 生成缓存文件名（基于年份范围、类别和阈值）
-    cache_key = f"{MIDDLE_VAR_NAME}_{years[0]}_{years[-1]}_{len(categories)}_thr{PHENO_THRESHOLD_PCT:.2f}"
+    # 生成缓存文件名（基于变量标签、年份范围、类别和阈值）
+    cache_key = f"{var_label}_{years[0]}_{years[-1]}_{len(categories)}_thr{threshold_pct:.2f}"
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
     cache_file = OUTPUT_FIG_DIR / f"daily_data_cache_{cache_hash}.npz"
 
@@ -266,7 +308,20 @@ def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_wo
         except Exception as e:
             print(f"  缓存加载失败: {e}，重新计算...")
 
-    print(f"\n计算各类别的日{MIDDLE_VAR_NAME}...")
+    print(f"\n计算各类别的日{var_label}...")
+
+    # 阈值>0时，基准曲线只用四类并集的像元年份
+    if threshold_pct > 0:
+        any_category_mask = None
+        for cat_mask in categories.values():
+            if any_category_mask is None:
+                any_category_mask = cat_mask.copy()
+            else:
+                any_category_mask |= cat_mask
+        print(f"  基准曲线使用四类并集的像元年份（阈值={threshold_pct*100:.0f}%）")
+    else:
+        any_category_mask = None  # None表示使用所有像元年份
+        print(f"  基准曲线使用所有像元年份（无阈值）")
 
     # 初始化累加器（使用更小的数据类型减少内存）
     baseline_sum = np.zeros((365, H, W), dtype=np.float32)
@@ -284,7 +339,7 @@ def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_wo
             doy = noleap_doy_from_date(date_obj)
             if doy is None:
                 continue
-            data_file = DAILY_DATA_DIR / DAILY_DATA_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
+            data_file = daily_dir / daily_format.format(date=date_obj.strftime("%Y%m%d"))
             if data_file.exists():
                 file_tasks.append((year_idx, doy - 1, data_file))
 
@@ -294,7 +349,7 @@ def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_wo
     batch_size = 100  # 每批处理100个文件
     n_batches = (len(file_tasks) + batch_size - 1) // batch_size
 
-    for batch_idx in tqdm(range(n_batches), desc=f"处理{MIDDLE_VAR_NAME}数据"):
+    for batch_idx in tqdm(range(n_batches), desc=f"处理{var_label}数据"):
         batch_start = batch_idx * batch_size
         batch_end = min(batch_start + batch_size, len(file_tasks))
         batch_tasks = file_tasks[batch_start:batch_end]
@@ -310,8 +365,13 @@ def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_wo
             if data is None:
                 continue
 
-            baseline_sum[doy_idx, valid] += data[valid]
-            baseline_count[doy_idx, valid] += 1
+            # 基准曲线累加：阈值>0时只用四类并集的像元年份
+            if any_category_mask is not None:
+                baseline_valid = valid & any_category_mask[year_idx]
+            else:
+                baseline_valid = valid
+            baseline_sum[doy_idx, baseline_valid] += data[baseline_valid]
+            baseline_count[doy_idx, baseline_valid] += 1
 
             for cat, cat_mask in categories.items():
                 cat_year_mask = cat_mask[year_idx]
@@ -324,27 +384,38 @@ def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_wo
     print("计算空间平均...")
 
     daily_data = {}
+    mask_3d = mask[np.newaxis, :, :]  # (1, H, W)
 
-    # 基准线 - 向量化计算
+    # 基准线 - 时间平均（每个像元在多年上的平均值）
     with np.errstate(divide='ignore', invalid='ignore'):
         baseline_mean = np.where(baseline_count > 0,
                                   baseline_sum / baseline_count,
                                   np.nan)
 
-    # 向量化空间平均：对每个DOY，计算mask内有效像元的平均值
-    mask_3d = mask[np.newaxis, :, :]  # (1, H, W)
-    baseline_mean_masked = np.where(mask_3d & np.isfinite(baseline_mean), baseline_mean, np.nan)
+    # 各类别 - 时间平均
+    cat_mean_dict = {}
+    for cat in categories:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cat_mean_dict[cat] = np.where(cat_count[cat] > 0,
+                                           cat_sum[cat] / cat_count[cat],
+                                           np.nan)
+
+    # 构建公共有效像元掩膜：对每个DOY，只有基准线和所有4个类别都有有效数据的像元才参与空间平均
+    # 这确保基准曲线确实是四类曲线的加权平均，避免因不同像元集合导致的系统性偏差
+    common_valid = mask_3d & np.isfinite(baseline_mean)  # (365, H, W)
+    for cat in categories:
+        common_valid = common_valid & np.isfinite(cat_mean_dict[cat])
+
+    n_common = np.sum(common_valid, axis=(1, 2))
+    print(f"  公共有效像元数: 最小={np.min(n_common)}, 最大={np.max(n_common)}, 平均={np.mean(n_common):.0f}")
+
+    # 使用公共掩膜进行空间平均
+    baseline_mean_masked = np.where(common_valid, baseline_mean, np.nan)
     baseline_spatial = np.nanmean(baseline_mean_masked, axis=(1, 2))  # (365,)
     daily_data['baseline'] = baseline_spatial
 
-    # 各类别 - 向量化计算
     for cat in categories:
-        with np.errstate(divide='ignore', invalid='ignore'):
-            cat_mean = np.where(cat_count[cat] > 0,
-                                cat_sum[cat] / cat_count[cat],
-                                np.nan)
-
-        cat_mean_masked = np.where(mask_3d & np.isfinite(cat_mean), cat_mean, np.nan)
+        cat_mean_masked = np.where(common_valid, cat_mean_dict[cat], np.nan)
         cat_spatial = np.nanmean(cat_mean_masked, axis=(1, 2))
         daily_data[cat] = cat_spatial
 
@@ -354,7 +425,7 @@ def compute_daily_data_by_category(years, categories, mask, use_cache=True, n_wo
         np.savez_compressed(cache_file, daily_data=daily_data)
 
     # 释放大数组内存
-    del baseline_sum, baseline_count, cat_sum, cat_count
+    del baseline_sum, baseline_count, cat_sum, cat_count, cat_mean_dict, common_valid
 
     return daily_data
 
@@ -476,7 +547,7 @@ def extract_phenology_from_curve(curve, x_daily, percent=0.20):
 # ==================== 绘图函数 ====================
 
 def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_pheno,
-                                  category, output_path):
+                                  category, output_path, var_label=None):
     """
     绘制完整的分解示意图，在一张图上展示整个生长季的分解
 
@@ -490,6 +561,9 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
     - TR_eos_change: EOS变化带来的累积（青色）
     - TR_fixed_window: 固定窗口内的速率差异（紫色斜线填充）
     """
+    if var_label is None:
+        var_label = MIDDLE_VAR_NAME
+
     fig, ax = plt.subplots(figsize=(18, 12))
 
     x_daily = np.arange(1, 366)
@@ -519,7 +593,7 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
     # 颜色定义
     color_baseline = '#3498db'  # 蓝色 - 基准曲线
     color_year = '#e67e22'      # 橙色 - 某年曲线
-    color_trc_av = '#d5d5d5'    # 浅灰色 - TR_c_av 基准累积
+    color_trc_av = '#E0E0E0'    # 浅灰色 - TR_c_av 基准累积
     color_sos = '#2ecc71'       # 绿色 - TR_sos_change
     color_pos = '#f39c12'       # 金黄色 - TR_pos_change
     color_eos = '#1abc9c'       # 青色 - TR_eos_change
@@ -527,30 +601,38 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
     color_fixed_pos = '#e74c3c'   # 红色 - TR_fixed正差异（当年>基准）
     color_fixed_neg = '#2980b9'   # 深蓝色 - TR_fixed负差异（当年<基准）
 
-    # 字体大小配置（再次大幅加大）
-    FONTSIZE_TITLE = 30
-    FONTSIZE_LABEL = 26
-    FONTSIZE_TICK = 22
-    FONTSIZE_LEGEND = 18
-    FONTSIZE_ANNOTATION = 24
+    # 字体大小配置：标题独立，其余统一
+    FONTSIZE_TITLE = 38
+    FONTSIZE_BODY = 36  # 所有非标题字体统一大小
+
+    # 预先计算y轴下限（用于fill_between的底部）
+    all_values = np.concatenate([baseline_curve, cat_curve])
+    valid_values = all_values[np.isfinite(all_values)]
+    data_min = np.min(valid_values)
+    if var_label.upper() == 'NDVI':
+        y_bottom = max(0, np.floor(data_min / 0.05) * 0.05)
+    elif 'GPP' in var_label.upper() or 'TR' in var_label.upper():
+        y_bottom = 0
+    else:
+        y_bottom = max(0, np.floor(data_min * 0.9 * 10) / 10)
 
     # ==================== 1. TR_c_av: 基准累积 [SOSav, EOSav] ====================
     x_range_av = x_daily[sos_av_idx:eos_av_idx+1]
     y_baseline_av = baseline_curve[sos_av_idx:eos_av_idx+1]
-    ax.fill_between(x_range_av, 0, y_baseline_av,
+    ax.fill_between(x_range_av, y_bottom, y_baseline_av,
                     color=color_trc_av, alpha=0.6, label=r'$TR_{c,av}$ (baseline)')
 
     # ==================== 2. TR_sos_change: SOS变化分量 ====================
     if sos_y < sos_av:  # SOS提前 → 正贡献
         x_sos = x_daily[sos_y_idx:sos_av_idx+1]
         y_sos = cat_curve[sos_y_idx:sos_av_idx+1]
-        ax.fill_between(x_sos, 0, y_sos,
+        ax.fill_between(x_sos, y_bottom, y_sos,
                         color=color_sos, alpha=0.5, label=r'$\Delta TR_{SOS}$ (+)')
     elif sos_y > sos_av:  # SOS推迟 → 负贡献
         x_sos = x_daily[sos_av_idx:sos_y_idx+1]
         y_sos = cat_curve[sos_av_idx:sos_y_idx+1]
-        ax.fill_between(x_sos, 0, y_sos,
-                        color=color_sos, alpha=0.3, hatch='///',
+        ax.fill_between(x_sos, y_bottom, y_sos,
+                        color=color_sos, alpha=0.5,
                         label=r'$\Delta TR_{SOS}$ (−)')
 
     # ==================== 3. TR_pos_change: POS变化分量（两侧都绘制） ====================
@@ -560,38 +642,29 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
     # 两者会相互抵消，但仍分别绘制以展示变化区域
 
     if pos_y > pos_av:  # POS延后
-        # 左侧：正贡献（窗口延长）
-        x_pos_left = x_daily[pos_av_idx:pos_y_idx+1]
-        y_pos_left = cat_curve[pos_av_idx:pos_y_idx+1]
-        ax.fill_between(x_pos_left, 0, y_pos_left,
-                        color=color_pos, alpha=0.5, label=r'$\Delta TR_{POS}$ (left+)')
-        # 右侧：负贡献（窗口缩短）- 用斜线表示损失
-        ax.fill_between(x_pos_left, 0, y_pos_left,
-                        color=color_pos, alpha=0.2, hatch='\\\\\\',
-                        label=r'$\Delta TR_{POS}$ (right−)')
+        # 左右两侧贡献相互抵消，用同一色块表示
+        x_pos = x_daily[pos_av_idx:pos_y_idx+1]
+        y_pos = cat_curve[pos_av_idx:pos_y_idx+1]
+        ax.fill_between(x_pos, y_bottom, y_pos,
+                        color=color_pos, alpha=0.5, label=r'$\Delta TR_{POS}$ (cancel)')
     elif pos_y < pos_av:  # POS提前
-        # 左侧：负贡献（窗口缩短）
-        x_pos_left = x_daily[pos_y_idx:pos_av_idx+1]
-        y_pos_left = cat_curve[pos_y_idx:pos_av_idx+1]
-        ax.fill_between(x_pos_left, 0, y_pos_left,
-                        color=color_pos, alpha=0.3, hatch='///',
-                        label=r'$\Delta TR_{POS}$ (left−)')
-        # 右侧：正贡献（窗口延长）
-        ax.fill_between(x_pos_left, 0, y_pos_left,
-                        color=color_pos, alpha=0.5,
-                        label=r'$\Delta TR_{POS}$ (right+)')
+        # 左右两侧贡献相互抵消，用同一色块表示
+        x_pos = x_daily[pos_y_idx:pos_av_idx+1]
+        y_pos = cat_curve[pos_y_idx:pos_av_idx+1]
+        ax.fill_between(x_pos, y_bottom, y_pos,
+                        color=color_pos, alpha=0.5, label=r'$\Delta TR_{POS}$ (cancel)')
 
     # ==================== 4. TR_eos_change: EOS变化分量 ====================
     if eos_y > eos_av:  # EOS延后 → 正贡献
         x_eos = x_daily[eos_av_idx:eos_y_idx+1]
         y_eos = cat_curve[eos_av_idx:eos_y_idx+1]
-        ax.fill_between(x_eos, 0, y_eos,
+        ax.fill_between(x_eos, y_bottom, y_eos,
                         color=color_eos, alpha=0.5, label=r'$\Delta TR_{EOS}$ (+)')
     elif eos_y < eos_av:  # EOS提前 → 负贡献
         x_eos = x_daily[eos_y_idx:eos_av_idx+1]
         y_eos = cat_curve[eos_y_idx:eos_av_idx+1]
-        ax.fill_between(x_eos, 0, y_eos,
-                        color=color_eos, alpha=0.3, hatch='///',
+        ax.fill_between(x_eos, y_bottom, y_eos,
+                        color=color_eos, alpha=0.5,
                         label=r'$\Delta TR_{EOS}$ (−)')
 
     # ==================== 5. TR_fixed_window: 固定窗口内速率差异 ====================
@@ -603,12 +676,12 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
     # 正差异（当年 > 基准）- 红色填充
     ax.fill_between(x_fixed, y_baseline_fixed, y_year_fixed,
                     where=(y_year_fixed > y_baseline_fixed),
-                    color=color_fixed_pos, alpha=0.5, hatch='\\\\\\',
+                    color=color_fixed_pos, alpha=0.5,
                     label=r'$\Delta TR_{fixed}$ (+)')
     # 负差异（当年 < 基准）- 蓝色填充
     ax.fill_between(x_fixed, y_baseline_fixed, y_year_fixed,
                     where=(y_year_fixed <= y_baseline_fixed),
-                    color=color_fixed_neg, alpha=0.5, hatch='///',
+                    color=color_fixed_neg, alpha=0.5,
                     label=r'$\Delta TR_{fixed}$ (−)')
 
     # ==================== 6. 绘制曲线 ====================
@@ -618,71 +691,63 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
             linewidth=4.0, label=f'{LABELS[category]}', zorder=6)
 
     # ==================== 7. 标注关键物候日期 ====================
-    # 垂直虚线
-    ax.axvline(sos_av, color=color_baseline, linestyle='--', linewidth=3.0, alpha=0.7)
-    ax.axvline(sos_y, color=color_year, linestyle='--', linewidth=3.0, alpha=0.7)
-    ax.axvline(pos_av, color=color_baseline, linestyle=':', linewidth=3.0, alpha=0.7)
-    ax.axvline(pos_y, color=color_year, linestyle=':', linewidth=3.0, alpha=0.7)
-    ax.axvline(eos_av, color=color_baseline, linestyle='--', linewidth=3.0, alpha=0.7)
-    ax.axvline(eos_y, color=color_year, linestyle='--', linewidth=3.0, alpha=0.7)
+    # 垂直虚线（统一使用 '--' 样式）
+    DASH_STYLE = (8, 5)  # (线段长, 间隔长)
+    ax.axvline(sos_av, color=color_baseline, linestyle='--', linewidth=3.0, alpha=0.7, dashes=DASH_STYLE)
+    ax.axvline(sos_y, color=color_year, linestyle='--', linewidth=3.0, alpha=0.7, dashes=DASH_STYLE)
+    ax.axvline(pos_av, color=color_baseline, linestyle='--', linewidth=3.0, alpha=0.7, dashes=DASH_STYLE)
+    ax.axvline(pos_y, color=color_year, linestyle='--', linewidth=3.0, alpha=0.7, dashes=DASH_STYLE)
+    ax.axvline(eos_av, color=color_baseline, linestyle='--', linewidth=3.0, alpha=0.7, dashes=DASH_STYLE)
+    ax.axvline(eos_y, color=color_year, linestyle='--', linewidth=3.0, alpha=0.7, dashes=DASH_STYLE)
 
-    # 设置x轴范围（覆盖整个生长季）
-    x_min = min(sos_av, sos_y) - 20
-    x_max = max(eos_av, eos_y) + 20
-    ax.set_xlim(max(1, int(x_min)), min(365, int(x_max)))
-    ax.set_ylim(bottom=0)
+    # 设置x轴范围：完整一年 1-365
+    ax.set_xlim(1, 365)
 
-    # 物候标注文字（根据相对位置动态调整，避免重叠）
+    # 设置y轴范围（y_bottom已在前面计算）
+    ax.set_ylim(bottom=y_bottom)
+
+    # 物候标注文字（原始位置，zorder最高以浮于所有图层之上）
     y_min, y_max = ax.get_ylim()
     y_range = y_max - y_min
+    TXT_Z = 20  # 高于曲线(5-6)和填充区域
+    FONTSIZE_ANNOT = 40  # 标注字体稍大，使下标/上标更清晰
 
-    # SOS标注：根据SOS_av和SOS'的相对位置调整
-    # 如果SOS' < SOS_av（提前），SOS'在左边下方，SOS_av在右边上方
-    # 如果SOS' > SOS_av（推迟），SOS_av在左边下方，SOS'在右边上方
-    if sos_y < sos_av:  # SOS提前
-        ax.text(sos_y, y_max * 0.03, r"$SOS'$", fontsize=FONTSIZE_ANNOTATION, color=color_year,
-                ha='center', va='bottom', fontweight='bold')
-        ax.text(sos_av, y_max * 0.12, r'$SOS_{av}$', fontsize=FONTSIZE_ANNOTATION, color=color_baseline,
-                ha='center', va='bottom', fontweight='bold')
-    else:  # SOS推迟或相等
-        ax.text(sos_av, y_max * 0.03, r'$SOS_{av}$', fontsize=FONTSIZE_ANNOTATION, color=color_baseline,
-                ha='center', va='bottom', fontweight='bold')
-        ax.text(sos_y, y_max * 0.12, r"$SOS'$", fontsize=FONTSIZE_ANNOTATION, color=color_year,
-                ha='center', va='bottom', fontweight='bold')
+    # SOS标注（底部）：SOS'在上，SOSav在下（间距0.05统一）
+    ax.text(sos_y, y_min + y_range * 0.08, r"$\mathrm{SOS\!'}$", fontsize=FONTSIZE_ANNOT, color=color_year,
+            ha='center', va='bottom', fontweight='bold', zorder=TXT_Z)
+    ax.text(sos_av, y_min + y_range * 0.03, r"$\mathrm{SOS}_{\!\mathrm{av}}$", fontsize=FONTSIZE_ANNOT, color=color_baseline,
+            ha='center', va='bottom', fontweight='bold', zorder=TXT_Z)
 
-    # POS标注（顶部）：根据POS_av和POS'的相对位置调整
-    if pos_y > pos_av:  # POS延后
-        ax.text(pos_av, y_max * 0.98, r'$POS_{av}$', fontsize=FONTSIZE_ANNOTATION, color=color_baseline,
-                ha='center', va='top', fontweight='bold')
-        ax.text(pos_y, y_max * 0.88, r"$POS'$", fontsize=FONTSIZE_ANNOTATION, color=color_year,
-                ha='center', va='top', fontweight='bold')
-    else:  # POS提前或相等
-        ax.text(pos_y, y_max * 0.98, r"$POS'$", fontsize=FONTSIZE_ANNOTATION, color=color_year,
-                ha='center', va='top', fontweight='bold')
-        ax.text(pos_av, y_max * 0.88, r'$POS_{av}$', fontsize=FONTSIZE_ANNOTATION, color=color_baseline,
-                ha='center', va='top', fontweight='bold')
+    # POS标注（顶部）：POS'在上，POSav在下（间距0.05统一）
+    ax.text(pos_y, y_min + y_range * 0.92, r"$\mathrm{POS\!'}$", fontsize=FONTSIZE_ANNOT, color=color_year,
+            ha='center', va='top', fontweight='bold', zorder=TXT_Z)
+    ax.text(pos_av, y_min + y_range * 0.87, r"$\mathrm{POS}_{\!\mathrm{av}}$", fontsize=FONTSIZE_ANNOT, color=color_baseline,
+            ha='center', va='top', fontweight='bold', zorder=TXT_Z)
 
-    # EOS标注：根据EOS_av和EOS'的相对位置调整
-    if eos_y > eos_av:  # EOS延后
-        ax.text(eos_av, y_max * 0.03, r'$EOS_{av}$', fontsize=FONTSIZE_ANNOTATION, color=color_baseline,
-                ha='center', va='bottom', fontweight='bold')
-        ax.text(eos_y, y_max * 0.12, r"$EOS'$", fontsize=FONTSIZE_ANNOTATION, color=color_year,
-                ha='center', va='bottom', fontweight='bold')
-    else:  # EOS提前或相等
-        ax.text(eos_y, y_max * 0.03, r"$EOS'$", fontsize=FONTSIZE_ANNOTATION, color=color_year,
-                ha='center', va='bottom', fontweight='bold')
-        ax.text(eos_av, y_max * 0.12, r'$EOS_{av}$', fontsize=FONTSIZE_ANNOTATION, color=color_baseline,
-                ha='center', va='bottom', fontweight='bold')
+    # EOS标注（底部）：EOS'在上，EOSav在下（间距0.05统一）
+    ax.text(eos_y, y_min + y_range * 0.08, r"$\mathrm{EOS\!'}$", fontsize=FONTSIZE_ANNOT, color=color_year,
+            ha='center', va='bottom', fontweight='bold', zorder=TXT_Z)
+    ax.text(eos_av, y_min + y_range * 0.03, r"$\mathrm{EOS}_{\!\mathrm{av}}$", fontsize=FONTSIZE_ANNOT, color=color_baseline,
+            ha='center', va='bottom', fontweight='bold', zorder=TXT_Z)
 
     # ==================== 8. 图例和标签 ====================
-    ax.set_xlabel('DOY (Day of Year)', fontsize=FONTSIZE_LABEL, fontweight='bold')
-    ax.set_ylabel(f'Daily {MIDDLE_VAR_NAME}', fontsize=FONTSIZE_LABEL, fontweight='bold')
-    ax.set_title(f'Decomposition: {LABELS[category]}', fontsize=FONTSIZE_TITLE, fontweight='bold')
-    ax.tick_params(axis='both', labelsize=FONTSIZE_TICK)
+    ax.set_ylabel(f'Daily {var_label}', fontsize=FONTSIZE_BODY, fontweight='bold')
+    ax.tick_params(axis='both', labelsize=FONTSIZE_BODY)
     ax.grid(True, alpha=0.3, linestyle='--')
 
-    # 图例放在图外右侧
-    ax.legend(loc='upper left', fontsize=FONTSIZE_LEGEND, framealpha=0.9, ncol=2)
+    # 图例：无边框，字体略小于正文
+    FONTSIZE_LEGEND = 28
+    ax.legend(loc='upper left', fontsize=FONTSIZE_LEGEND, frameon=False, ncol=1,
+              handletextpad=0.4, labelspacing=0.3, handlelength=1.5)
+
+    # 标题：灰色矩形紧贴数据框顶部，与数据区等宽（使用 ax.transAxes 坐标）
+    title_text = f'SOS effects on {var_label}: {LABELS[category]}'
+    ax.add_patch(mpl.patches.Rectangle(
+        (0, 1.0), 1.0, 0.09,
+        transform=ax.transAxes, facecolor='#EDEDED',
+        edgecolor='#BBBBBB', linewidth=1.5, clip_on=False, zorder=10))
+    ax.text(0.5, 1.045, title_text, fontsize=FONTSIZE_TITLE, fontweight='bold',
+            ha='center', va='center', transform=ax.transAxes, zorder=11)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -692,7 +757,8 @@ def plot_decomposition_schematic(baseline_curve, cat_curve, baseline_pheno, cat_
 
 
 def plot_single_category(daily_data, category, category_stats, output_path,
-                         baseline_curve, baseline_pheno, cat_curve, cat_pheno):
+                         baseline_curve, baseline_pheno, cat_curve, cat_pheno,
+                         var_label=None):
     """
     绘制单个类别的生长曲线图（与基准线叠加）
 
@@ -714,7 +780,11 @@ def plot_single_category(daily_data, category, category_stats, output_path,
         该类别拟合曲线
     cat_pheno : dict
         该类别物候参数
+    var_label : str, optional
+        变量标签，默认使用全局MIDDLE_VAR_NAME
     """
+    if var_label is None:
+        var_label = MIDDLE_VAR_NAME
     fig, ax = plt.subplots(figsize=(14, 8))
 
     x_daily = np.arange(1, 366)
@@ -798,9 +868,9 @@ def plot_single_category(daily_data, category, category_stats, output_path,
 
     # 图形设置
     ax.set_xlabel('Day of Year (DOY)', fontsize=14, fontweight='bold')
-    ax.set_ylabel(MIDDLE_VAR_NAME, fontsize=14, fontweight='bold')
+    ax.set_ylabel(var_label, fontsize=14, fontweight='bold')
 
-    title = f'{MIDDLE_VAR_NAME} Growth Curve: {LABELS[category]}'
+    title = f'{var_label} Growth Curve: {LABELS[category]}'
     ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
 
     ax.set_xlim(1, 365)
@@ -919,116 +989,159 @@ def compute_category_statistics(categories, sos_stack, eos_stack, mask):
 # ==================== 主函数 ====================
 
 def main():
+    ensure_output_fig_dir()
     print("\n" + "="*70)
-    print(f"物候异常分组的{MIDDLE_VAR_NAME}年内生长曲线分析")
+    print("物候异常分组的年内生长曲线分析（多数据源组合 × 多阈值）")
     print("="*70)
 
     years = list(range(YEAR_START, YEAR_END + 1))
     print(f"分析年份: {YEAR_START}-{YEAR_END} ({len(years)}年)")
-    print(f"变量: {MIDDLE_VAR_NAME}")
+    print(f"数据源组合: {len(RUN_CONFIGS_07)} 种")
+    print(f"阈值列表: {PHENO_THRESHOLD_LIST}")
 
-    # 加载掩膜
-    print("\n[1/5] 加载掩膜...")
+    # 加载掩膜（所有组合共用）
+    print("\n[0] 加载掩膜...")
     mask = load_mask()
     print(f"  有效像元数: {np.sum(mask)}")
 
-    # 加载物候数据
-    print("\n[2/5] 加载物候数据...")
-    sos_stack, eos_stack, valid_years = load_phenology_all_years(years)
-    print(f"  有效年份数: {len(valid_years)}")
-    print(f"  数据形状: {sos_stack.shape}")
+    total_generated = 0
+    total_skipped = 0
 
-    # 分类年份
-    print("\n[3/5] 按物候异常分类年份...")
-    categories, category_year_counts, sos_mean, eos_mean = \
-        classify_years_by_phenology(sos_stack, eos_stack, valid_years, mask,
-                                     threshold_pct=PHENO_THRESHOLD_PCT)
+    # 外层循环：遍历阈值
+    for thr_pct in PHENO_THRESHOLD_LIST:
+        thr_tag = f"thr{int(thr_pct*100)}pct" if thr_pct > 0 else "no_threshold"
 
-    # 统计各类别
-    category_stats = compute_category_statistics(categories, sos_stack, eos_stack, mask)
+        print(f"\n{'='*70}")
+        print(f"阈值: {thr_pct*100:.0f}% ({thr_tag})")
+        print(f"{'='*70}")
 
-    print("\n  各类别统计:")
-    for cat, stats in category_stats.items():
-        print(f"    {LABELS[cat]}: 平均{stats['n_years_mean']:.1f}年/像元")
+        # 内层循环：遍历数据源组合
+        for run_idx, cfg in enumerate(RUN_CONFIGS_07, 1):
+            run_name = cfg['run_name']
+            var_label = cfg['var_label']
+            data_type = cfg['data_type']
 
-    # 计算日数据
-    print(f"\n[4/5] 计算各类别的日{MIDDLE_VAR_NAME}...")
-    daily_data = compute_daily_data_by_category(valid_years, categories, mask)
+            # 输出子目录：run_name/thr_tag/
+            run_output_dir = OUTPUT_FIG_DIR / run_name / thr_tag
+            run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 拟合曲线并提取物候参数
-    print("\n[5/5] 拟合曲线并绘图...")
+            # 检查是否已有结果（看分解示意图是否齐全，4个类别）
+            expected_files = [
+                run_output_dir / f"decomposition_schematic_{var_label}_{cat}.png"
+                for cat in ['sos_early_eos_late', 'sos_early_eos_early',
+                            'sos_late_eos_late', 'sos_late_eos_early']
+            ]
+            if all(f.exists() for f in expected_files):
+                print(f"\n  [跳过] {run_name}/{thr_tag} - 已有完整结果")
+                total_skipped += 8
+                continue
 
-    x_daily = np.arange(1, 366)
-    fitted_curves = {}
-    pheno_params = {}
+            print(f"\n{'#'*70}")
+            print(f"## 组合 {run_idx}/{len(RUN_CONFIGS_07)}: {run_name} "
+                  f"(标签: {var_label}, 阈值: {thr_pct*100:.0f}%)")
+            print(f"{'#'*70}")
 
-    # 先拟合所有曲线
-    for cat in ['baseline'] + list(categories.keys()):
-        y = daily_data[cat]
-        y_smooth = smooth_curve(y)
+            # [1/4] 加载物候数据
+            print(f"\n  [1/4] 加载物候数据 ({cfg['pheno_dir'].name})...")
+            sos_stack, eos_stack, valid_years = load_phenology_all_years(
+                years, pheno_dir=cfg['pheno_dir'], pheno_format=cfg['pheno_format'])
+            print(f"    有效年份数: {len(valid_years)}")
+            print(f"    数据形状: {sos_stack.shape}")
 
-        # 检查数据有效性
-        valid_count = np.sum(np.isfinite(y))
-        print(f"  {cat}: {valid_count} valid days")
+            # [2/4] 按物候异常分类年份
+            print(f"\n  [2/4] 按物候异常分类年份（阈值={thr_pct*100:.0f}%）...")
+            categories, category_year_counts, sos_mean, eos_mean = \
+                classify_years_by_phenology(sos_stack, eos_stack, valid_years, mask,
+                                             threshold_pct=thr_pct)
 
-        popt = fit_double_logistic(x_daily, y_smooth)
-        if popt is not None:
-            y_fitted = double_logistic(x_daily, *popt)
-            fitted_curves[cat] = y_fitted
-            sos, eos, pos = extract_phenology_from_curve(y_fitted, x_daily)
-            pheno_params[cat] = {'SOS': sos, 'EOS': eos, 'POS': pos}
-            print(f"    拟合成功: SOS={sos:.1f}, POS={pos:.1f}, EOS={eos:.1f}")
-        else:
-            fitted_curves[cat] = y_smooth
-            pheno_params[cat] = {'SOS': np.nan, 'EOS': np.nan, 'POS': np.nan}
-            print(f"    拟合失败！")
+            category_stats = compute_category_statistics(categories, sos_stack, eos_stack, mask)
+            for cat, stats in category_stats.items():
+                print(f"    {LABELS[cat]}: 平均{stats['n_years_mean']:.1f}年/像元")
 
-    # 为每个类别单独绘图
-    baseline_curve = fitted_curves['baseline']
-    baseline_pheno = pheno_params['baseline']
+            # [3/4] 计算日数据
+            print(f"\n  [3/4] 计算各类别的日{var_label}...")
+            daily_data = compute_daily_data_by_category(
+                valid_years, categories, mask,
+                daily_dir=cfg['daily_dir'], daily_format=cfg['daily_format'],
+                var_label=var_label, threshold_pct=thr_pct)
 
-    for category in categories.keys():
-        # 原有曲线图
-        output_path = OUTPUT_FIG_DIR / OUTPUT_FILE_FORMAT.format(category=category)
-        plot_single_category(
-            daily_data=daily_data,
-            category=category,
-            category_stats=category_stats,
-            output_path=output_path,
-            baseline_curve=baseline_curve,
-            baseline_pheno=baseline_pheno,
-            cat_curve=fitted_curves[category],
-            cat_pheno=pheno_params[category]
-        )
+            # [4/4] 拟合曲线并绘图
+            print(f"\n  [4/4] 拟合曲线并绘图...")
 
-        # 新增：分解示意图
-        decomp_output_path = OUTPUT_FIG_DIR / f"decomposition_schematic_{MIDDLE_VAR_NAME}_{category}.png"
-        plot_decomposition_schematic(
-            baseline_curve=baseline_curve,
-            cat_curve=fitted_curves[category],
-            baseline_pheno=baseline_pheno,
-            cat_pheno=pheno_params[category],
-            category=category,
-            output_path=decomp_output_path
-        )
+            x_daily = np.arange(1, 366)
+            fitted_curves = {}
+            pheno_params = {}
 
-    # 打印物候参数对比
-    print("\n" + "="*70)
-    print("物候参数对比")
-    print("="*70)
-    print(f"{'类别':<30} {'SOS':>10} {'POS':>10} {'EOS':>10} {'LOS':>10}")
-    print("-"*70)
-    for cat in ['baseline'] + list(categories.keys()):
-        if cat in pheno_params:
-            p = pheno_params[cat]
-            los = p['EOS'] - p['SOS'] if np.isfinite(p['EOS']) and np.isfinite(p['SOS']) else np.nan
-            print(f"{LABELS[cat]:<30} {p['SOS']:>10.0f} {p['POS']:>10.0f} "
-                  f"{p['EOS']:>10.0f} {los:>10.0f}")
-    print("="*70)
+            for cat in ['baseline'] + list(categories.keys()):
+                y = daily_data[cat]
+                y_smooth = smooth_curve(y)
 
-    print(f"\n分析完成！")
-    print(f"输出目录: {OUTPUT_FIG_DIR}")
-    print(f"共生成 {len(categories) * 2} 张图（{len(categories)} 张曲线图 + {len(categories)} 张分解示意图）")
+                valid_count = np.sum(np.isfinite(y))
+                print(f"    {cat}: {valid_count} valid days")
+
+                popt = fit_double_logistic(x_daily, y_smooth, data_type=data_type)
+                if popt is not None:
+                    y_fitted = double_logistic(x_daily, *popt)
+                    fitted_curves[cat] = y_fitted
+                    sos, eos, pos = extract_phenology_from_curve(y_fitted, x_daily)
+                    pheno_params[cat] = {'SOS': sos, 'EOS': eos, 'POS': pos}
+                    print(f"      拟合成功: SOS={sos:.1f}, POS={pos:.1f}, EOS={eos:.1f}")
+                else:
+                    fitted_curves[cat] = y_smooth
+                    pheno_params[cat] = {'SOS': np.nan, 'EOS': np.nan, 'POS': np.nan}
+                    print(f"      拟合失败！")
+
+            baseline_curve = fitted_curves['baseline']
+            baseline_pheno = pheno_params['baseline']
+
+            file_fmt = f"phenology_composite_{var_label}_{{category}}.png"
+
+            for category in categories.keys():
+                # 曲线图
+                output_path = run_output_dir / file_fmt.format(category=category)
+                plot_single_category(
+                    daily_data=daily_data,
+                    category=category,
+                    category_stats=category_stats,
+                    output_path=output_path,
+                    baseline_curve=baseline_curve,
+                    baseline_pheno=baseline_pheno,
+                    cat_curve=fitted_curves[category],
+                    cat_pheno=pheno_params[category],
+                    var_label=var_label
+                )
+
+                # 分解示意图
+                decomp_path = run_output_dir / f"decomposition_schematic_{var_label}_{category}.png"
+                plot_decomposition_schematic(
+                    baseline_curve=baseline_curve,
+                    cat_curve=fitted_curves[category],
+                    baseline_pheno=baseline_pheno,
+                    cat_pheno=pheno_params[category],
+                    category=category,
+                    output_path=decomp_path,
+                    var_label=var_label
+                )
+                total_generated += 2
+
+            # 打印物候参数对比
+            print(f"\n  [{var_label}, {thr_tag}] 物候参数对比:")
+            print(f"  {'类别':<30} {'SOS':>10} {'POS':>10} {'EOS':>10} {'LOS':>10}")
+            print("  " + "-"*70)
+            for cat in ['baseline'] + list(categories.keys()):
+                if cat in pheno_params:
+                    p = pheno_params[cat]
+                    los = p['EOS'] - p['SOS'] if np.isfinite(p['EOS']) and np.isfinite(p['SOS']) else np.nan
+                    print(f"  {LABELS[cat]:<30} {p['SOS']:>10.0f} {p['POS']:>10.0f} "
+                          f"{p['EOS']:>10.0f} {los:>10.0f}")
+
+            print(f"\n  输出目录: {run_output_dir}")
+
+    # 汇总
+    print(f"\n{'='*70}")
+    print(f"全部完成！新生成 {total_generated} 张图，跳过 {total_skipped} 张已有结果")
+    print(f"输出根目录: {OUTPUT_FIG_DIR}")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":

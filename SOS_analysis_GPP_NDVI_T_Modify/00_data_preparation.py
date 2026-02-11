@@ -24,14 +24,23 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 导入配置（固定使用_config.py）
+# 注意：00模块使用固定常量（GPP_DAILY_DIR等），不使用可切换别名VAR_DAILY_DIR
 from _config import (
     ROOT, OUTPUT_ROOT, LAT_MIN, FOREST_CLASSES, NODATA_OUT,
-    USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, PHENO_DIR,
-    YEAR_START, YEAR_END, PHENO_FILE_FORMAT,
+    USE_FOREST_MASK, LANDCOVER_FILE, TR_DAILY_DIR, TR_MODE,
+    GLEAM_TR_DAILY_DIR, ERA5_TR_DAILY_DIR, GLEAM_TR_FILE_FORMAT, ERA5_TR_FILE_FORMAT,
+    NDVI_PHENO_DIR, NDVI_PHENO_FORMAT,
+    YEAR_START, YEAR_END,
     NDVI_DAILY_DIR, SM_DAILY_DIR, TR_FILE_FORMAT, get_TR_file_path,
-    TEMPLATE_RASTER, MASK_FILE, get_GPP_file_path,
-    NDVI_DAILY_FORMAT  # NDVI日尺度文件命名格式
+    TEMPLATE_RASTER, MASK_FILE, get_NDVI_file_path,
+    NDVI_DAILY_FORMAT,
+    GPP_DAILY_DIR, GPP_DAILY_FORMAT,
+    GPP_PHENO_DIR, GPP_PHENO_FORMAT
 )
+
+# 00模块始终使用NDVI物候作为主物候（保持原始变量名以减少下游改动）
+PHENO_DIR = NDVI_PHENO_DIR
+PHENO_FILE_FORMAT = NDVI_PHENO_FORMAT
 
 # 运行开关
 RUN_VERIFY_DATA = True
@@ -93,12 +102,20 @@ def ensure_template_raster():
     candidate_years = [YEAR_START, (YEAR_START + YEAR_END) // 2, YEAR_END]
     candidate_dates = [(1, 15), (7, 1), (10, 1)]
     src_file = None
-    for year in candidate_years:
-        for month, day in candidate_dates:
-            test_date = datetime(year, month, day)
-            tr_file = get_TR_file_path(test_date)
-            if tr_file and tr_file.exists():
-                src_file = tr_file
+    tr_sources = []
+    if TR_MODE in ("GLEAM", "BOTH"):
+        tr_sources.append(("GLEAM", GLEAM_TR_DAILY_DIR, GLEAM_TR_FILE_FORMAT))
+    if TR_MODE in ("ERA5", "BOTH"):
+        tr_sources.append(("ERA5", ERA5_TR_DAILY_DIR, ERA5_TR_FILE_FORMAT))
+    for _, tr_dir, tr_format in tr_sources:
+        for year in candidate_years:
+            for month, day in candidate_dates:
+                test_date = datetime(year, month, day)
+                tr_file = tr_dir / tr_format.format(date=test_date.strftime("%Y%m%d"))
+                if tr_file.exists():
+                    src_file = tr_file
+                    break
+            if src_file:
                 break
         if src_file:
             break
@@ -274,6 +291,7 @@ def fast_grid_consistency_check(template_profile):
     mask/SOS/POS/GPP/SM/土地覆盖 与模板网格一致性
     """
     global NDVI_DAILY_DIR
+    global GPP_DAILY_DIR
     global SM_DAILY_DIR
     global TR_DAILY_DIR
     global PHENO_AUTO_FIXED
@@ -318,7 +336,28 @@ def fast_grid_consistency_check(template_profile):
                 PHENO_AUTO_FIXED = True
 
     if PHENO_AUTO_FIXED or (pheno_checked and pheno_all_match):
-        print("  ⚠ 物候已一致/修正，按统一auto-fix流程跳过重投影/掩膜步骤")
+        print("  ⚠ NDVI物候已一致/修正，按统一auto-fix流程跳过重投影/掩膜步骤")
+
+    # GPP物候样本
+    if GPP_PHENO_DIR.exists():
+        for var_key, label in [("SOS", "GPP-SOS物候"), ("POS", "GPP-POS物候"), ("EOS", "GPP-EOS物候")]:
+            if var_key not in GPP_PHENO_FORMAT:
+                continue
+            sample = None
+            for year in candidate_years:
+                pheno_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT[var_key].format(year=year)
+                if pheno_file.exists():
+                    sample = pheno_file
+                    break
+            if sample is None:
+                print(f"  ⚠ 未找到{label}样本，跳过一致性检查")
+            else:
+                try:
+                    _check_profile_match(template_profile, sample, label)
+                except ValueError as e:
+                    print(f"  ⚠ {label}网格不一致: {e}")
+    else:
+        print(f"  ⚠ GPP物候目录不存在: {GPP_PHENO_DIR}")
 
     # NDVI日尺度样本
     ndvi_dates = [datetime(1982, 1, 15), datetime(2000, 7, 1), datetime(2018, 10, 1)]
@@ -341,21 +380,48 @@ def fast_grid_consistency_check(template_profile):
             if not AUTO_REPROJECT_INPLACE:
                 print(f"  ⚠ 请同步更新 _config.py 中的 NDVI_DAILY_DIR: {prev_dir} -> {NDVI_DAILY_DIR}")
 
-    # TR日尺度样本
-    tr_sample = _find_first_tr_file()
-    if tr_sample is None:
-        print("  ⚠ 未找到TR样本，跳过一致性检查")
+    # GPP日尺度样本
+    gpp_sample = _find_first_gpp_file()
+    if gpp_sample is None:
+        print("  ⚠ 未找到GPP样本，跳过一致性检查")
     else:
-        prev_dir = TR_DAILY_DIR
-        tr_pattern = TR_FILE_FORMAT.replace("{date}", "*")
-        fixed_dir, tr_sample = _auto_fix_dataset(
-            tr_sample, TR_DAILY_DIR, tr_pattern, template_profile, "TR日尺度"
+        prev_dir = GPP_DAILY_DIR
+        gpp_pattern = GPP_DAILY_FORMAT.replace("{date}", "*")
+        fixed_dir, gpp_sample = _auto_fix_dataset(
+            gpp_sample, GPP_DAILY_DIR, gpp_pattern, template_profile, "GPP日尺度"
         )
-        if fixed_dir != TR_DAILY_DIR:
-            TR_DAILY_DIR = fixed_dir
-            print(f"  ⚠ 已切换TR_DAILY_DIR到: {TR_DAILY_DIR}")
+        if fixed_dir != GPP_DAILY_DIR:
+            GPP_DAILY_DIR = fixed_dir
+            print(f"  ⚠ 已切换GPP_DAILY_DIR到: {GPP_DAILY_DIR}")
             if not AUTO_REPROJECT_INPLACE:
-                print(f"  ⚠ 请同步更新 _config.py 中的 TR_DAILY_DIR: {prev_dir} -> {TR_DAILY_DIR}")
+                print(f"  ⚠ 请同步更新 _config.py 中的 GPP_DAILY_DIR: {prev_dir} -> {GPP_DAILY_DIR}")
+
+    def _check_tr_sample(tr_dir, tr_format, label, update_global=False):
+        tr_sample = _find_first_tr_file(tr_dir, tr_format, use_helper=update_global)
+        if tr_sample is None:
+            print(f"  ⚠ 未找到{label}样本，跳过一致性检查")
+            return tr_dir
+        prev_dir = tr_dir
+        tr_pattern = tr_format.replace("{date}", "*")
+        fixed_dir, _ = _auto_fix_dataset(
+            tr_sample, tr_dir, tr_pattern, template_profile, label
+        )
+        if fixed_dir != tr_dir:
+            if update_global:
+                global TR_DAILY_DIR
+                TR_DAILY_DIR = fixed_dir
+                print(f"  ⚠ 已切换TR_DAILY_DIR到: {TR_DAILY_DIR}")
+            else:
+                print(f"  ⚠ {label}目录已自动修复: {prev_dir} -> {fixed_dir}")
+            if not AUTO_REPROJECT_INPLACE:
+                print(f"  ⚠ 请同步更新 _config.py 中的 {label}目录: {prev_dir} -> {fixed_dir}")
+        return fixed_dir
+
+    # TR日尺度样本（GLEAM/ERA5）
+    if TR_MODE in ("GLEAM", "BOTH"):
+        _check_tr_sample(GLEAM_TR_DAILY_DIR, GLEAM_TR_FILE_FORMAT, "TR(GLEAM)日尺度", update_global=True)
+    if TR_MODE in ("ERA5", "BOTH"):
+        _check_tr_sample(ERA5_TR_DAILY_DIR, ERA5_TR_FILE_FORMAT, "TR(ERA5)日尺度", update_global=False)
 
     # SM日尺度样本
     sm_dates = [datetime(1982, 1, 15), datetime(2000, 6, 15), datetime(2018, 12, 15)]
@@ -564,29 +630,44 @@ def combine_masks(lat_mask, forest_mask):
     return combined_mask
 
 
-def _find_first_tr_file():
-    # 从YEAR_START年起，寻找最早可用的TR日文件
+def _find_first_tr_file(tr_dir=None, tr_format=None, use_helper=True):
+    """从YEAR_START年起，寻找最早可用的TR日文件"""
+    if tr_dir is None:
+        tr_dir = TR_DAILY_DIR
+    if tr_format is None:
+        tr_format = TR_FILE_FORMAT
     for day_offset in range(0, 31):
         date_obj = datetime(YEAR_START, 1, 1) + timedelta(days=day_offset)
-        cand = TR_DAILY_DIR / TR_FILE_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
+        cand = tr_dir / tr_format.format(date=date_obj.strftime("%Y%m%d"))
         if cand.exists():
             return cand
-        tr_file = get_TR_file_path(date_obj)
-        if tr_file and tr_file.exists():
-            return tr_file
+        if use_helper and tr_dir == TR_DAILY_DIR and tr_format == TR_FILE_FORMAT:
+            tr_file = get_TR_file_path(date_obj)
+            if tr_file and tr_file.exists():
+                return tr_file
     return None
 
 
 def _find_first_ndvi_file():
-    # 从YEAR_START年起，寻找最早可用的GPP日文件
+    """从YEAR_START年起，寻找最早可用的NDVI日文件"""
     for day_offset in range(0, 31):
         date_obj = datetime(YEAR_START, 1, 1) + timedelta(days=day_offset)
         cand = NDVI_DAILY_DIR / NDVI_DAILY_FORMAT.format(date=date_obj.strftime('%Y%m%d'))
         if cand.exists():
             return cand
-        ndvi_file = get_GPP_file_path(date_obj, daily=True)
+        ndvi_file = get_NDVI_file_path(date_obj)
         if ndvi_file and ndvi_file.exists():
             return ndvi_file
+    return None
+
+
+def _find_first_gpp_file():
+    """从YEAR_START年起，寻找最早可用的GPP日文件（使用固定常量路径）"""
+    for day_offset in range(0, 31):
+        date_obj = datetime(YEAR_START, 1, 1) + timedelta(days=day_offset)
+        cand = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_obj.strftime('%Y%m%d'))
+        if cand.exists():
+            return cand
     return None
 
 
@@ -620,13 +701,23 @@ def _apply_data_intersection_mask(combined_mask, template_profile):
     print("\n  [DATA] 交集掩膜：首个有效文件")
     sos_file = PHENO_DIR / PHENO_FILE_FORMAT["SOS"].format(year=YEAR_START)
     pos_file = PHENO_DIR / PHENO_FILE_FORMAT["POS"].format(year=YEAR_START)
-    tr_file = _find_first_tr_file()
+    tr_file = None
+    tr_file_era5 = None
+    if TR_MODE in ("GLEAM", "BOTH"):
+        tr_file = _find_first_tr_file(GLEAM_TR_DAILY_DIR, GLEAM_TR_FILE_FORMAT, use_helper=False)
+    if TR_MODE in ("ERA5", "BOTH"):
+        tr_file_era5 = _find_first_tr_file(ERA5_TR_DAILY_DIR, ERA5_TR_FILE_FORMAT, use_helper=False)
     ndvi_file = _find_first_ndvi_file()
+    gpp_file = _find_first_gpp_file()
 
-    if tr_file is None:
-        raise FileNotFoundError("未找到可用TR日尺度文件用于掩膜交集")
+    if TR_MODE in ("GLEAM", "BOTH") and tr_file is None:
+        raise FileNotFoundError("未找到可用GLEAM TR日尺度文件用于掩膜交集")
+    if TR_MODE in ("ERA5", "BOTH") and tr_file_era5 is None:
+        raise FileNotFoundError("未找到可用ERA5 TR日尺度文件用于掩膜交集")
     if ndvi_file is None:
         raise FileNotFoundError("未找到可用NDVI日尺度文件用于掩膜交集")
+    if gpp_file is None:
+        raise FileNotFoundError("未找到可用GPP日尺度文件用于掩膜交集")
     if not sos_file.exists():
         raise FileNotFoundError(f"未找到SOS文件: {sos_file}")
     if not pos_file.exists():
@@ -636,13 +727,21 @@ def _apply_data_intersection_mask(combined_mask, template_profile):
                                       value_range=(1, 365))
     pos_valid = _valid_mask_from_file(pos_file, template_profile, "POS",
                                       value_range=(1, 365))
-    tr_valid = _valid_mask_from_file(tr_file, template_profile, "TR",
-                                     non_negative=True)
-    ndvi_valid = _valid_mask_from_file(ndvi_file, template_profile, "GPP",
-                                      non_negative=True)  # NDVI负值过滤，与其他模块保持一致
+    tr_valid = None
+    if TR_MODE in ("GLEAM", "BOTH"):
+        tr_valid = _valid_mask_from_file(tr_file, template_profile, "TR(GLEAM)",
+                                         non_negative=True)
+    if TR_MODE in ("ERA5", "BOTH"):
+        tr_valid_era5 = _valid_mask_from_file(tr_file_era5, template_profile, "TR(ERA5)",
+                                              non_negative=True)
+        tr_valid = tr_valid_era5 if tr_valid is None else (tr_valid & tr_valid_era5)
+    ndvi_valid = _valid_mask_from_file(ndvi_file, template_profile, "NDVI",
+                                      non_negative=True)
+    gpp_valid = _valid_mask_from_file(gpp_file, template_profile, "GPP",
+                                      non_negative=True)
 
     before = np.sum(combined_mask)
-    combined_mask = combined_mask & sos_valid & pos_valid & tr_valid & ndvi_valid
+    combined_mask = combined_mask & sos_valid & pos_valid & tr_valid & ndvi_valid & gpp_valid
     after = np.sum(combined_mask)
     print(f"  数据交集: {before} -> {after} (移除 {before - after})")
     return combined_mask
@@ -660,57 +759,112 @@ def check_data_availability(years=[2000, 2010, 2018]):
     print(f"\n[4] 数据完整性检查...")
 
     results = {
-        'pheno': {'available': 0, 'missing': 0},
-        'tr': {'available': 0, 'missing': 0}
+        'ndvi_pheno': {'available': 0, 'missing': 0},
+        'gpp_pheno': {'available': 0, 'missing': 0},
+        'ndvi': {'available': 0, 'missing': 0},
+        'gpp': {'available': 0, 'missing': 0},
+        'tr_gleam': {'available': 0, 'missing': 0},
+        'tr_era5': {'available': 0, 'missing': 0},
     }
 
-    # 检查物候数据
-    print("\n  物候数据 (SOS/POS/EOS):")
+    # 检查NDVI物候数据
+    print("\n  NDVI物候数据 (SOS/POS/EOS):")
     for year in years:
-        # 根据配置的格式检查物候文件
         sos_file = PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year)
         pos_file = PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year)
         eos_file = PHENO_DIR / PHENO_FILE_FORMAT['EOS'].format(year=year)
-
-        files_exist = [
-            sos_file.exists(),
-            pos_file.exists(),
-            eos_file.exists()
-        ]
-
+        files_exist = [sos_file.exists(), pos_file.exists(), eos_file.exists()]
         if all(files_exist):
             print(f"    {year}: ✓")
-            results['pheno']['available'] += 1
+            results['ndvi_pheno']['available'] += 1
         else:
-            # 修复警告：先计算缺失列表再插入f-string
             missing_types = [name for i, name in enumerate(['SOS', 'POS', 'EOS']) if not files_exist[i]]
             print(f"    {year}: ✗ (缺失: {missing_types})")
-            results['pheno']['missing'] += 1
+            results['ndvi_pheno']['missing'] += 1
 
-    # 检查TR数据（抽样检查每年1月15日）
-    print("\n  TR数据 (每年1月15日抽样 - GLEAM):")
+    # 检查GPP物候数据
+    print("\n  GPP物候数据 (SOS/POS/EOS):")
+    for year in years:
+        sos_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT['SOS'].format(year=year)
+        pos_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT['POS'].format(year=year)
+        eos_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT['EOS'].format(year=year)
+        files_exist = [sos_file.exists(), pos_file.exists(), eos_file.exists()]
+        if all(files_exist):
+            print(f"    {year}: ✓")
+            results['gpp_pheno']['available'] += 1
+        else:
+            missing_types = [name for i, name in enumerate(['SOS', 'POS', 'EOS']) if not files_exist[i]]
+            print(f"    {year}: ✗ (缺失: {missing_types})")
+            results['gpp_pheno']['missing'] += 1
+
+    # 检查NDVI日尺度数据（抽样检查每年1月15日）
+    print("\n  NDVI数据 (每年1月15日抽样 - GIMMS):")
     for year in years:
         test_date = datetime(year, 1, 15)
-        tr_file = get_TR_file_path(test_date)
-
-        if tr_file and tr_file.exists():
-            print(f"    {year}: ✓ ({tr_file.name})")
-            results['tr']['available'] += 1
+        ndvi_file = NDVI_DAILY_DIR / NDVI_DAILY_FORMAT.format(date=f"{year}0115")
+        if ndvi_file.exists():
+            print(f"    {year}: ✓ ({ndvi_file.name})")
+            results['ndvi']['available'] += 1
         else:
-            expected_name = TR_FILE_FORMAT.format(date=f"{year}0115")
-            print(f"    {year}: ✗ (缺失: {expected_name})")
-            results['tr']['missing'] += 1
+            print(f"    {year}: ✗ (缺失: {ndvi_file.name})")
+            results['ndvi']['missing'] += 1
+
+    # 检查GPP日尺度数据（抽样检查每年1月15日）
+    print("\n  GPP数据 (每年1月15日抽样 - GLASS):")
+    for year in years:
+        gpp_file = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=f"{year}0115")
+        if gpp_file.exists():
+            print(f"    {year}: ✓ ({gpp_file.name})")
+            results['gpp']['available'] += 1
+        else:
+            print(f"    {year}: ✗ (缺失: {gpp_file.name})")
+            results['gpp']['missing'] += 1
+
+    # 检查TR数据（抽样检查每年1月15日）
+    if TR_MODE in ("GLEAM", "BOTH"):
+        print("\n  TR数据 (每年1月15日抽样 - GLEAM):")
+        for year in years:
+            tr_file = GLEAM_TR_DAILY_DIR / GLEAM_TR_FILE_FORMAT.format(date=f"{year}0115")
+            if tr_file.exists():
+                print(f"    {year}: ✓ ({tr_file.name})")
+                results['tr_gleam']['available'] += 1
+            else:
+                print(f"    {year}: ✗ (缺失: {tr_file.name})")
+                results['tr_gleam']['missing'] += 1
+    if TR_MODE in ("ERA5", "BOTH"):
+        print("\n  TR数据 (每年1月15日抽样 - ERA5):")
+        for year in years:
+            tr_file = ERA5_TR_DAILY_DIR / ERA5_TR_FILE_FORMAT.format(date=f"{year}0115")
+            if tr_file.exists():
+                print(f"    {year}: ✓ ({tr_file.name})")
+                results['tr_era5']['available'] += 1
+            else:
+                print(f"    {year}: ✗ (缺失: {tr_file.name})")
+                results['tr_era5']['missing'] += 1
 
     # 总结
     print("\n  总结:")
-    print(f"    物候数据: {results['pheno']['available']}/{len(years)} 年份可用")
-    print(f"    TR数据:   {results['tr']['available']}/{len(years)} 年份可用")
+    print(f"    NDVI物候: {results['ndvi_pheno']['available']}/{len(years)} 年份可用")
+    print(f"    GPP物候:  {results['gpp_pheno']['available']}/{len(years)} 年份可用")
+    print(f"    NDVI数据: {results['ndvi']['available']}/{len(years)} 年份可用")
+    print(f"    GPP数据:  {results['gpp']['available']}/{len(years)} 年份可用")
+    if TR_MODE in ("GLEAM", "BOTH"):
+        print(f"    TR数据(GLEAM): {results['tr_gleam']['available']}/{len(years)} 年份可用")
+    if TR_MODE in ("ERA5", "BOTH"):
+        print(f"    TR数据(ERA5):  {results['tr_era5']['available']}/{len(years)} 年份可用")
 
-    if results['pheno']['missing'] > 0:
-        print(f"\n  ⚠ 提示：缺少物候数据，需运行 Module 01: 01_phenology_extraction.py")
-
-    if results['tr']['missing'] > 0:
-        print(f"\n  ⚠ 提示：缺少TR数据，请检查路径: {TR_DAILY_DIR}")
+    if results['ndvi_pheno']['missing'] > 0:
+        print(f"\n  ⚠ 提示：缺少NDVI物候数据，需运行 Module 01")
+    if results['gpp_pheno']['missing'] > 0:
+        print(f"\n  ⚠ 提示：缺少GPP物候数据，需运行 Module 01")
+    if results['ndvi']['missing'] > 0:
+        print(f"\n  ⚠ 提示：缺少NDVI数据，请检查路径: {NDVI_DAILY_DIR}")
+    if results['gpp']['missing'] > 0:
+        print(f"\n  ⚠ 提示：缺少GPP数据，请检查路径: {GPP_DAILY_DIR}")
+    if TR_MODE in ("GLEAM", "BOTH") and results['tr_gleam']['missing'] > 0:
+        print(f"\n  ⚠ 提示：缺少GLEAM TR数据，请检查路径: {GLEAM_TR_DAILY_DIR}")
+    if TR_MODE in ("ERA5", "BOTH") and results['tr_era5']['missing'] > 0:
+        print(f"\n  ⚠ 提示：缺少ERA5 TR数据，请检查路径: {ERA5_TR_DAILY_DIR}")
 
     return results
 
@@ -736,8 +890,8 @@ def check_file(file_path, name):
 
 
 def check_phenology_data():
-    """检查物候数据完整性"""
-    print("\n[2] 检查物候数据 (SOS/POS/EOS):")
+    """检查NDVI物候数据完整性"""
+    print("\n[2] 检查NDVI物候数据 (SOS/POS/EOS):")
 
     years = list(range(YEAR_START, YEAR_END + 1))
     available = 0
@@ -765,28 +919,42 @@ def check_phenology_data():
 
 def check_TR_data():
     """检查TR数据（抽样检查）"""
-    print("\n[3] 检查TR数据 (GLEAM格式，抽样检查):")
-
     test_years = [1982, 1990, 2000, 2010, 2018]
-    available = 0
+    ok = True
 
-    for year in test_years:
-        test_date = datetime(year, 1, 15)
-        tr_file = get_TR_file_path(test_date)
-
-        if tr_file and tr_file.exists():
-            print(f"  ✓ {year}: {tr_file.name}")
-            available += 1
+    if TR_MODE in ("GLEAM", "BOTH"):
+        print("\n[3] 检查TR数据 (GLEAM格式，抽样检查):")
+        available = 0
+        for year in test_years:
+            tr_file = GLEAM_TR_DAILY_DIR / GLEAM_TR_FILE_FORMAT.format(date=f"{year}0115")
+            if tr_file.exists():
+                print(f"  ✓ {year}: {tr_file.name}")
+                available += 1
+            else:
+                print(f"  ✗ {year}: 未找到 {tr_file.name}")
+        if available == len(test_years):
+            print(f"  ✓ 抽样检查通过 ({available}/{len(test_years)})")
         else:
-            expected_name = TR_FILE_FORMAT.format(date=f"{year}0115")
-            print(f"  ✗ {year}: 未找到 {expected_name}")
+            print(f"  ⚠ 部分年份缺失 ({available}/{len(test_years)})")
+            ok = False
 
-    if available == len(test_years):
-        print(f"  ✓ 抽样检查通过 ({available}/{len(test_years)})")
-        return True
+    if TR_MODE in ("ERA5", "BOTH"):
+        print("\n[3] 检查TR数据 (ERA5格式，抽样检查):")
+        available = 0
+        for year in test_years:
+            tr_file = ERA5_TR_DAILY_DIR / ERA5_TR_FILE_FORMAT.format(date=f"{year}0115")
+            if tr_file.exists():
+                print(f"  ✓ {year}: {tr_file.name}")
+                available += 1
+            else:
+                print(f"  ✗ {year}: 未找到 {tr_file.name}")
+        if available == len(test_years):
+            print(f"  ✓ 抽样检查通过 ({available}/{len(test_years)})")
+        else:
+            print(f"  ⚠ 部分年份缺失 ({available}/{len(test_years)})")
+            ok = False
 
-    print(f"  ⚠ 部分年份缺失 ({available}/{len(test_years)})")
-    return False
+    return ok
 
 
 def check_NDVI_data():
@@ -845,6 +1013,62 @@ def check_SM_data():
     return False
 
 
+def check_GPP_data():
+    """检查GPP日尺度数据（抽样检查）"""
+    print("\n[6] 检查GPP数据 (GLASS GPP日尺度，抽样检查):")
+
+    test_dates = [
+        datetime(1982, 1, 1),
+        datetime(2000, 6, 15),
+        datetime(2018, 12, 31)
+    ]
+
+    available = 0
+    for test_date in test_dates:
+        gpp_file = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=test_date.strftime('%Y%m%d'))
+
+        if gpp_file.exists():
+            print(f"  ✓ {test_date.date()}: {gpp_file.name}")
+            available += 1
+        else:
+            print(f"  ✗ {test_date.date()}: {gpp_file.name}")
+
+    if available == len(test_dates):
+        print(f"  ✓ 抽样检查通过 ({available}/{len(test_dates)})")
+        return True
+
+    print(f"  ⚠ 部分日期缺失 ({available}/{len(test_dates)})")
+    return False
+
+
+def check_GPP_pheno_data():
+    """检查GPP物候数据完整性"""
+    print("\n[7] 检查GPP物候数据 (SOS/POS/EOS):")
+
+    years = list(range(YEAR_START, YEAR_END + 1))
+    available = 0
+    missing_years = []
+
+    for year in years:
+        sos_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT['SOS'].format(year=year)
+        pos_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT['POS'].format(year=year)
+        eos_file = GPP_PHENO_DIR / GPP_PHENO_FORMAT['EOS'].format(year=year)
+
+        if all([sos_file.exists(), pos_file.exists(), eos_file.exists()]):
+            available += 1
+        else:
+            missing_years.append(year)
+
+    print(f"  可用年份: {available}/{len(years)}")
+
+    if missing_years:
+        print(f"  缺失年份: {missing_years[:5]}" + (" ..." if len(missing_years) > 5 else ""))
+        return False
+
+    print("  ✓ 所有年份完整")
+    return True
+
+
 def run_data_verification():
     """运行完整的数据验证流程"""
     print("\n" + "=" * 70)
@@ -855,9 +1079,14 @@ def run_data_verification():
 
     print("\n[1] 检查关键目录:")
     all_checks.append(check_directory(ROOT, "根目录"))
-    all_checks.append(check_directory(TR_DAILY_DIR, "TR数据目录"))
-    all_checks.append(check_directory(PHENO_DIR, "物候数据目录"))
+    if TR_MODE in ("GLEAM", "BOTH"):
+        all_checks.append(check_directory(GLEAM_TR_DAILY_DIR, "TR数据目录(GLEAM)"))
+    if TR_MODE in ("ERA5", "BOTH"):
+        all_checks.append(check_directory(ERA5_TR_DAILY_DIR, "TR数据目录(ERA5)"))
+    all_checks.append(check_directory(PHENO_DIR, "NDVI物候目录"))
+    all_checks.append(check_directory(GPP_PHENO_DIR, "GPP物候目录"))
     all_checks.append(check_directory(NDVI_DAILY_DIR, "NDVI数据目录"))
+    all_checks.append(check_directory(GPP_DAILY_DIR, "GPP数据目录"))
     all_checks.append(check_directory(SM_DAILY_DIR, "土壤水分目录"))
 
     print(f"\n  土地覆盖数据 (USE_FOREST_MASK={USE_FOREST_MASK}):")
@@ -870,6 +1099,8 @@ def run_data_verification():
     all_checks.append(check_TR_data())
     all_checks.append(check_NDVI_data())
     all_checks.append(check_SM_data())
+    all_checks.append(check_GPP_data())
+    all_checks.append(check_GPP_pheno_data())
 
     print("\n" + "=" * 70)
     print("验证结果总结")
@@ -942,7 +1173,10 @@ def main():
 
     if template_file is None:
         print("  ✗ 错误：找不到TR日尺度模板文件")
-        print(f"  请检查TR数据路径: {TR_DAILY_DIR}")
+        if TR_MODE in ("GLEAM", "BOTH"):
+            print(f"  请检查GLEAM TR数据路径: {GLEAM_TR_DAILY_DIR}")
+        if TR_MODE in ("ERA5", "BOTH"):
+            print(f"  请检查ERA5 TR数据路径: {ERA5_TR_DAILY_DIR}")
         return
 
     print(f"  ✓ 使用模板: {template_file.name}")

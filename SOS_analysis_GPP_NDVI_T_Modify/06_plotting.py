@@ -52,7 +52,9 @@ from _config import MIDDLE_VAR_NAME, OUTPUT_ROOT, FIGURES_DIR
 # ==================== 路径与全局配置 ====================
 ANALYSIS_DIR = OUTPUT_ROOT
 OUTPUT_FIG_DIR = FIGURES_DIR  # 使用_config.py中的统一配置
-OUTPUT_FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+def ensure_output_fig_dir():
+    OUTPUT_FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 SEM_FALLBACK_DIRS = [
     Path(r"D:\claude-project\结果分析"),
@@ -466,6 +468,12 @@ def plot_corr_style_map(r_file, p_file, out_figure, var_label,
 
     hist_ax.set_ylabel('Frequency (%)', labelpad=3, fontsize=FONT_SIZE)
     hist_ax.axhline(0, color='black', linewidth=.3)
+
+    # Mean 值显示
+    mean_value = np.nanmean(valid_data)
+    mean_text = f'Mean = {mean_value:.2f}'
+    ax.text(0.5, 0.97, mean_text, transform=ax.transAxes,
+            ha='center', va='center', fontsize=FONT_SIZE, color='black')
 
     # P / N 比例（正/负相关 + 显著比例）（与模板一致）
     total_pixels = valid_data.size
@@ -1074,6 +1082,394 @@ def plot_04c_all():
                 auto_range=task.auto_range,
             )
 
+    # 贡献率分析图
+    plot_04c_contribution()
+
+
+# ==================== 04c Section 3.4 贡献率绘图 ====================
+def _make_base_brightdiv_cmap():
+    """
+    构造BrightDiv连续色带（蓝-浅蓝-白-浅橙-橙）
+    """
+    import colorsys
+    colors = [
+        (95 / 255, 175 / 255, 250 / 255),   # 蓝
+        (175 / 255, 215 / 255, 255 / 255),  # 浅蓝
+        (1, 1, 1),                           # 白
+        (1, 220 / 255, 185 / 255),          # 浅橙
+        (1, 160 / 255, 115 / 255)           # 橙
+    ]
+    brighten = 0.9
+    for i, (r, g, b) in enumerate(colors):
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
+        l = max(0, min(1, l * brighten))
+        colors[i] = colorsys.hls_to_rgb(h, l, s)
+
+    return mpl.colors.LinearSegmentedColormap.from_list('BrightDiv', colors, N=256)
+
+
+def _make_contrib_4color_cmap():
+    """
+    4色色带（<-50, -50~0, 0~50, >50）
+    从BrightDiv均匀取8个颜色，选第1、3、6、8位
+    """
+    base_cmap = _make_base_brightdiv_cmap()
+    positions = np.linspace(0, 1, 8)
+    base8 = [base_cmap(p) for p in positions]  # RGBA
+
+    indices = [0, 2, 5, 7]  # 第1、3、6、8位颜色
+    colors4 = [base8[i] for i in indices]
+
+    return mpl.colors.LinearSegmentedColormap.from_list("Contrib4", colors4, N=4)
+
+
+def _make_contribution_cmap():
+    """创建贡献率色带（0-100%，蓝到红）- 用于绝对贡献率"""
+    colors = [
+        (65/255, 105/255, 225/255),   # 蓝色 (窗口主导低)
+        (135/255, 206/255, 250/255),  # 浅蓝
+        (255/255, 255/255, 255/255),  # 白色 (50%)
+        (255/255, 200/255, 150/255),  # 浅橙
+        (255/255, 99/255, 71/255),    # 红色 (速率主导高)
+    ]
+    return mpl.colors.LinearSegmentedColormap.from_list("ContribDiv", colors, N=256)
+
+
+def _make_dominant_cmap():
+    """创建主导因子离散色带（1=窗口蓝，2=速率红）"""
+    colors = [(65/255, 105/255, 225/255), (255/255, 99/255, 71/255)]
+    return mpl.colors.ListedColormap(colors)
+
+
+def _make_direction_cmap():
+    """创建方向分类离散色带（4类）"""
+    colors = [
+        (34/255, 139/255, 34/255),    # 1 = 同向增加（绿）
+        (255/255, 165/255, 0/255),    # 2 = 同向减少（橙）
+        (65/255, 105/255, 225/255),   # 3 = 异向（窗口+，速率-）（蓝）
+        (255/255, 99/255, 71/255),    # 4 = 异向（窗口-，速率+）（红）
+    ]
+    return mpl.colors.ListedColormap(colors)
+
+
+def plot_contribution_map(data_file, out_figure, title, cmap_type="contrib", value_range=None):
+    """
+    绘制贡献率空间分布图（北极投影）
+
+    Parameters
+    ----------
+    data_file : str or Path
+        输入栅格文件
+    out_figure : str or Path
+        输出图像路径
+    title : str
+        图像标题
+    cmap_type : str
+        色带类型（全部使用4色分级）:
+        - "contrib_signed": 方法1、4，带符号（[-100,-50,0,50,100]）
+        - "contrib_abs": 方法2，绝对值（[0,25,50,75,100]）
+        - "contrib_var": 方法3，方差（[0,50,100,150,200]）
+        - "dominant": 主导因子（离散2色）
+        - "direction": 方向分类（离散4色）
+    value_range : tuple
+        值域范围（未使用）
+    """
+    if not should_plot(out_figure):
+        return
+    if not Path(data_file).exists():
+        print(f"文件不存在，跳过: {data_file}")
+        return
+
+    _set_corr_style()
+    ds = gdal.Open(str(data_file), gdal.GA_ReadOnly)
+    if ds is None:
+        print(f"GDAL 无法打开文件 {data_file}，跳过。")
+        return
+
+    arr = ds.ReadAsArray().astype(float)
+    gt = ds.GetGeoTransform()
+    nodata = ds.GetRasterBand(1).GetNoDataValue()
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+
+    nrows, ncols = arr.shape
+    extent = [gt[0], gt[0] + gt[1] * ncols, gt[3] + gt[5] * nrows, gt[3]]
+
+    # 降采样大图
+    max_pixels = 10_000_000
+    factor = int(np.ceil(np.sqrt((nrows * ncols) / max_pixels)))
+    if factor > 1:
+        arr = arr[::factor, ::factor]
+
+    valid_data = arr[~np.isnan(arr)]
+    if valid_data.size == 0:
+        print("全部为 NaN，跳过此图。")
+        return
+
+    # 选择色带和值域（全部使用4色分级）
+    # 注意：不clip数据，保留原始值用于Mean计算（保证加和=100%）
+    use_4color = False  # 是否显示正负比例（仅带符号贡献率）
+    if cmap_type == "contrib_signed":
+        # 方法1、4：带符号贡献率（可正可负，之和=100%）
+        # 不clip数据，动态计算色带范围（参考长度强度分解代码）
+        use_4color = True
+        cmap = _make_contrib_4color_cmap()
+        # 动态计算色带范围
+        vmin = np.nanpercentile(valid_data, 1)
+        vmax = np.nanpercentile(valid_data, 99)
+        vabs = max(abs(vmin), abs(vmax))
+        if vabs < 100:
+            vabs = 100  # 至少显示±100范围
+        boundaries = np.array([-vabs, -50, 0, 50, vabs], dtype=float)
+        norm = mpl.colors.BoundaryNorm(boundaries, cmap.N)
+        ticks = boundaries.copy()
+        ticklabels = [f"<{int(ticks[1])}", f"{int(ticks[1])}", "0", f"{int(ticks[3])}", f">{int(ticks[3])}"]
+    elif cmap_type == "contrib_abs":
+        # 方法2：绝对贡献率（0-100%，无负值，之和=100%）
+        # 不clip数据，动态计算色带范围
+        use_4color = False
+        cmap = _make_contrib_4color_cmap()
+        vmax = np.nanpercentile(valid_data, 99)
+        if vmax < 100:
+            vmax = 100
+        boundaries = np.array([0, 25, 50, 75, vmax], dtype=float)
+        norm = mpl.colors.BoundaryNorm(boundaries, cmap.N)
+        ticks = [0, 25, 50, 75, vmax]
+        ticklabels = ["0", "25", "50", "75", f">{int(ticks[3])}"]
+    elif cmap_type == "contrib_var":
+        # 方法3：方差贡献率（≥0，可能>100%，之和≠100%）
+        # 不clip数据，动态计算色带范围
+        use_4color = False
+        cmap = _make_contrib_4color_cmap()
+        vmax = np.nanpercentile(valid_data, 99)
+        if vmax < 200:
+            vmax = 200
+        boundaries = np.array([0, 50, 100, 150, vmax], dtype=float)
+        norm = mpl.colors.BoundaryNorm(boundaries, cmap.N)
+        ticks = [0, 50, 100, 150, vmax]
+        ticklabels = ["0", "50", "100", "150", f">{int(ticks[3])}"]
+    elif cmap_type == "dominant":
+        cmap = _make_dominant_cmap()
+        boundaries = [0.5, 1.5, 2.5]
+        norm = mpl.colors.BoundaryNorm(boundaries, cmap.N)
+    elif cmap_type == "direction":
+        cmap = _make_direction_cmap()
+        boundaries = [0.5, 1.5, 2.5, 3.5, 4.5]
+        norm = mpl.colors.BoundaryNorm(boundaries, cmap.N)
+    else:
+        # 默认：带符号4色分级（不clip）
+        use_4color = True
+        cmap = _make_contrib_4color_cmap()
+        vmin = np.nanpercentile(valid_data, 1)
+        vmax = np.nanpercentile(valid_data, 99)
+        vabs = max(abs(vmin), abs(vmax))
+        if vabs < 100:
+            vabs = 100
+        boundaries = np.array([-vabs, -50, 0, 50, vabs], dtype=float)
+        norm = mpl.colors.BoundaryNorm(boundaries, cmap.N)
+        ticks = boundaries.copy()
+        ticklabels = [f"<{int(ticks[1])}", f"{int(ticks[1])}", "0", f"{int(ticks[3])}", f">{int(ticks[3])}"]
+
+    proj_map = ccrs.NorthPolarStereo()
+    proj_pc = ccrs.PlateCarree()
+
+    fig = plt.figure(figsize=(3.2, 3.8))
+    ax = plt.axes(projection=proj_map)
+    ax.set_extent([-180, 180, 30, 90], crs=proj_pc)
+
+    ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="none", edgecolor="k", linewidth=0.3, zorder=1)
+    ax.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.3, zorder=1)
+
+    theta = np.linspace(0, 2 * np.pi, 360)
+    verts = np.column_stack([0.5 + 0.5 * np.sin(theta), 0.5 + 0.5 * np.cos(theta)])
+    ax.set_boundary(mpath.Path(verts, closed=True), transform=ax.transAxes)
+
+    mesh = ax.imshow(arr, origin="upper", extent=extent, transform=proj_pc, cmap=cmap, norm=norm,
+                     interpolation="nearest", zorder=2)
+
+    gl = ax.gridlines(crs=proj_pc, draw_labels=False, linewidth=0.4, color="grey",
+                      linestyle=(0, (5, 2)), alpha=0.8)
+    gl.xlocator = mticker.FixedLocator(np.arange(-180, 181, 30))
+    gl.ylocator = mticker.FixedLocator([45, 60, 75])
+
+    _add_polar_lon_labels(ax, np.arange(-180, 181, 30), lat_label=35)
+    _add_lat_labels(ax, lat_values=(45, 60, 75), lon_for_labels=-130)
+
+    # 色条
+    if cmap_type == "dominant":
+        cax = inset_axes(ax, width="52%", height="3%", loc="lower right",
+                         bbox_to_anchor=(0.0, -0.08, 1, 1),
+                         bbox_transform=ax.transAxes, borderpad=0)
+        cbar = plt.colorbar(mesh, cax=cax, orientation="horizontal", ticks=[1, 2])
+        cbar.ax.set_xticklabels(["Window", "Rate"])
+    elif cmap_type == "direction":
+        cax = inset_axes(ax, width="70%", height="3%", loc="lower right",
+                         bbox_to_anchor=(-0.1, -0.08, 1, 1),
+                         bbox_transform=ax.transAxes, borderpad=0)
+        cbar = plt.colorbar(mesh, cax=cax, orientation="horizontal", ticks=[1, 2, 3, 4])
+        cbar.ax.set_xticklabels(["++", "--", "+-", "-+"], fontsize=FONT_SIZE-1)
+    else:
+        cax = inset_axes(ax, width="52%", height="3%", loc="lower right",
+                         bbox_to_anchor=(0.0, -0.08, 1, 1),
+                         bbox_transform=ax.transAxes, borderpad=0)
+        cbar = plt.colorbar(mesh, cax=cax, orientation="horizontal",
+                            boundaries=boundaries, ticks=ticks)
+        cbar.ax.set_xticklabels(ticklabels)
+
+    cax.tick_params(length=0, width=0, pad=1)
+    for spine in cax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.3)
+
+    cbar.ax.text(0.5, 1.03, title, transform=cbar.ax.transAxes,
+                 ha="center", va="bottom", fontsize=FONT_SIZE)
+
+    # 直方图（对所有贡献率类型）- 使用等间距布局
+    if cmap_type in ["contrib_signed", "contrib_abs", "contrib_var"]:
+        hist_ax = inset_axes(ax, width="34%", height="34%", loc="lower left",
+                             bbox_to_anchor=(0.05, -0.06, 1, 1),
+                             bbox_transform=ax.transAxes, borderpad=0)
+        bins = boundaries
+        hist, _ = np.histogram(valid_data, bins=bins)
+        percent = hist / hist.sum() * 100.0
+
+        # 使用等间距布局（参考长度强度分解代码）
+        n_bins = len(bins)
+        n_bars = n_bins - 1
+        # 柱状图位置：0.5, 1.5, 2.5, 3.5（在刻度之间）
+        bar_positions = np.arange(n_bars) + 0.5
+        # 刻度位置：0, 1, 2, 3, 4（边界位置）
+        tick_positions = np.arange(n_bins)
+
+        # 计算每个bin中心对应的颜色
+        centers = (bins[:-1] + bins[1:]) / 2.0
+        bar_colors = [cmap(norm(c)) for c in centers]
+
+        hist_ax.bar(bar_positions, percent, width=0.8,
+                    color=bar_colors, edgecolor='none', align='center')
+
+        # x轴刻度使用等间距位置
+        hist_ax.set_xlim(0, n_bins - 1)
+        hist_ax.set_xticks(tick_positions)
+        hist_ax.set_xticklabels(ticklabels, fontsize=FONT_SIZE - 1)
+        hist_ax.set_ylim(0, max(60, np.nanmax(percent) * 1.2))
+        hist_ax.set_yticks([15, 30, 45, 60])
+        hist_ax.tick_params(direction='out', length=2, width=0.3, pad=1)
+        for spine in hist_ax.spines.values():
+            spine.set_linewidth(0.3)
+        hist_ax.set_ylabel('Frequency (%)', labelpad=3, fontsize=FONT_SIZE)
+        hist_ax.axhline(0, color='black', linewidth=0.3)
+
+    # 计算Mean值（贡献图）
+    mean_value = np.nanmean(valid_data)
+
+    # 正负比例（仅对带符号贡献率）
+    if use_4color:
+        total_pixels = valid_data.size
+        pos_count = np.sum(valid_data > 0)
+        neg_count = np.sum(valid_data < 0)
+        pos_percent = pos_count / total_pixels * 100
+        neg_percent = neg_count / total_pixels * 100
+
+        # 格式化Mean值和P/N文本（参考长度强度分解代码格式）
+        mean_text = f'Mean = {mean_value:.1f}'
+        pn_text = f'P: {pos_percent:.1f}%; N: {neg_percent:.1f}%'
+
+        # 添加文本标注（Mean在上，P/N合并在一行）
+        ax.text(0.5, 0.95, mean_text, transform=ax.transAxes,
+                ha='center', va='center', fontsize=FONT_SIZE, color='black')
+        ax.text(0.5, 0.89, pn_text, transform=ax.transAxes,
+                ha='center', va='center', fontsize=FONT_SIZE, color='black')
+
+    Path(out_figure).parent.mkdir(parents=True, exist_ok=True)
+    plt.subplots_adjust(bottom=0.12, top=0.98, left=0.03, right=0.97)
+    fig.savefig(out_figure, dpi=600, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    print(f"  ✓ 已保存: {out_figure}")
+
+
+def plot_04c_contribution():
+    """绘制04c Section 3.4 贡献率分析图（四种方法）
+
+    注意：
+    - Raw数据：绘制方法1,2,3,4（全部）
+    - Detrended数据：仅绘制方法2,3（方法1和4因mean/trend≈0而无意义）
+    """
+    print("\n" + "=" * 50)
+    print("绘制 Section 3.4 贡献率分析图")
+    print("=" * 50)
+
+    base_root = ANALYSIS_DIR / "Statistical_Analysis_FixedWindow"
+    for run_label in ["Raw", "Detrended"]:
+        base_dir = base_root / run_label / "Section_3.4_Contribution" / "Mean"
+        if not base_dir.exists():
+            print(f"贡献率目录不存在，跳过: {base_dir}")
+            continue
+
+        out_dir = OUTPUT_FIG_DIR / "04c" / run_label / "Contribution"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        is_detrended = (run_label == "Detrended")
+        if is_detrended:
+            print(f"\n  [{run_label}] 仅绘制方法2、3（方法1、4无意义）")
+        else:
+            print(f"\n  [{run_label}] 绘制方法1、2、3、4")
+
+        # 绘制各类贡献率图（四种方法，全部使用4色分级）
+        # cmap_type: "contrib_signed" = 带符号[-100,-50,0,50,100]
+        #            "contrib_abs" = 绝对值[0,25,50,75,100]
+        #            "contrib_var" = 方差[0,50,100,150,200]
+        plot_tasks = []
+
+        # 方法1: 带符号均值法（边界：-100,-50,0,50,100）- 仅Raw
+        if not is_detrended:
+            plot_tasks.extend([
+                ("window_contrib_signed.tif", "M1_window_contrib_signed.png",
+                 "M1: Window (%)", "contrib_signed", None),
+                ("rate_contrib_signed.tif", "M1_rate_contrib_signed.png",
+                 "M1: Rate (%)", "contrib_signed", None),
+            ])
+
+        # 方法2: 绝对均值法（边界：0,25,50,75,100）- Raw和Detrended都有
+        plot_tasks.extend([
+            ("window_contrib_abs.tif", "M2_window_contrib_abs.png",
+             "M2: Window (%)", "contrib_abs", None),
+            ("rate_contrib_abs.tif", "M2_rate_contrib_abs.png",
+             "M2: Rate (%)", "contrib_abs", None),
+        ])
+
+        # 方法3: 方差贡献率（边界：0,50,100,150,200）- Raw和Detrended都有
+        plot_tasks.extend([
+            ("window_var_contrib.tif", "M3_window_var_contrib.png",
+             "M3: Window Var (%)", "contrib_var", None),
+            ("rate_var_contrib.tif", "M3_rate_var_contrib.png",
+             "M3: Rate Var (%)", "contrib_var", None),
+        ])
+
+        # 方法4: 趋势贡献率（边界：-100,-50,0,50,100）- 仅Raw
+        if not is_detrended:
+            plot_tasks.extend([
+                ("window_trend_contrib.tif", "M4_window_trend_contrib.png",
+                 "M4: Window Trend (%)", "contrib_signed", None),
+                ("rate_trend_contrib.tif", "M4_rate_trend_contrib.png",
+                 "M4: Rate Trend (%)", "contrib_signed", None),
+            ])
+
+        # 主导因子与方向分类 - 所有情况都有
+        plot_tasks.extend([
+            ("dominant_factor.tif", "dominant_factor.png", "Dominant Factor", "dominant", None),
+            ("direction_class.tif", "direction_class.png", "Direction Class", "direction", None),
+        ])
+
+        for in_file, out_file, title, cmap_type, vrange in plot_tasks:
+            data_file = base_dir / in_file
+            out_figure = out_dir / out_file
+            if data_file.exists():
+                plot_contribution_map(data_file, out_figure, title, cmap_type, vrange)
+
+    print("\n  ✓ 贡献率绘图完成")
+
+
 
 # ==================== 05 SEM 绘图任务 ====================
 def _resolve_sem_dir(dir_name, fallback_file):
@@ -1112,7 +1508,7 @@ def plot_sem_all(only_group=None):
         "dir_name": "SEM_Results_Dual_Fixed",
         "param": "SEM_dual_timescale_parameters.csv",
         "r2": "SEM_dual_timescale_R2.csv",
-        "middle_var": "Fixed_GPPrate",
+        "middle_var": f"Fixed_{MIDDLE_VAR_NAME}rate",
         "outcome_var": "Fixed_Trate",
         "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
@@ -1128,7 +1524,7 @@ def plot_sem_all(only_group=None):
         "dir_name": "SEM_Results_Dual_Fixed_Robust_Pooled_SOS",
         "param": "SEM_dual_timescale_parameters.csv",
         "r2": "SEM_dual_timescale_R2.csv",
-        "middle_var": "Fixed_GPPrate",
+        "middle_var": f"Fixed_{MIDDLE_VAR_NAME}rate",
         "outcome_var": "Fixed_Trate",
         "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
@@ -1144,7 +1540,7 @@ def plot_sem_all(only_group=None):
         "dir_name": "SEM_Results_Dual_Fixed_Lavaan_Compare_Ours",
         "param": "SEM_dual_timescale_parameters.csv",
         "r2": "SEM_dual_timescale_R2.csv",
-        "middle_var": "Fixed_GPPrate",
+        "middle_var": f"Fixed_{MIDDLE_VAR_NAME}rate",
         "outcome_var": "Fixed_Trate",
         "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
@@ -1161,7 +1557,7 @@ def plot_sem_all(only_group=None):
         "dir_name": "SEM_Results_Dual_Fixed_Lavaan_Compare_Other",
         "param": "SEM_dual_timescale_parameters.csv",
         "r2": "SEM_dual_timescale_R2.csv",
-        "middle_var": "Fixed_GPPrate",
+        "middle_var": f"Fixed_{MIDDLE_VAR_NAME}rate",
         "outcome_var": "Fixed_Trate",
         "middle_label": MIDDLE_VAR_NAME,
         "outcome_label": r"T$_{rate}$",
@@ -1233,6 +1629,7 @@ def _parse_plot_args():
 
 
 def main():
+    ensure_output_fig_dir()
     args = _parse_plot_args()
     only = args.only
     print("=" * 70)
@@ -1247,4 +1644,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from _config import RUN_CONFIGS_02_06, apply_run_config
+    for cfg in RUN_CONFIGS_02_06:
+        apply_run_config(cfg, globals())
+        # 重置局部别名（FIGURES_DIR已更新，但ANALYSIS_DIR/OUTPUT_FIG_DIR是导入时的旧值）
+        tr_source = cfg.get('TR_SOURCE_NAME', 'GLEAM')
+        ANALYSIS_DIR = OUTPUT_ROOT / f"{cfg['MIDDLE_VAR_NAME']}_{tr_source}"
+        OUTPUT_FIG_DIR = FIGURES_DIR
+        ensure_output_fig_dir()
+        main()

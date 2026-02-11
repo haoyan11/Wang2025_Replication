@@ -22,14 +22,10 @@ from _config import (
     PHENO_DIR, TR_DAILY_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
     YEAR_START, YEAR_END, BLOCK_SIZE, MAX_WORKERS, NODATA_OUT, TR_FILE_FORMAT,
     PHENO_FILE_FORMAT, TEMPLATE_RASTER, MASK_FILE,
-    GPP_DAILY_DIR, GPP_DAILY_FORMAT,  # GPP/NDVI相关配置（已重定向到NDVI）
+    VAR_DAILY_DIR, VAR_DAILY_FORMAT,  # 当前模式的日尺度数据（NDVI或GPP）
     OUTPUT_CUMULATIVE_FORMAT, OUTPUT_CLIMATOLOGY_FORMAT,  # 输出文件名格式
     MIDDLE_VAR_NAME  # 用于日志标签
 )
-
-# 确保输出目录存在
-TRC_ANNUAL_DIR.mkdir(parents=True, exist_ok=True)
-CLIMATOLOGY_DIR.mkdir(parents=True, exist_ok=True)
 
 # 向后兼容：保留OUTPUT_DIR别名
 OUTPUT_DIR = TRC_ANNUAL_DIR
@@ -41,6 +37,13 @@ OVERWRITE = RUN_MODE == "overwrite"
 def should_write(path):
     path = Path(path)
     return OVERWRITE or not path.exists()
+
+def ensure_output_dirs():
+    """确保输出目录在apply_run_config之后创建"""
+    TRC_ANNUAL_DIR.mkdir(parents=True, exist_ok=True)
+    CLIMATOLOGY_DIR.mkdir(parents=True, exist_ok=True)
+    global OUTPUT_DIR
+    OUTPUT_DIR = TRC_ANNUAL_DIR
 
 def outputs_complete(years):
     trc_done = all((OUTPUT_DIR / f"TRc_{year}.tif").exists() for year in years)
@@ -635,6 +638,7 @@ def main(use_block_processing=True):
     use_block_processing : bool
         是否使用块处理（普通版已移除，参数仅保留兼容）
     """
+    ensure_output_dirs()
     print("\n" + "="*70)
     print("Module 02: TRc和GPPc计算")
     print("="*70)
@@ -846,6 +850,7 @@ def main_parallel(use_block_processing=True, max_workers=None):
     max_workers : int
         并行进程数（默认使用MAX_WORKERS配置）
     """
+    ensure_output_dirs()
     if max_workers is None:
         max_workers = MAX_WORKERS
 
@@ -935,13 +940,13 @@ def main_parallel(use_block_processing=True, max_workers=None):
 
 # ==================== GPP/NDVI相关函数 ====================
 
-def get_GPP_file_path(date_obj):
+def get_var_daily_file_path(date_obj):
     """
-    获取NDVI日数据文件路径（通过_config.py的GPP_DAILY_DIR/FORMAT重定向到NDVI）
-    注意：GPP_DAILY_DIR/FORMAT已在_config.py中重定向到NDVI数据
+    获取当前模式的日尺度数据文件路径（VAR_DAILY_DIR随模式切换）。
+    NDVI模式返回NDVI文件，GPP模式返回GPP文件。
     """
     yyyymmdd = date_obj.strftime("%Y%m%d")
-    file_path = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=yyyymmdd)
+    file_path = VAR_DAILY_DIR / VAR_DAILY_FORMAT.format(date=yyyymmdd)
     if file_path.exists():
         return file_path
     return None
@@ -996,7 +1001,7 @@ def calculate_GPPc_block_optimized(year, mask, template_profile):
     # 使用统一模板profile
     profile = template_profile.copy()
     test_date = datetime(year, 1, 15)
-    test_gpp_file = get_GPP_file_path(test_date)
+    test_gpp_file = get_var_daily_file_path(test_date)
     if test_gpp_file is None or not test_gpp_file.exists():
         print(f"  ✗ 错误：找不到{MIDDLE_VAR_NAME}数据文件用于检查profile一致性")
         return None, None
@@ -1044,7 +1049,7 @@ def calculate_GPPc_block_optimized(year, mask, template_profile):
 
     # 优化：改为"先天后块"循环（与TRc一致）
     for date_obj in tqdm(dates_year, desc=f"逐日累加{MIDDLE_VAR_NAME}（先天后块）", leave=False):
-        gpp_file = get_GPP_file_path(date_obj)
+        gpp_file = get_var_daily_file_path(date_obj)
         if gpp_file is None or not gpp_file.exists():
             missing_files += 1
             continue
@@ -1179,7 +1184,7 @@ def save_climatology_data_GPP():
             else:
                 doy_idx = doy - 1  # 1-based to 0-based
 
-            gpp_file = get_GPP_file_path(date_obj)
+            gpp_file = get_var_daily_file_path(date_obj)
             if gpp_file is None or not gpp_file.exists():
                 continue
 
@@ -1332,45 +1337,18 @@ def save_climatology_data_GPP():
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    years = list(range(YEAR_START, YEAR_END + 1))
-    if RUN_MODE == "skip" and outputs_complete(years):
-        print("✓ Module 02 输出齐全，已跳过全部计算")
-    else:
-        # 步骤1：计算年度TRc（SOS-POS累积蒸腾）
-        # 方式1：串行处理（推荐，稳定可靠）
-        main(use_block_processing=True)
-
-        # 方式2：并行处理（可选，SSD环境下可能更快）
-        # ⚠️ 注意：
-        # - 并行适用于SSD，HDD可能适得其反
-        # - MAX_WORKERS=2-4 比较稳妥（I/O密集任务）
-        # - 自动支持断点续算
-        # main_parallel(use_block_processing=True, max_workers=2)
-
-        # ======================================================================
-        # 步骤2：计算气候态数据（用于03_decomposition_original.py原版分解）
-        # ⚠️ 重要：仅在完成步骤1后，且准备进行分解时再运行此步骤
-        # ======================================================================
-        save_climatology_data()
-        #
-        # 此步骤将计算并保存：
-        #   - TR_daily_climatology.tif (365波段，每个DOY的多年平均TR)
-        #   - SOSav.tif (多年平均SOS)
-        #   - POSav.tif (多年平均POS)
-        #
-        # 输出目录：Wang2025_Analysis/Climatology/
-        #
-        # 注意：此步骤计算密集，预计需要30-60分钟（取决于数据规模）
-
-        # ======================================================================
-        # 步骤3：计算GPP气候态数据（新增）
-        # ======================================================================
-        save_climatology_data_GPP()
-        #
-        # 此步骤将计算并保存：
-        #   - NDVI_daily_climatology.tif (365波段，每个DOY的多年平均NDVI)
-        #   - NDVIc_av.tif (基于SOSav和POSav的多年平均累积NDVI)
-        #
-        # 输出目录：Wang2025_Analysis_GPP_Modify/Climatology/
-        #
-        # 注意：此步骤需要在save_climatology_data()之后运行（依赖SOSav和POSav）
+    from _config import RUN_CONFIGS_02_06, apply_run_config
+    for cfg in RUN_CONFIGS_02_06:
+        apply_run_config(cfg, globals())
+        # 重置局部别名（apply_run_config已更新TRC_ANNUAL_DIR等，但OUTPUT_DIR是导入时的旧值）
+        OUTPUT_DIR = TRC_ANNUAL_DIR
+        years = list(range(YEAR_START, YEAR_END + 1))
+        if RUN_MODE == "skip" and outputs_complete(years):
+            print(f"✓ Module 02 [{MIDDLE_VAR_NAME}] 输出齐全，已跳过全部计算")
+        else:
+            # 步骤1：计算年度TRc + 累积NDVI/GPP
+            main(use_block_processing=True)
+            # 步骤2：计算气候态数据（TR气候态 + SOSav/POSav）
+            save_climatology_data()
+            # 步骤3：计算日尺度变量（NDVI/GPP）的气候态
+            save_climatology_data_GPP()

@@ -56,7 +56,7 @@ from _config import (
     ROOT, PHENO_DIR, PHENO_FILE_FORMAT, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
     DECOMPOSITION_FIXED_DIR, YEAR_START, YEAR_END, NODATA_OUT, TR_DAILY_DIR,
     TR_FILE_FORMAT, BLOCK_SIZE, MAX_WORKERS, TEMPLATE_RASTER, MASK_FILE,
-    GPP_DAILY_DIR, GPP_DAILY_FORMAT,
+    VAR_DAILY_DIR, VAR_DAILY_FORMAT,  # 当前模式的日尺度数据（NDVI或GPP）
     OUTPUT_CUMULATIVE_FORMAT, OUTPUT_CLIMATOLOGY_FORMAT, OUTPUT_DECOMP_FORMAT,  # 输出文件名格式
     MIDDLE_VAR_NAME  # 用于日志标签
 )
@@ -66,9 +66,6 @@ GDAL_CACHE_MAX_MB = 512
 PARALLEL_BY_YEAR = True
 YEAR_WORKERS = MAX_WORKERS
 MIN_VALID_FRAC = 0.60  # 有效天数阈值（窗口内）
-
-# 确保输出目录存在
-DECOMPOSITION_FIXED_DIR.mkdir(parents=True, exist_ok=True)
 
 # 向后兼容：保留旧变量名
 TRC_DIR = TRC_ANNUAL_DIR
@@ -82,6 +79,12 @@ OVERWRITE = RUN_MODE == "overwrite"
 def should_write(path):
     path = Path(path)
     return OVERWRITE or not path.exists()
+
+def ensure_output_dir():
+    """确保输出目录在apply_run_config之后创建"""
+    DECOMPOSITION_FIXED_DIR.mkdir(parents=True, exist_ok=True)
+    global OUTPUT_DIR
+    OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
 
 
 def _is_valid_value(value, nodata):
@@ -110,7 +113,14 @@ _GLOBAL_CTX = {}
 
 
 def _init_worker(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile,
-                 gppc_av, gpp_valid):
+                 gppc_av, gpp_valid, run_cfg=None):
+    if run_cfg is not None:
+        from _config import apply_run_config
+        apply_run_config(run_cfg, globals())
+        global TRC_DIR, CLIM_DIR, OUTPUT_DIR
+        TRC_DIR = TRC_ANNUAL_DIR
+        CLIM_DIR = CLIMATOLOGY_DIR
+        OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
     global _GLOBAL_CTX
     _GLOBAL_CTX = {
         "trc_av": trc_av,
@@ -280,7 +290,7 @@ def accumulate_daily_gpp_sums(year, ref_profile, valid_base,
             if doy_noleap is None:
                 continue
 
-            file_path = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
+            file_path = VAR_DAILY_DIR / VAR_DAILY_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
             if not file_path.exists():
                 continue
 
@@ -589,8 +599,8 @@ def decompose_year(year, trc_av, pos_av, eos_av,
     # 空间一致性检查
     check_spatial_consistency(ref_profile, trc_file, trc_profile, f"TRc_{year}")
     check_spatial_consistency(ref_profile, gppc_file, gppc_profile, f"{MIDDLE_VAR_NAME}c_{year}")
-    check_spatial_consistency(ref_profile, pos_file, pos_profile, f"POS({year})")
-    check_spatial_consistency(ref_profile, eos_file, eos_profile, f"EOS({year})")
+    check_spatial_consistency(ref_profile, pos_file, pos_profile, PHENO_FILE_FORMAT["POS"].format(year=year))
+    check_spatial_consistency(ref_profile, eos_file, eos_profile, PHENO_FILE_FORMAT["EOS"].format(year=year))
 
     height, width = trc_y.shape
 
@@ -723,9 +733,10 @@ def decompose_year(year, trc_av, pos_av, eos_av,
             gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change)
 
 
-def main():
+def main(run_cfg=None):
+    ensure_output_dir()
     print("\n" + "=" * 80)
-    print("Fixed-Window Decomeosition (Method 2)")
+    print("Fixed-Window Decomposition (Method 2)")
     print("=" * 80)
     print("\n核心思想：")
     print("  - 固定窗口[POSav, EOSav]内的强度变化 → 剥离窗口选择效应")
@@ -773,7 +784,7 @@ def main():
     tr_valid = np.any(np.isfinite(tr_daily_av), axis=0)
     tr_cum = np.nancumsum(tr_daily_av, axis=0).astype(np.float32)
 
-    # Load GPP climatology (GPPc_av在Climatology目录)
+    # Load 日尺度变量气候态 (NDVI/GPP cumulative_av 在Climatology目录)
     gppc_av_file = CLIMATOLOGY_DIR / OUTPUT_CLIMATOLOGY_FORMAT['cumulative_av']
     if not gppc_av_file.exists():
         raise FileNotFoundError(f"Missing {MIDDLE_VAR_NAME} climatology: {gppc_av_file}")
@@ -813,7 +824,7 @@ def main():
             max_workers=YEAR_WORKERS,
             initializer=_init_worker,
             initargs=(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile,
-                      gppc_av, gpp_valid)
+                      gppc_av, gpp_valid, run_cfg)
         ) as executor:
             futures = {executor.submit(_process_year, year): year for year in years}
             for future in tqdm(as_completed(futures), total=len(futures),
@@ -989,4 +1000,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from _config import RUN_CONFIGS_02_06, apply_run_config
+    for cfg in RUN_CONFIGS_02_06:
+        apply_run_config(cfg, globals())
+        # 重置局部别名（apply_run_config已更新基础目录，但别名是导入时的旧值）
+        TRC_DIR = TRC_ANNUAL_DIR
+        CLIM_DIR = CLIMATOLOGY_DIR
+        OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
+        main(run_cfg=cfg)
