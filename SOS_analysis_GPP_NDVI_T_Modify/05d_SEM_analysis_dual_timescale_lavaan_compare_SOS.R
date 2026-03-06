@@ -48,11 +48,32 @@ should_write <- function(path) {
   OVERWRITE || !file.exists(path)
 }
 
+normalize_fixed_rate_labels <- function(df) {
+  if (!is.data.frame(df)) {
+    return(df)
+  }
+  new_name <- sprintf("Fixed_%srate", MIDDLE_VAR_NAME)
+  names(df) <- gsub("Fixed_GPPrate", new_name, names(df))
+  if (!is.null(rownames(df))) {
+    rownames(df) <- gsub("Fixed_GPPrate", new_name, rownames(df))
+  }
+  for (col in names(df)) {
+    if (is.factor(df[[col]])) {
+      df[[col]] <- as.character(df[[col]])
+    }
+    if (is.character(df[[col]])) {
+      df[[col]] <- gsub("Fixed_GPPrate", new_name, df[[col]])
+    }
+  }
+  df
+}
+
 safe_write_csv <- function(df, path, ...) {
   if (!should_write(path)) {
     cat(sprintf("  [skip] %s\n", path))
     return(invisible(FALSE))
   }
+  df <- normalize_fixed_rate_labels(df)
   write.csv(df, path, ...)
   invisible(TRUE)
 }
@@ -66,25 +87,21 @@ safe_write_lines <- function(lines, path) {
   invisible(TRUE)
 }
 
-# ==================== Paths ====================
-if (.Platform$OS.type == "windows") {
-  ROOT <- "I:/F/Data4"
-} else {
-  if (dir.exists("/mnt/i/F/Data4")) {
-    ROOT <- "/mnt/i/F/Data4"
-  } else {
-    ROOT <- "I:/F/Data4"
+# ==================== 配置 ====================
+# 加载统一配置（路径、模式、常量等）
+.script_dir <- tryCatch(
+  dirname(normalizePath(sys.frame(1)$ofile)),
+  error = function(e) {
+    args <- commandArgs(trailingOnly = FALSE)
+    f <- grep("--file=", args, value = TRUE)
+    if (length(f)) dirname(normalizePath(sub("--file=", "", f))) else getwd()
   }
-}
+)
+source(file.path(.script_dir, "_config.R"))
 
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS_GPP_Modify")
-PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
-DECOMP_DIR <- file.path(OUTPUT_ROOT, "Decomposition_FixedWindow")
-MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
-TEMPLATE_FILE <- file.path(OUTPUT_ROOT, "masks", "template_grid.tif")
-DERIVED_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed", "Derived")
-
-OUTPUT_DIR_BASE <- file.path(OUTPUT_ROOT, "SEM_Results_Dual_Fixed_Lavaan_Compare")
+# ===== 05d模块专用输出目录 =====
+# DERIVED_DIR 来自_config.R（05b生成的缓存数据）
+OUTPUT_DIR_BASE <- file.path(MODE_ROOT, "SEM_Results_Dual_Fixed_Lavaan_Compare")
 OUTPUT_DIR <- OUTPUT_DIR_BASE
 PIXELWISE_DIR <- file.path(OUTPUT_DIR, "Pixelwise")
 COMPARE_DIR <- file.path(OUTPUT_DIR_BASE, "Compare")
@@ -131,10 +148,7 @@ outputs_ready <- function(suffix = "") {
   ours_ok && other_ok && compare_ok
 }
 
-# ==================== Options ====================
-YEAR_START <- 1982
-YEAR_END <- 2018
-
+# ==================== 05d控制选项 ====================
 MIN_VALID_YEAR_FRAC <- 0.60  # "Ours"方法的最小年份比例
 OTHER_MIN_VALID_YEAR_FRAC <- 1.00  # "Other"方法要求100%数据完整（对应N04）
 DETREND_PIXEL_ENABLE <- TRUE
@@ -616,8 +630,8 @@ run_pixel_sem_lavaan_compare <- function(years, mask_r, fixed_window_length_r,
 
   files <- list(
     TR_fixed_window = file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", years)),
-    SOS = file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", years)),
-    Fixed_GPPrate = file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", years)),  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
+    SOS = file.path(PHENO_DIR, sprintf(SOS_PATTERN, years)),
+    Fixed_GPPrate = file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, years)),  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
     P_pre = file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", years)),
     T_pre = file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", years)),
     SW_pre = file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", years)),
@@ -716,7 +730,7 @@ run_pixel_sem_lavaan_compare <- function(years, mask_r, fixed_window_length_r,
     sos_block <- t(getValues(stacks$SOS, row = row, nrows = nrows))
     sos_block <- sanitize_values(sos_block, na_values$SOS, allow_negative = FALSE)
     gpp_block <- t(getValues(stacks$Fixed_GPPrate, row = row, nrows = nrows))
-    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = FALSE)
+    gpp_block <- sanitize_values(gpp_block, na_values$Fixed_GPPrate, allow_negative = TRUE)  # Fixed_NDVIrate是异常值，可以为负
     p_pre_block <- t(getValues(stacks$P_pre, row = row, nrows = nrows))
     p_pre_block <- sanitize_values(p_pre_block, na_values$P_pre, allow_negative = FALSE)
     t_pre_block <- t(getValues(stacks$T_pre, row = row, nrows = nrows))
@@ -1229,8 +1243,8 @@ main <- function() {
   for (year in years) {
     files_to_check <- c(
       file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)),
-      file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year)),
-      file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year)),  # 从DECOMP_DIR读取
+      file.path(PHENO_DIR, sprintf(SOS_PATTERN, year)),
+      file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year)),  # 从DECOMP_DIR读取
       file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year)),
       file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", year)),
       file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", year)),
@@ -1273,8 +1287,8 @@ main <- function() {
   sample_rasters <- list(
     fixed_window_length_r,
     raster(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", YEAR_START))),
-    raster(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", YEAR_START))),
-    raster(file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", YEAR_START))),  # 从DECOMP_DIR读取
+    raster(file.path(PHENO_DIR, sprintf(SOS_PATTERN, YEAR_START))),
+    raster(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, YEAR_START))),  # 从DECOMP_DIR读取
     raster(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", YEAR_START)))
   )
   tryCatch({

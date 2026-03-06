@@ -22,12 +22,10 @@ from _config import (
     PHENO_DIR, TR_DAILY_DIR, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
     YEAR_START, YEAR_END, BLOCK_SIZE, MAX_WORKERS, NODATA_OUT, TR_FILE_FORMAT,
     PHENO_FILE_FORMAT, TEMPLATE_RASTER, MASK_FILE,
-    GPP_DAILY_DIR, GPP_DAILY_FORMAT  # GPP相关配置
+    VAR_DAILY_DIR, VAR_DAILY_FORMAT,  # 当前模式的日尺度数据（NDVI或GPP）
+    OUTPUT_CUMULATIVE_FORMAT, OUTPUT_CLIMATOLOGY_FORMAT,  # 输出文件名格式
+    MIDDLE_VAR_NAME  # 用于日志标签
 )
-
-# 确保输出目录存在
-TRC_ANNUAL_DIR.mkdir(parents=True, exist_ok=True)
-CLIMATOLOGY_DIR.mkdir(parents=True, exist_ok=True)
 
 # 向后兼容：保留OUTPUT_DIR别名
 OUTPUT_DIR = TRC_ANNUAL_DIR
@@ -40,13 +38,20 @@ def should_write(path):
     path = Path(path)
     return OVERWRITE or not path.exists()
 
+def ensure_output_dirs():
+    """确保输出目录在apply_run_config之后创建"""
+    TRC_ANNUAL_DIR.mkdir(parents=True, exist_ok=True)
+    CLIMATOLOGY_DIR.mkdir(parents=True, exist_ok=True)
+    global OUTPUT_DIR
+    OUTPUT_DIR = TRC_ANNUAL_DIR
+
 def outputs_complete(years):
     trc_done = all((OUTPUT_DIR / f"TRc_{year}.tif").exists() for year in years)
-    gppc_done = all((OUTPUT_DIR / f"GPPc_{year}.tif").exists() for year in years)
+    gppc_done = all((OUTPUT_DIR / OUTPUT_CUMULATIVE_FORMAT.format(year=year)).exists() for year in years)
     clim_done = all(
         (CLIMATOLOGY_DIR / name).exists()
         for name in ("TR_daily_climatology.tif", "SOSav.tif", "POSav.tif",
-                     "GPP_daily_climatology.tif", "GPPc_av.tif")
+                     OUTPUT_CLIMATOLOGY_FORMAT['daily'], OUTPUT_CLIMATOLOGY_FORMAT['cumulative_av'])
     )
     return trc_done and gppc_done and clim_done
 
@@ -633,6 +638,7 @@ def main(use_block_processing=True):
     use_block_processing : bool
         是否使用块处理（普通版已移除，参数仅保留兼容）
     """
+    ensure_output_dirs()
     print("\n" + "="*70)
     print("Module 02: TRc和GPPc计算")
     print("="*70)
@@ -687,7 +693,7 @@ def main(use_block_processing=True):
 
     for year in years:
         trc_file = OUTPUT_DIR / f"TRc_{year}.tif"
-        gppc_file = OUTPUT_DIR / f"GPPc_{year}.tif"
+        gppc_file = OUTPUT_DIR / OUTPUT_CUMULATIVE_FORMAT.format(year=year)
 
         year_failed = False
 
@@ -763,7 +769,7 @@ def process_single_year(args):
     """
     year, mask, use_block_processing = args
     trc_file = OUTPUT_DIR / f"TRc_{year}.tif"
-    gppc_file = OUTPUT_DIR / f"GPPc_{year}.tif"
+    gppc_file = OUTPUT_DIR / OUTPUT_CUMULATIVE_FORMAT.format(year=year)
 
     messages = []
     trc_status = 'skipped'
@@ -792,24 +798,24 @@ def process_single_year(args):
 
         # ========== 处理GPPc ==========
         if gppc_file.exists() and not OVERWRITE:
-            messages.append(f"GPPc已存在: {gppc_file.name}")
+            messages.append(f"{MIDDLE_VAR_NAME}c已存在: {gppc_file.name}")
             gppc_status = 'skipped'
         else:
             try:
                 GPPc, gppc_profile = calculate_GPPc_block_optimized(year, mask, template_profile)
 
                 if GPPc is None:
-                    messages.append('GPPc: 缺少GPP数据')
+                    messages.append(f'{MIDDLE_VAR_NAME}c: 缺少{MIDDLE_VAR_NAME}数据')
                     gppc_status = 'failed'
                 else:
                     # 保存GPPc结果
                     gppc_profile.update(dtype=rasterio.float32, count=1, compress='lzw', nodata=NODATA_OUT)
                     with rasterio.open(gppc_file, 'w', **gppc_profile) as dst:
                         dst.write(GPPc.astype(np.float32), 1)
-                    messages.append(f"GPPc已保存: {gppc_file.name}")
+                    messages.append(f"{MIDDLE_VAR_NAME}c已保存: {gppc_file.name}")
                     gppc_status = 'success'
             except Exception as e:
-                messages.append(f"GPPc出错: {str(e)}")
+                messages.append(f"{MIDDLE_VAR_NAME}c出错: {str(e)}")
                 gppc_status = 'error'
 
         # 综合状态
@@ -844,6 +850,7 @@ def main_parallel(use_block_processing=True, max_workers=None):
     max_workers : int
         并行进程数（默认使用MAX_WORKERS配置）
     """
+    ensure_output_dirs()
     if max_workers is None:
         max_workers = MAX_WORKERS
 
@@ -931,14 +938,15 @@ def main_parallel(use_block_processing=True, max_workers=None):
     print("="*70)
 
 
-# ==================== GPP相关函数（新增） ====================
+# ==================== GPP/NDVI相关函数 ====================
 
-def get_GPP_file_path(date_obj):
+def get_var_daily_file_path(date_obj):
     """
-    获取GPP日数据文件路径（使用_config.py中的GPP_DAILY_FORMAT）
+    获取当前模式的日尺度数据文件路径（VAR_DAILY_DIR随模式切换）。
+    NDVI模式返回NDVI文件，GPP模式返回GPP文件。
     """
     yyyymmdd = date_obj.strftime("%Y%m%d")
-    file_path = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=yyyymmdd)
+    file_path = VAR_DAILY_DIR / VAR_DAILY_FORMAT.format(date=yyyymmdd)
     if file_path.exists():
         return file_path
     return None
@@ -946,9 +954,12 @@ def get_GPP_file_path(date_obj):
 
 def calculate_GPPc_block_optimized(year, mask, template_profile):
     """
-    块处理优化版本：计算GPPc（SOS-POS累积GPP）
+    块处理优化版本：计算GPPc/NDVIc（SOS-POS累积）
 
-    完全仿照calculate_TRc_block_optimized的逻辑
+    完全对齐calculate_TRc_block_optimized的逻辑：
+    - 使用无闰日DOY映射（noleap_doy_from_date）
+    - 使用块处理（先天后块）
+    - 有效天数阈值过滤（MIN_VALID_FRAC）
 
     Parameters:
     -----------
@@ -962,92 +973,157 @@ def calculate_GPPc_block_optimized(year, mask, template_profile):
     Returns:
     --------
     GPPc : ndarray
-        累积GPP (gC/m²)
+        累积GPP/NDVI
     output_profile : dict
         输出配置
     """
-    height, width = mask.shape
-    GPPc = np.full((height, width), NODATA_OUT, dtype=np.float32)
+    print(f"\n=== 计算{MIDDLE_VAR_NAME}c（块处理-加速版）: {year} ===")
 
     # 读取物候数据
     sos_file = PHENO_DIR / PHENO_FILE_FORMAT['SOS'].format(year=year)
     pos_file = PHENO_DIR / PHENO_FILE_FORMAT['POS'].format(year=year)
 
     if not sos_file.exists() or not pos_file.exists():
-        print(f"  警告：{year}年物候文件缺失")
-        return GPPc, template_profile
+        print(f"  ✗ 错误：缺少物候数据")
+        print(f"    SOS: {sos_file} ({'存在' if sos_file.exists() else '不存在'})")
+        print(f"    POS: {pos_file} ({'存在' if pos_file.exists() else '不存在'})")
+        return None, None
 
     with rasterio.open(sos_file) as src:
         sos = src.read(1)
-        sos_nodata = src.nodata
+        height, width = src.height, src.width
+        nodata_sos = src.nodata
 
     with rasterio.open(pos_file) as src:
         pos = src.read(1)
-        pos_nodata = src.nodata
+        nodata_pos = src.nodata
 
-    # 创建有效像元掩膜
-    valid_mask = mask.copy()
-    valid_mask &= np.isfinite(sos) & np.isfinite(pos)
-    if sos_nodata is not None:
-        valid_mask &= (sos != sos_nodata)
-    if pos_nodata is not None:
-        valid_mask &= (pos != pos_nodata)
-    valid_mask &= (sos > 0) & (sos <= 365)
-    valid_mask &= (pos > 0) & (pos <= 365)
-    valid_mask &= (sos < pos)
+    # 使用统一模板profile
+    profile = template_profile.copy()
+    test_date = datetime(year, 1, 15)
+    test_gpp_file = get_var_daily_file_path(test_date)
+    if test_gpp_file is None or not test_gpp_file.exists():
+        print(f"  ✗ 错误：找不到{MIDDLE_VAR_NAME}数据文件用于检查profile一致性")
+        return None, None
+    with rasterio.open(test_gpp_file) as src:
+        check_spatial_consistency(profile, test_gpp_file, src.profile, f"{MIDDLE_VAR_NAME}({year})")
 
-    sos = np.where(valid_mask, sos, 0).astype(np.int16)
-    pos = np.where(valid_mask, pos, 0).astype(np.int16)
+    days_in_year = 366 if is_leap_year(year) else 365
+    dates_year = [datetime(year, 1, 1) + timedelta(days=i) for i in range(days_in_year)]
 
-    # 找到所有可能的DOY范围
-    min_doy = int(np.min(sos[valid_mask])) if np.any(valid_mask) else 1
-    max_doy = int(np.max(pos[valid_mask])) if np.any(valid_mask) else 365
+    # 有效物候检查（与TRc一致）
+    def _is_valid_pheno(arr, nodata):
+        """检查物候值是否有效"""
+        if nodata is None:
+            return np.isfinite(arr)
+        if np.isnan(nodata):
+            return np.isfinite(arr)
+        return (arr != nodata) & np.isfinite(arr)
 
-    print(f"  GPP累积范围: DOY {min_doy} - {max_doy}")
+    valid_pheno = (
+        mask
+        & _is_valid_pheno(sos, nodata_sos)
+        & _is_valid_pheno(pos, nodata_pos)
+        & (sos > 0) & (pos > 0)
+        & (pos >= sos)
+        & (sos <= PHENO_MAX_DOY) & (pos <= PHENO_MAX_DOY)
+    )
 
-    # 逐DOY累加
-    for doy in tqdm(range(min_doy, max_doy + 1), desc=f"GPPc {year}", leave=False):
-        current_date = datetime(year, 1, 1) + timedelta(days=doy - 1)
-        gpp_file = get_GPP_file_path(current_date)
+    # 初始化GPPc：只对valid_pheno初始化为0，其他为NODATA
+    GPPc = np.full((height, width), NODATA_OUT, dtype=np.float32)
+    GPPc[valid_pheno] = 0.0
+    GPPc_count = np.zeros((height, width), dtype=np.int16)
 
-        if gpp_file is None:
+    # 生成块窗口
+    block_windows = [
+        Window(col_off, row_off,
+               min(BLOCK_SIZE, width - col_off),
+               min(BLOCK_SIZE, height - row_off))
+        for row_off in range(0, height, BLOCK_SIZE)
+        for col_off in range(0, width, BLOCK_SIZE)
+    ]
+    print(f"  总块数: {len(block_windows)}")
+
+    missing_files = 0
+    nodata_gpp = None
+
+    # 优化：改为"先天后块"循环（与TRc一致）
+    for date_obj in tqdm(dates_year, desc=f"逐日累加{MIDDLE_VAR_NAME}（先天后块）", leave=False):
+        gpp_file = get_var_daily_file_path(date_obj)
+        if gpp_file is None or not gpp_file.exists():
+            missing_files += 1
             continue
+
+        # 使用无闰日DOY映射（与TRc一致）
+        doy = noleap_doy_from_date(date_obj)
+        if doy is None:
+            continue  # 跳过2月29日
 
         try:
             with rasterio.open(gpp_file) as src:
-                gpp_daily = src.read(1).astype(np.float32)
-                gpp_nodata = src.nodata
+                nodata_gpp = src.nodata
 
-            valid_gpp = np.isfinite(gpp_daily)
-            if gpp_nodata is not None and np.isfinite(gpp_nodata):
-                valid_gpp &= (gpp_daily != gpp_nodata)
+                # 逐块读取并累加
+                for win in block_windows:
+                    r0, r1 = win.row_off, win.row_off + win.height
+                    c0, c1 = win.col_off, win.col_off + win.width
 
-            gpp_daily = np.where(valid_gpp, gpp_daily, 0)
-        except:
+                    sos_b = sos[r0:r1, c0:c1]
+                    pos_b = pos[r0:r1, c0:c1]
+                    vph_b = valid_pheno[r0:r1, c0:c1]
+
+                    # 如果块内没有有效像元，跳过
+                    if not np.any(vph_b):
+                        continue
+
+                    # 读取块内GPP数据
+                    gpp_b = src.read(1, window=win)
+
+                    # 累加条件：SOS ≤ doy ≤ POS
+                    in_window = vph_b & (sos_b <= doy) & (doy <= pos_b)
+
+                    # 使用真实nodata判断GPP有效性
+                    if nodata_gpp is None:
+                        valid_gpp = np.isfinite(gpp_b)
+                    else:
+                        if np.isnan(nodata_gpp):
+                            valid_gpp = np.isfinite(gpp_b)
+                        else:
+                            valid_gpp = (gpp_b != nodata_gpp) & np.isfinite(gpp_b)
+                    valid_gpp &= (gpp_b >= 0)  # NDVI负值过滤，与其他模块保持一致
+
+                    acc = in_window & valid_gpp
+                    if np.any(acc):
+                        gppc_block = GPPc[r0:r1, c0:c1]
+                        gppc_block[acc] += gpp_b[acc]
+                        count_block = GPPc_count[r0:r1, c0:c1]
+                        count_block[acc] += 1
+
+        except Exception as e:
+            missing_files += 1
             continue
 
-        # 找到需要累加的像元（SOS <= DOY <= POS）
-        to_add = valid_mask & (sos <= doy) & (doy <= pos)
+    print(f"  缺失日文件数: {missing_files}/{days_in_year}")
 
-        if np.any(to_add):
-            # 初始化未累加的像元
-            uninitialized = (GPPc[to_add] == NODATA_OUT)
-            GPPc[to_add] = np.where(uninitialized, gpp_daily[to_add],
-                                    GPPc[to_add] + gpp_daily[to_add])
+    # 有效天数比例过滤（与TRc一致：窗口内有效天数需 >= MIN_VALID_FRAC * 窗口长度）
+    sos_i = np.rint(sos).astype(np.int16)
+    pos_i = np.rint(pos).astype(np.int16)
+    window_len = (pos_i - sos_i + 1).astype(np.int16)
+    min_required = np.ceil(MIN_VALID_FRAC * window_len).astype(np.int16)
+    valid_count = valid_pheno & (GPPc_count >= min_required)
+    GPPc[valid_pheno & ~valid_count] = NODATA_OUT
 
-    # 统计
-    valid_result = (GPPc != NODATA_OUT) & np.isfinite(GPPc)
-    n_valid = np.sum(valid_result)
-
-    if n_valid > 0:
-        print(f"  ✓ 成功计算GPPc像元数: {n_valid}")
-        print(f"    GPPc范围: {np.min(GPPc[valid_result]):.2f} - {np.max(GPPc[valid_result]):.2f} gC/m²")
-        print(f"    GPPc平均值: {np.mean(GPPc[valid_result]):.2f} gC/m²")
+    # 质量检查
+    GPPc_valid = GPPc[valid_count & (GPPc != NODATA_OUT)]
+    if GPPc_valid.size > 0:
+        print(f"  {MIDDLE_VAR_NAME}c范围: {GPPc_valid.min():.4f} - {GPPc_valid.max():.4f}")
+        print(f"  {MIDDLE_VAR_NAME}c平均: {GPPc_valid.mean():.4f}")
+        print(f"  有效像元: {GPPc_valid.size}")
     else:
-        print(f"  警告：{year}年无有效GPPc结果")
+        print(f"  ⚠ 警告：没有有效{MIDDLE_VAR_NAME}c值（请检查物候/掩膜/{MIDDLE_VAR_NAME}数据）")
 
     # 更新profile
-    output_profile = template_profile.copy()
+    output_profile = profile.copy()
     output_profile.update({
         'dtype': 'float32',
         'nodata': NODATA_OUT
@@ -1058,15 +1134,18 @@ def calculate_GPPc_block_optimized(year, mask, template_profile):
 
 def save_climatology_data_GPP():
     """
-    计算并保存GPP气候态数据
+    计算并保存GPP/NDVI气候态数据（根据MIDDLE_VAR_NAME配置）
+
+    对齐calculate_daily_TR_climatology的逻辑：
+    - 使用无闰日DOY映射（闰年跳过2月29日，3月1日后DOY-1）
 
     输出：
     -------
-    - GPP_daily_climatology.tif : 365波段，每个DOY的多年平均GPP (gC/m²/day)
-    - GPPc_av.tif : 基于[SOSav, POSav]的多年平均累积GPP (gC/m²)
+    - {MIDDLE_VAR_NAME}_daily_climatology.tif : 365波段，每个DOY的多年平均值
+    - {MIDDLE_VAR_NAME}c_av.tif : 基于[SOSav, POSav]的多年平均累积值
     """
     print("\n" + "="*70)
-    print("计算GPP气候态数据")
+    print(f"计算{MIDDLE_VAR_NAME}气候态数据")
     print("="*70)
 
     years = list(range(YEAR_START, YEAR_END + 1))
@@ -1076,41 +1155,88 @@ def save_climatology_data_GPP():
     mask = load_mask()
     height, width = template_profile['height'], template_profile['width']
 
-    # 1. 计算365天的GPP气候态
-    print("\n[1/3] 计算GPP日气候态...")
-    gpp_daily_stack = np.full((len(years), 365, height, width), np.nan, dtype=np.float32)
+    # 1. 计算365天的气候态（与TR气候态逻辑对齐）
+    print(f"\n[1/3] 计算{MIDDLE_VAR_NAME}日气候态...")
 
-    base_date = datetime(2000, 1, 1)  # 非闰年基准
+    # 初始化累加器：(365天, H, W)
+    GPP_sum = np.zeros((365, height, width), dtype=np.float64)
+    GPP_count = np.zeros((365, height, width), dtype=np.int16)
 
-    for doy in tqdm(range(1, 366), desc="逐DOY累积"):
-        for year_idx, year in enumerate(years):
-            current_date = datetime(year, 1, 1) + timedelta(days=doy - 1)
-            gpp_file = get_GPP_file_path(current_date)
+    print(f"  栅格尺寸: {height} × {width}")
+    print(f"  数据大小: {365 * height * width * 8 / 1e9:.2f} GB (float64)")
 
-            if gpp_file is None:
+    # 逐年累加（与TR气候态逻辑对齐）
+    for year in tqdm(years, desc=f"逐年累加{MIDDLE_VAR_NAME}"):
+        days_in_year = 366 if is_leap_year(year) else 365
+        dates_year = [datetime(year, 1, 1) + timedelta(days=i) for i in range(days_in_year)]
+
+        for date_obj in dates_year:
+            doy = date_obj.timetuple().tm_yday
+
+            # 闰年处理：跳过2月29日，3月1日之后DOY-2映射到0-based索引（与TR一致）
+            if is_leap_year(year):
+                if doy == 60:
+                    continue  # 跳过2月29日（DOY=60）
+                elif doy > 60:
+                    doy_idx = doy - 2  # 61->59(3月1日), 62->60, ..., 366->364
+                else:
+                    doy_idx = doy - 1  # 1->0, ..., 59->58(2月28日)
+            else:
+                doy_idx = doy - 1  # 1-based to 0-based
+
+            gpp_file = get_var_daily_file_path(date_obj)
+            if gpp_file is None or not gpp_file.exists():
                 continue
 
             try:
                 with rasterio.open(gpp_file) as src:
-                    gpp_data = src.read(1).astype(np.float32)
-                    gpp_nodata = src.nodata
+                    gpp_daily = src.read(1)
+                    nodata_gpp = src.nodata
 
-                valid = np.isfinite(gpp_data)
-                if gpp_nodata is not None and np.isfinite(gpp_nodata):
-                    valid &= (gpp_data != gpp_nodata)
+                # 判断有效GPP值
+                if nodata_gpp is None:
+                    valid_gpp = mask & np.isfinite(gpp_daily)
+                else:
+                    if np.isnan(nodata_gpp):
+                        valid_gpp = mask & np.isfinite(gpp_daily)
+                    else:
+                        valid_gpp = mask & (gpp_daily != nodata_gpp) & np.isfinite(gpp_daily)
+                valid_gpp &= (gpp_daily >= 0)  # NDVI负值过滤，与其他模块保持一致
 
-                gpp_daily_stack[year_idx, doy-1, valid] = gpp_data[valid]
-            except:
+                # 累加
+                gpp_sum_block = GPP_sum[doy_idx]
+                gpp_sum_block[valid_gpp] += gpp_daily[valid_gpp]
+                gpp_count_block = GPP_count[doy_idx]
+                gpp_count_block[valid_gpp] += 1
+
+            except Exception as e:
                 continue
 
-    # 计算多年平均
-    gpp_daily_av = np.nanmean(gpp_daily_stack, axis=0).astype(np.float32)  # (365, H, W)
+    # 计算平均值
+    print("  计算平均值...")
+    gpp_daily_av = np.full((365, height, width), NODATA_OUT, dtype=np.float32)
 
-    print(f"  ✓ GPP日气候态计算完成")
-    print(f"    有效DOY: {np.sum(np.any(np.isfinite(gpp_daily_av), axis=(1,2)))} / 365")
+    with np.errstate(divide='ignore', invalid='ignore'):
+        for doy_idx in range(365):
+            valid = (GPP_count[doy_idx] > 0) & mask
+            gpp_clim_block = gpp_daily_av[doy_idx]
+            gpp_clim_block[valid] = (GPP_sum[doy_idx][valid] /
+                                     GPP_count[doy_idx][valid]).astype(np.float32)
 
-    # 保存GPP日气候态
-    gpp_clim_file = CLIMATOLOGY_DIR / "GPP_daily_climatology.tif"
+    # 统计信息（与TR气候态格式一致）
+    print(f"\n  统计信息:")
+    for doy_idx in [0, 90, 180, 270, 364]:  # 采样几个日期
+        valid_data = gpp_daily_av[doy_idx][mask & (gpp_daily_av[doy_idx] != NODATA_OUT)]
+        if valid_data.size > 0:
+            print(f"    DOY {doy_idx+1:3d}: 平均={valid_data.mean():.4f}, "
+                  f"范围=[{valid_data.min():.4f}, {valid_data.max():.4f}], "
+                  f"有效像元={valid_data.size}")
+
+    print(f"  ✓ {MIDDLE_VAR_NAME}日气候态计算完成")
+    print(f"    有效DOY: {np.sum(np.any(gpp_daily_av != NODATA_OUT, axis=(1,2)))} / 365")
+
+    # 保存日气候态
+    gpp_clim_file = CLIMATOLOGY_DIR / OUTPUT_CLIMATOLOGY_FORMAT['daily']
     output_profile = template_profile.copy()
     output_profile.update({
         'count': 365,
@@ -1143,8 +1269,8 @@ def save_climatology_data_GPP():
         pos_av = src.read(1)
         pos_nodata = src.nodata
 
-    # 3. 计算GPPc_av（基于SOSav和POSav）
-    print("\n[3/3] 计算GPPc_av...")
+    # 3. 计算累积气候态（基于SOSav和POSav）
+    print(f"\n[3/3] 计算{MIDDLE_VAR_NAME}c_av...")
     GPPc_av = np.full((height, width), NODATA_OUT, dtype=np.float32)
 
     valid_pheno = np.isfinite(sos_av) & np.isfinite(pos_av)
@@ -1157,8 +1283,8 @@ def save_climatology_data_GPP():
     valid_pheno &= (sos_av < pos_av)
     valid_pheno &= mask
 
-    # 逐像元累加
-    for i in tqdm(range(height), desc="逐像元累加GPP"):
+    # 逐像元累加（添加MIN_VALID_FRAC过滤，与TRc一致）
+    for i in tqdm(range(height), desc=f"逐像元累加{MIDDLE_VAR_NAME}"):
         for j in range(width):
             if not valid_pheno[i, j]:
                 continue
@@ -1172,23 +1298,26 @@ def save_climatology_data_GPP():
             # 累加[SOS, POS]范围的GPP
             gpp_sum = 0.0
             valid_days = 0
+            window_len = pos - sos + 1
             for doy in range(sos, pos + 1):
                 gpp_val = gpp_daily_av[doy - 1, i, j]
-                if np.isfinite(gpp_val):
+                if gpp_val != NODATA_OUT and np.isfinite(gpp_val):
                     gpp_sum += gpp_val
                     valid_days += 1
 
-            if valid_days > 0:
+            # MIN_VALID_FRAC过滤：有效天数需达到窗口长度的MIN_VALID_FRAC比例
+            min_required = int(np.ceil(MIN_VALID_FRAC * window_len))
+            if valid_days >= min_required:
                 GPPc_av[i, j] = gpp_sum
 
     valid_gppav = (GPPc_av != NODATA_OUT) & np.isfinite(GPPc_av)
-    print(f"  ✓ GPPc_av计算完成")
+    print(f"  ✓ {MIDDLE_VAR_NAME}c_av计算完成")
     print(f"    有效像元: {np.sum(valid_gppav)}")
     if np.any(valid_gppav):
-        print(f"    GPPc_av范围: {np.min(GPPc_av[valid_gppav]):.2f} - {np.max(GPPc_av[valid_gppav]):.2f} gC/m²")
+        print(f"    {MIDDLE_VAR_NAME}c_av范围: {np.min(GPPc_av[valid_gppav]):.2f} - {np.max(GPPc_av[valid_gppav]):.2f}")
 
-    # 保存GPPc_av
-    gppav_file = CLIMATOLOGY_DIR / "GPPc_av.tif"
+    # 保存累积气候态
+    gppav_file = CLIMATOLOGY_DIR / OUTPUT_CLIMATOLOGY_FORMAT['cumulative_av']
     output_profile_single = template_profile.copy()
     output_profile_single.update({
         'count': 1,
@@ -1201,52 +1330,25 @@ def save_climatology_data_GPP():
 
     print(f"  ✓ 已保存: {gppav_file}")
     print("\n" + "="*70)
-    print("✓ GPP气候态数据计算完成！")
+    print(f"✓ {MIDDLE_VAR_NAME}气候态数据计算完成！")
     print(f"输出目录: {CLIMATOLOGY_DIR}")
     print("="*70)
 
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    years = list(range(YEAR_START, YEAR_END + 1))
-    if RUN_MODE == "skip" and outputs_complete(years):
-        print("✓ Module 02 输出齐全，已跳过全部计算")
-    else:
-        # 步骤1：计算年度TRc（SOS-POS累积蒸腾）
-        # 方式1：串行处理（推荐，稳定可靠）
-        main(use_block_processing=True)
-
-        # 方式2：并行处理（可选，SSD环境下可能更快）
-        # ⚠️ 注意：
-        # - 并行适用于SSD，HDD可能适得其反
-        # - MAX_WORKERS=2-4 比较稳妥（I/O密集任务）
-        # - 自动支持断点续算
-        # main_parallel(use_block_processing=True, max_workers=2)
-
-        # ======================================================================
-        # 步骤2：计算气候态数据（用于03_decomposition_original.py原版分解）
-        # ⚠️ 重要：仅在完成步骤1后，且准备进行分解时再运行此步骤
-        # ======================================================================
-        save_climatology_data()
-        #
-        # 此步骤将计算并保存：
-        #   - TR_daily_climatology.tif (365波段，每个DOY的多年平均TR)
-        #   - SOSav.tif (多年平均SOS)
-        #   - POSav.tif (多年平均POS)
-        #
-        # 输出目录：Wang2025_Analysis/Climatology/
-        #
-        # 注意：此步骤计算密集，预计需要30-60分钟（取决于数据规模）
-
-        # ======================================================================
-        # 步骤3：计算GPP气候态数据（新增）
-        # ======================================================================
-        save_climatology_data_GPP()
-        #
-        # 此步骤将计算并保存：
-        #   - GPP_daily_climatology.tif (365波段，每个DOY的多年平均GPP)
-        #   - GPPc_av.tif (基于SOSav和POSav的多年平均累积GPP)
-        #
-        # 输出目录：Wang2025_Analysis_GPP_Modify/Climatology/
-        #
-        # 注意：此步骤需要在save_climatology_data()之后运行（依赖SOSav和POSav）
+    from _config import RUN_CONFIGS_02_06, apply_run_config
+    for cfg in RUN_CONFIGS_02_06:
+        apply_run_config(cfg, globals())
+        # 重置局部别名（apply_run_config已更新TRC_ANNUAL_DIR等，但OUTPUT_DIR是导入时的旧值）
+        OUTPUT_DIR = TRC_ANNUAL_DIR
+        years = list(range(YEAR_START, YEAR_END + 1))
+        if RUN_MODE == "skip" and outputs_complete(years):
+            print(f"✓ Module 02 [{MIDDLE_VAR_NAME}] 输出齐全，已跳过全部计算")
+        else:
+            # 步骤1：计算年度TRc + 累积NDVI/GPP
+            main(use_block_processing=True)
+            # 步骤2：计算气候态数据（TR气候态 + SOSav/POSav）
+            save_climatology_data()
+            # 步骤3：计算日尺度变量（NDVI/GPP）的气候态
+            save_climatology_data_GPP()

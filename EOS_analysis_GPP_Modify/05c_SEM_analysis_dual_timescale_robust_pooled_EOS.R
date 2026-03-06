@@ -386,7 +386,7 @@ delta_p_ratio <- function(c_val, d_val, e_val, se_c, se_d, se_e, eps = MEDIATION
 # ==================== 步骤1：验证缓存文件 ====================
 
 cat("\n=== 步骤1：验证缓存文件 ===\n")
-cat("检查05b生成的缓存文件...\n")
+cat("检查03c和05b生成的缓存文件...\n")
 
 years <- YEAR_START:YEAR_END
 
@@ -397,14 +397,14 @@ check_file(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "固定窗口长度
 # 检查所有年份的缓存文件
 missing_files <- 0
 for (year in years) {
+  # 检查DERIVED_DIR中的气候数据（05b生成）
   files_to_check <- c(
     sprintf("P_pre_%d.tif", year),
     sprintf("T_pre_%d.tif", year),
     sprintf("SW_pre_%d.tif", year),
     sprintf("P_season_%d.tif", year),
     sprintf("T_season_%d.tif", year),
-    sprintf("SW_season_%d.tif", year),
-    sprintf("Fixed_GPPrate_%d.tif", year)
+    sprintf("SW_season_%d.tif", year)
   )
 
   for (f in files_to_check) {
@@ -415,6 +415,7 @@ for (year in years) {
     }
   }
 
+  # 检查DECOMP_DIR中的分解数据（03c生成）
   # 检查TR_fixed_window
   tr_file <- file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year))
   if (!file.exists(tr_file)) {
@@ -422,7 +423,14 @@ for (year in years) {
     missing_files <- missing_files + 1
   }
 
-  # 检查EOS
+  # 检查Fixed_GPPrate（03c生成，在DECOMP_DIR中）
+  gpprate_file <- file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year))
+  if (!file.exists(gpprate_file)) {
+    cat(sprintf("  ✗ 缺失: Fixed_GPPrate_%d.tif\n", year))
+    missing_files <- missing_files + 1
+  }
+
+  # 检查EOS（物候数据）
   eos_file <- file.path(PHENO_DIR, sprintf("eos_gpp_%d.tif", year))
   if (!file.exists(eos_file)) {
     cat(sprintf("  ✗ 缺失: eos_gpp_%d.tif\n", year))
@@ -431,7 +439,7 @@ for (year in years) {
 }
 
 if (missing_files > 0) {
-  stop(sprintf("\n✗ 错误：缺失 %d 个文件！\n请先运行05b代码生成所有缓存文件。", missing_files))
+  stop(sprintf("\n✗ 错误：缺失 %d 个文件！\n请先运行03c（分解）和05b（气候数据）代码生成所有缓存文件。", missing_files))
 }
 
 cat(sprintf("✓ 所有 %d 年的缓存文件验证通过\n", length(years)))
@@ -505,7 +513,7 @@ cat("    ✓ 栅格对齐检查通过\n")
 # Bug Fix 3: 应用NODATA过滤
 tr_test <- sanitize_values(getValues(tr_test_r), get_nodata(tr_test_r), allow_negative = TRUE)  # TR_fixed_window 可以是负值！
 eos_test <- sanitize_values(getValues(eos_test_r), get_nodata(eos_test_r), allow_negative = FALSE)
-gpp_test <- sanitize_values(getValues(gpp_test_r), get_nodata(gpp_test_r), allow_negative = FALSE)
+gpp_test <- sanitize_values(getValues(gpp_test_r), get_nodata(gpp_test_r), allow_negative = TRUE)  # Fixed_GPPrate是异常值，可以为负
 p_pre_test <- sanitize_values(getValues(p_pre_test_r), get_nodata(p_pre_test_r), allow_negative = FALSE)
 t_pre_test <- sanitize_values(getValues(t_pre_test_r), get_nodata(t_pre_test_r))
 sw_pre_test <- sanitize_values(getValues(sw_pre_test_r), get_nodata(sw_pre_test_r), allow_negative = FALSE)
@@ -517,7 +525,7 @@ fixed_len_test <- sanitize_values(fixed_len_vals_all, fixed_len_nodata, allow_ne
 # 变量特定约束
 eos_test[eos_test < 1 | eos_test > 365] <- NA
 # tr_test 可以是负值，不过滤！
-gpp_test[gpp_test <= 0] <- NA
+# gpp_test (Fixed_GPPrate) 是异常值，可以为负，不过滤！
 fixed_len_test[fixed_len_test <= 0] <- NA
 
 # 【诊断】逐个变量统计有效像元数
@@ -583,7 +591,7 @@ read_year_data <- function(year, candidate_cells, fixed_len_vals_all, fixed_len_
   # Bug Fix 3: 只提取候选像元的值并过滤NODATA
   tr_vals <- sanitize_values(getValues(tr_fixed_r)[candidate_cells], get_nodata(tr_fixed_r), allow_negative = TRUE)
   eos_vals <- sanitize_values(getValues(eos_r)[candidate_cells], get_nodata(eos_r), allow_negative = FALSE)
-  gpp_vals <- sanitize_values(getValues(gpp_season_r)[candidate_cells], get_nodata(gpp_season_r), allow_negative = FALSE)
+  gpp_vals <- sanitize_values(getValues(gpp_season_r)[candidate_cells], get_nodata(gpp_season_r), allow_negative = TRUE)  # Fixed_GPPrate是异常值，可以为负
   p_pre_vals <- sanitize_values(getValues(p_pre_r)[candidate_cells], get_nodata(p_pre_r), allow_negative = FALSE)
   t_pre_vals <- sanitize_values(getValues(t_pre_r)[candidate_cells], get_nodata(t_pre_r))
   sw_pre_vals <- sanitize_values(getValues(sw_pre_r)[candidate_cells], get_nodata(sw_pre_r), allow_negative = FALSE)
@@ -593,7 +601,7 @@ read_year_data <- function(year, candidate_cells, fixed_len_vals_all, fixed_len_
 
   # 额外的变量特定约束
   eos_vals[eos_vals < 1 | eos_vals > 365] <- NA
-  gpp_vals[gpp_vals <= 0] <- NA
+  # gpp_vals (Fixed_GPPrate) 是异常值，可以为负，不过滤！
 
   # 计算Fixed_Trate（只对候选像元）
   fixed_len_vals <- sanitize_values(fixed_len_vals_all[candidate_cells], fixed_len_nodata, allow_negative = FALSE)
@@ -718,8 +726,8 @@ clean_outliers <- function(dt) {
   dt <- dt[is.finite(Fixed_Trate)]  # Bug Fix 4: 允许负值！
   # EOS应该在1-365之间
   dt <- dt[EOS >= 1 & EOS <= 365]
-  # GPP应该为正
-  dt <- dt[Fixed_GPPrate > 0 & is.finite(Fixed_GPPrate)]
+  # Fixed_GPPrate是异常值，可以为负，只过滤非有限值
+  dt <- dt[is.finite(Fixed_GPPrate)]
   # 降水应该非负
   dt <- dt[P_pre >= 0 & P_season >= 0]
 

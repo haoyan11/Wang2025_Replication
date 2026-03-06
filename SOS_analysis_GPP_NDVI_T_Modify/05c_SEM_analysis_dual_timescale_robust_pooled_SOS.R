@@ -44,11 +44,31 @@ OVERWRITE <- identical(RUN_MODE, "overwrite")
 should_write <- function(path) {
   OVERWRITE || !file.exists(path)
 }
+normalize_fixed_rate_labels <- function(df) {
+  if (!is.data.frame(df)) {
+    return(df)
+  }
+  new_name <- sprintf("Fixed_%srate", MIDDLE_VAR_NAME)
+  names(df) <- gsub("Fixed_GPPrate", new_name, names(df))
+  if (!is.null(rownames(df))) {
+    rownames(df) <- gsub("Fixed_GPPrate", new_name, rownames(df))
+  }
+  for (col in names(df)) {
+    if (is.factor(df[[col]])) {
+      df[[col]] <- as.character(df[[col]])
+    }
+    if (is.character(df[[col]])) {
+      df[[col]] <- gsub("Fixed_GPPrate", new_name, df[[col]])
+    }
+  }
+  df
+}
 safe_write_csv <- function(df, path, ...) {
   if (!should_write(path)) {
     cat(sprintf("  [skip] %s\n", path))
     return(invisible(FALSE))
   }
+  df <- normalize_fixed_rate_labels(df)
   write.csv(df, path, ...)
   invisible(TRUE)
 }
@@ -70,31 +90,21 @@ safe_write_raster <- function(r, path, ...) {
 }
 
 # ==================== 配置 ====================
-
-# 根目录（自动检测）
-if (.Platform$OS.type == "windows") {
-  ROOT <- "I:/F/Data4"
-} else {
-  if (dir.exists("/mnt/i/F/Data4")) {
-    ROOT <- "/mnt/i/F/Data4"
-  } else {
-    ROOT <- "I:/F/Data4"
+# 加载统一配置（路径、模式、常量等）
+.script_dir <- tryCatch(
+  dirname(normalizePath(sys.frame(1)$ofile)),
+  error = function(e) {
+    args <- commandArgs(trailingOnly = FALSE)
+    f <- grep("--file=", args, value = TRUE)
+    if (length(f)) dirname(normalizePath(sub("--file=", "", f))) else getwd()
   }
-}
+)
+source(file.path(.script_dir, "_config.R"))
 
-# 路径配置
-OUTPUT_ROOT <- file.path(ROOT, "Wang2025_Analysis_SOS_GPP_Modify")
-PHENO_DIR <- file.path(ROOT, "Phenology_Output_1", "GPP_phenology")
-DECOMP_DIR <- file.path(OUTPUT_ROOT, "Decomposition_FixedWindow")
-MASK_FILE <- file.path(OUTPUT_ROOT, "masks", "combined_mask.tif")
-TEMPLATE_FILE <- file.path(OUTPUT_ROOT, "masks", "template_grid.tif")
-
-# 缓存数据路径（来自05b）
-DERIVED_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed", "Derived")
-
-# 输出目录（与05b命名风格保持一致：SEM_Data_*/SEM_Results_*）
-DATA_DIR <- file.path(OUTPUT_ROOT, "SEM_Data_Dual_Fixed_Robust_Pooled_SOS")
-OUTPUT_DIR <- file.path(OUTPUT_ROOT, "SEM_Results_Dual_Fixed_Robust_Pooled_SOS")
+# ===== 05c模块专用输出目录 =====
+# DERIVED_DIR 来自_config.R（05b生成的缓存数据）
+DATA_DIR <- file.path(MODE_ROOT, "SEM_Data_Dual_Fixed_Robust_Pooled_SOS")
+OUTPUT_DIR <- file.path(MODE_ROOT, "SEM_Results_Dual_Fixed_Robust_Pooled_SOS")
 
 # 创建输出目录
 dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -140,13 +150,7 @@ outputs_ready <- function(suffix = "") {
   all(file.exists(required))
 }
 
-# 年份范围
-YEAR_START <- 1982
-YEAR_END <- 2018
-
-# 常量
-NODATA_OUT <- -9999
-NODATA_ABS_MAX <- 1e20
+# ===== 05c控制选项 =====
 FILTER_SEM_OUTLIERS <- TRUE  # 输出结果异常值过滤（类似04c）
 SEM_COEF_ABS_MAX <- 5        # 系数绝对值阈值（标准化系数）
 SEM_P_MIN <- 0               # p值下限
@@ -199,9 +203,9 @@ check_raster_alignment <- function(template_r, year) {
     list(MASK_FILE, "mask", TRUE),
     list(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)), "TR_fixed_window", FALSE),
     list(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "Fixed_Window_Length", FALSE),
-    list(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year)), "SOS", FALSE),
-    list(file.path(PHENO_DIR, sprintf("pos_doy_gpp_%d.tif", year)), "POS", FALSE),
-    list(file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year)), "Fixed_GPPrate", FALSE),  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
+    list(file.path(PHENO_DIR, sprintf(SOS_PATTERN, year)), "SOS", FALSE),
+    list(file.path(PHENO_DIR, sprintf(POS_PATTERN, year)), "POS", FALSE),
+    list(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year)), "Fixed_GPPrate", FALSE),  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
     list(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year)), "P_pre", TRUE)
   )
 
@@ -386,7 +390,7 @@ delta_p_ratio <- function(c_val, d_val, e_val, se_c, se_d, se_e, eps = MEDIATION
 # ==================== 步骤1：验证缓存文件 ====================
 
 cat("\n=== 步骤1：验证缓存文件 ===\n")
-cat("检查05b生成的缓存文件...\n")
+cat("检查03c和05b生成的缓存文件...\n")
 
 years <- YEAR_START:YEAR_END
 
@@ -397,14 +401,14 @@ check_file(file.path(DECOMP_DIR, "Fixed_Window_Length.tif"), "固定窗口长度
 # 检查所有年份的缓存文件
 missing_files <- 0
 for (year in years) {
+  # 检查DERIVED_DIR中的气候数据（05b生成）
   files_to_check <- c(
     sprintf("P_pre_%d.tif", year),
     sprintf("T_pre_%d.tif", year),
     sprintf("SW_pre_%d.tif", year),
     sprintf("P_season_%d.tif", year),
     sprintf("T_season_%d.tif", year),
-    sprintf("SW_season_%d.tif", year),
-    sprintf("Fixed_GPPrate_%d.tif", year)
+    sprintf("SW_season_%d.tif", year)
   )
 
   for (f in files_to_check) {
@@ -415,6 +419,7 @@ for (year in years) {
     }
   }
 
+  # 检查DECOMP_DIR中的分解数据（03c生成）
   # 检查TR_fixed_window
   tr_file <- file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year))
   if (!file.exists(tr_file)) {
@@ -422,16 +427,23 @@ for (year in years) {
     missing_files <- missing_files + 1
   }
 
-  # 检查SOS
-  sos_file <- file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year))
+  # 检查Fixed_NDVIrate/Fixed_GPPrate（03c生成，在DECOMP_DIR中）
+  rate_file <- file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year))
+  if (!file.exists(rate_file)) {
+    cat(sprintf("  ✗ 缺失: %s\n", basename(rate_file)))
+    missing_files <- missing_files + 1
+  }
+
+  # 检查SOS（物候数据）
+  sos_file <- file.path(PHENO_DIR, sprintf(SOS_PATTERN, year))
   if (!file.exists(sos_file)) {
-    cat(sprintf("  ✗ 缺失: sos_gpp_%d.tif\n", year))
+    cat(sprintf("  ✗ 缺失: %s\n", basename(sos_file)))
     missing_files <- missing_files + 1
   }
 }
 
 if (missing_files > 0) {
-  stop(sprintf("\n✗ 错误：缺失 %d 个文件！\n请先运行05b代码生成所有缓存文件。", missing_files))
+  stop(sprintf("\n✗ 错误：缺失 %d 个文件！\n请先运行03c（分解）和05b（气候数据）代码生成所有缓存文件。", missing_files))
 }
 
 cat(sprintf("✓ 所有 %d 年的缓存文件验证通过\n", length(years)))
@@ -483,8 +495,8 @@ cat(sprintf("    掩膜有效像元数: %d (%.2f%%)\n",
 # 读取1982年数据快速筛选
 year_test <- years[1]  # 1982
 tr_test_r <- raster(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year_test)))
-sos_test_r <- raster(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year_test)))
-gpp_test_r <- raster(file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year_test)))  # 从DECOMP_DIR读取
+sos_test_r <- raster(file.path(PHENO_DIR, sprintf(SOS_PATTERN, year_test)))
+gpp_test_r <- raster(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year_test)))  # 从DECOMP_DIR读取
 p_pre_test_r <- raster(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year_test)))
 t_pre_test_r <- raster(file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", year_test)))
 sw_pre_test_r <- raster(file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", year_test)))
@@ -505,7 +517,7 @@ cat("    ✓ 栅格对齐检查通过\n")
 # Bug Fix 3: 应用NODATA过滤
 tr_test <- sanitize_values(getValues(tr_test_r), get_nodata(tr_test_r), allow_negative = TRUE)  # TR_fixed_window 可以是负值！
 sos_test <- sanitize_values(getValues(sos_test_r), get_nodata(sos_test_r), allow_negative = FALSE)
-gpp_test <- sanitize_values(getValues(gpp_test_r), get_nodata(gpp_test_r), allow_negative = FALSE)
+gpp_test <- sanitize_values(getValues(gpp_test_r), get_nodata(gpp_test_r), allow_negative = TRUE)  # Fixed_NDVIrate是异常值，可以为负
 p_pre_test <- sanitize_values(getValues(p_pre_test_r), get_nodata(p_pre_test_r), allow_negative = FALSE)
 t_pre_test <- sanitize_values(getValues(t_pre_test_r), get_nodata(t_pre_test_r))
 sw_pre_test <- sanitize_values(getValues(sw_pre_test_r), get_nodata(sw_pre_test_r), allow_negative = FALSE)
@@ -517,7 +529,7 @@ fixed_len_test <- sanitize_values(fixed_len_vals_all, fixed_len_nodata, allow_ne
 # 变量特定约束
 sos_test[sos_test < 1 | sos_test > 365] <- NA
 # tr_test 可以是负值，不过滤！
-gpp_test[gpp_test <= 0] <- NA
+# gpp_test (Fixed_NDVIrate) 也是距平值，可以是负值，不过滤！
 fixed_len_test[fixed_len_test <= 0] <- NA
 
 # 【诊断】逐个变量统计有效像元数
@@ -571,8 +583,8 @@ cat(sprintf("    （相比全量检查减少了 %.1f%% 的计算量）\n\n",
 read_year_data <- function(year, candidate_cells, fixed_len_vals_all, fixed_len_nodata) {
   # 读取该年的所有变量
   tr_fixed_r <- raster(file.path(DECOMP_DIR, sprintf("TR_fixed_window_%d.tif", year)))
-  sos_r <- raster(file.path(PHENO_DIR, sprintf("sos_gpp_%d.tif", year)))
-  gpp_season_r <- raster(file.path(DECOMP_DIR, sprintf("Fixed_GPPrate_%d.tif", year)))  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
+  sos_r <- raster(file.path(PHENO_DIR, sprintf(SOS_PATTERN, year)))
+  gpp_season_r <- raster(file.path(DECOMP_DIR, sprintf(FIXED_RATE_PATTERN, year)))  # 从DECOMP_DIR读取03c生成的Fixed_GPPrate
   p_pre_r <- raster(file.path(DERIVED_DIR, sprintf("P_pre_%d.tif", year)))
   t_pre_r <- raster(file.path(DERIVED_DIR, sprintf("T_pre_%d.tif", year)))
   sw_pre_r <- raster(file.path(DERIVED_DIR, sprintf("SW_pre_%d.tif", year)))
@@ -583,7 +595,7 @@ read_year_data <- function(year, candidate_cells, fixed_len_vals_all, fixed_len_
   # Bug Fix 3: 只提取候选像元的值并过滤NODATA
   tr_vals <- sanitize_values(getValues(tr_fixed_r)[candidate_cells], get_nodata(tr_fixed_r), allow_negative = TRUE)
   sos_vals <- sanitize_values(getValues(sos_r)[candidate_cells], get_nodata(sos_r), allow_negative = FALSE)
-  gpp_vals <- sanitize_values(getValues(gpp_season_r)[candidate_cells], get_nodata(gpp_season_r), allow_negative = FALSE)
+  gpp_vals <- sanitize_values(getValues(gpp_season_r)[candidate_cells], get_nodata(gpp_season_r), allow_negative = TRUE)  # Fixed_NDVIrate是异常值，可以为负
   p_pre_vals <- sanitize_values(getValues(p_pre_r)[candidate_cells], get_nodata(p_pre_r), allow_negative = FALSE)
   t_pre_vals <- sanitize_values(getValues(t_pre_r)[candidate_cells], get_nodata(t_pre_r))
   sw_pre_vals <- sanitize_values(getValues(sw_pre_r)[candidate_cells], get_nodata(sw_pre_r), allow_negative = FALSE)
@@ -593,7 +605,7 @@ read_year_data <- function(year, candidate_cells, fixed_len_vals_all, fixed_len_
 
   # 额外的变量特定约束
   sos_vals[sos_vals < 1 | sos_vals > 365] <- NA
-  gpp_vals[gpp_vals <= 0] <- NA
+  # gpp_vals (Fixed_NDVIrate) 是距平值，可以是负值，不过滤！
 
   # 计算Fixed_Trate（只对候选像元）
   fixed_len_vals <- sanitize_values(fixed_len_vals_all[candidate_cells], fixed_len_nodata, allow_negative = FALSE)
@@ -629,7 +641,8 @@ if (PARALLEL_ENABLE && PARALLEL_CORES > 1) {
   clusterExport(cl, c("years", "candidate_cells", "fixed_len_vals_all", "fixed_len_nodata",
                       "DECOMP_DIR", "PHENO_DIR", "DERIVED_DIR",
                       "sanitize_values", "get_nodata", "read_year_data",
-                      "NODATA_OUT", "NODATA_ABS_MAX"),
+                      "NODATA_OUT", "NODATA_ABS_MAX",
+                      "MIDDLE_VAR_NAME", "FIXED_RATE_PATTERN", "SOS_PATTERN", "POS_PATTERN"),
                 envir = environment())
 
   year_list <- parLapply(cl, years, function(year) {
@@ -718,8 +731,8 @@ clean_outliers <- function(dt) {
   dt <- dt[is.finite(Fixed_Trate)]  # Bug Fix 4: 允许负值！
   # SOS应该在1-365之间
   dt <- dt[SOS >= 1 & SOS <= 365]
-  # GPP应该为正
-  dt <- dt[Fixed_GPPrate > 0 & is.finite(Fixed_GPPrate)]
+  # Fixed_GPPrate (Fixed_NDVIrate) 是距平值，可以是负值，只过滤Inf/NaN
+  dt <- dt[is.finite(Fixed_GPPrate)]
   # 降水应该非负
   dt <- dt[P_pre >= 0 & P_season >= 0]
 

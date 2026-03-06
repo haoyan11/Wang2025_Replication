@@ -56,7 +56,9 @@ from _config import (
     ROOT, PHENO_DIR, PHENO_FILE_FORMAT, TRC_ANNUAL_DIR, CLIMATOLOGY_DIR,
     DECOMPOSITION_FIXED_DIR, YEAR_START, YEAR_END, NODATA_OUT, TR_DAILY_DIR,
     TR_FILE_FORMAT, BLOCK_SIZE, MAX_WORKERS, TEMPLATE_RASTER, MASK_FILE,
-    GPP_DAILY_DIR, GPP_DAILY_FORMAT
+    VAR_DAILY_DIR, VAR_DAILY_FORMAT,  # 当前模式的日尺度数据（NDVI或GPP）
+    OUTPUT_CUMULATIVE_FORMAT, OUTPUT_CLIMATOLOGY_FORMAT, OUTPUT_DECOMP_FORMAT,  # 输出文件名格式
+    MIDDLE_VAR_NAME  # 用于日志标签
 )
 
 # GDAL缓存（MB），用于加速连续读取
@@ -64,9 +66,6 @@ GDAL_CACHE_MAX_MB = 512
 PARALLEL_BY_YEAR = True
 YEAR_WORKERS = MAX_WORKERS
 MIN_VALID_FRAC = 0.60  # 有效天数阈值（窗口内）
-
-# 确保输出目录存在
-DECOMPOSITION_FIXED_DIR.mkdir(parents=True, exist_ok=True)
 
 # 向后兼容：保留旧变量名
 TRC_DIR = TRC_ANNUAL_DIR
@@ -80,6 +79,12 @@ OVERWRITE = RUN_MODE == "overwrite"
 def should_write(path):
     path = Path(path)
     return OVERWRITE or not path.exists()
+
+def ensure_output_dir():
+    """确保输出目录在apply_run_config之后创建"""
+    DECOMPOSITION_FIXED_DIR.mkdir(parents=True, exist_ok=True)
+    global OUTPUT_DIR
+    OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
 
 
 def _is_valid_value(value, nodata):
@@ -108,7 +113,14 @@ _GLOBAL_CTX = {}
 
 
 def _init_worker(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile,
-                 gppc_av, gpp_valid):
+                 gppc_av, gpp_valid, run_cfg=None):
+    if run_cfg is not None:
+        from _config import apply_run_config
+        apply_run_config(run_cfg, globals())
+        global TRC_DIR, CLIM_DIR, OUTPUT_DIR
+        TRC_DIR = TRC_ANNUAL_DIR
+        CLIM_DIR = CLIMATOLOGY_DIR
+        OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
     global _GLOBAL_CTX
     _GLOBAL_CTX = {
         "trc_av": trc_av,
@@ -131,11 +143,11 @@ def _process_year(year):
             OUTPUT_DIR / f"TR_fixed_window_{year}.tif",
             OUTPUT_DIR / f"TR_pos_change_{year}.tif",
             OUTPUT_DIR / f"TR_eos_change_{year}.tif",
-            OUTPUT_DIR / f"GPP_window_change_{year}.tif",
-            OUTPUT_DIR / f"GPP_fixed_window_{year}.tif",
-            OUTPUT_DIR / f"GPP_pos_change_{year}.tif",
-            OUTPUT_DIR / f"GPP_eos_change_{year}.tif",
-            OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif",
+            OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['window_change'].format(year=year),
+            OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window'].format(year=year),
+            OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['pos_change'].format(year=year),
+            OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['eos_change'].format(year=year),
+            OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_rate'].format(year=year),
         ]
         if all(p.exists() for p in outputs):
             return year
@@ -158,17 +170,17 @@ def _process_year(year):
     write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, ctx["profile"])
     write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, ctx["profile"])
     write_geotiff(OUTPUT_DIR / f"TR_eos_change_{year}.tif", tr_eos_change, ctx["profile"])
-    write_geotiff(OUTPUT_DIR / f"GPP_window_change_{year}.tif", gpp_window_change, ctx["profile"])
-    write_geotiff(OUTPUT_DIR / f"GPP_fixed_window_{year}.tif", gpp_fixed_window, ctx["profile"])
-    write_geotiff(OUTPUT_DIR / f"GPP_pos_change_{year}.tif", gpp_pos_change, ctx["profile"])
-    write_geotiff(OUTPUT_DIR / f"GPP_eos_change_{year}.tif", gpp_eos_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['window_change'].format(year=year), gpp_window_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window'].format(year=year), gpp_fixed_window, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['pos_change'].format(year=year), gpp_pos_change, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['eos_change'].format(year=year), gpp_eos_change, ctx["profile"])
 
     # 计算并保存Fixed_GPPrate = GPP_fixed_window / Fixed_GPPWindow_Length
-    fixed_window_length, _, _ = read_geotiff(OUTPUT_DIR / "Fixed_GPPWindow_Length.tif")
+    fixed_window_length, _, _ = read_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window_length'])
     fixed_gpp_rate = np.full_like(gpp_fixed_window, NODATA_OUT)
     valid_rate = (gpp_fixed_window != NODATA_OUT) & (fixed_window_length > 0)
     fixed_gpp_rate[valid_rate] = gpp_fixed_window[valid_rate] / fixed_window_length[valid_rate]
-    write_geotiff(OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif", fixed_gpp_rate, ctx["profile"])
+    write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_rate'].format(year=year), fixed_gpp_rate, ctx["profile"])
 
     return year
 
@@ -278,7 +290,7 @@ def accumulate_daily_gpp_sums(year, ref_profile, valid_base,
             if doy_noleap is None:
                 continue
 
-            file_path = GPP_DAILY_DIR / GPP_DAILY_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
+            file_path = VAR_DAILY_DIR / VAR_DAILY_FORMAT.format(date=date_obj.strftime("%Y%m%d"))
             if not file_path.exists():
                 continue
 
@@ -288,7 +300,7 @@ def accumulate_daily_gpp_sums(year, ref_profile, valid_base,
 
                 if not checked_ref:
                     check_spatial_consistency(ref_profile, file_path, profile,
-                                              f"GPP_daily_{date_obj.strftime('%Y%m%d')}")
+                                              f"{MIDDLE_VAR_NAME}_daily_{date_obj.strftime('%Y%m%d')}")
                     checked_ref = True
 
                 for win, has_valid in zip(block_windows, block_has_valid):
@@ -575,7 +587,7 @@ def decompose_year(year, trc_av, pos_av, eos_av,
     """
     # 读取当年数据
     trc_file = TRC_DIR / f"TRc_{year}.tif"
-    gppc_file = TRC_DIR / f"GPPc_{year}.tif"  # GPPc也在TRc_annual目录
+    gppc_file = TRC_DIR / OUTPUT_CUMULATIVE_FORMAT.format(year=year)  # GPPc也在TRc_annual目录
     pos_file = PHENO_DIR / PHENO_FILE_FORMAT["POS"].format(year=year)
     eos_file = PHENO_DIR / PHENO_FILE_FORMAT["EOS"].format(year=year)
 
@@ -586,9 +598,9 @@ def decompose_year(year, trc_av, pos_av, eos_av,
 
     # 空间一致性检查
     check_spatial_consistency(ref_profile, trc_file, trc_profile, f"TRc_{year}")
-    check_spatial_consistency(ref_profile, gppc_file, gppc_profile, f"GPPc_{year}")
-    check_spatial_consistency(ref_profile, pos_file, pos_profile, f"POS({year})")
-    check_spatial_consistency(ref_profile, eos_file, eos_profile, f"EOS({year})")
+    check_spatial_consistency(ref_profile, gppc_file, gppc_profile, f"{MIDDLE_VAR_NAME}c_{year}")
+    check_spatial_consistency(ref_profile, pos_file, pos_profile, PHENO_FILE_FORMAT["POS"].format(year=year))
+    check_spatial_consistency(ref_profile, eos_file, eos_profile, PHENO_FILE_FORMAT["EOS"].format(year=year))
 
     height, width = trc_y.shape
 
@@ -721,9 +733,10 @@ def decompose_year(year, trc_av, pos_av, eos_av,
             gpp_window_change, gpp_fixed_window, gpp_pos_change, gpp_eos_change)
 
 
-def main():
+def main(run_cfg=None):
+    ensure_output_dir()
     print("\n" + "=" * 80)
-    print("Fixed-Window Decomeosition (Method 2)")
+    print("Fixed-Window Decomposition (Method 2)")
     print("=" * 80)
     print("\n核心思想：")
     print("  - 固定窗口[POSav, EOSav]内的强度变化 → 剥离窗口选择效应")
@@ -735,9 +748,9 @@ def main():
     if RUN_MODE == "skip":
         base_outputs = [
             OUTPUT_DIR / "TRc_av.tif",
-            CLIMATOLOGY_DIR / "GPPc_av.tif",  # GPPc_av在Climatology目录
+            CLIMATOLOGY_DIR / OUTPUT_CLIMATOLOGY_FORMAT['cumulative_av'],  # NDVIc_av在Climatology目录
             OUTPUT_DIR / "Fixed_Window_Length.tif",
-            OUTPUT_DIR / "Fixed_GPPWindow_Length.tif",
+            OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window_length'],
         ]
         year_outputs = []
         for year in years:
@@ -746,11 +759,11 @@ def main():
                 OUTPUT_DIR / f"TR_fixed_window_{year}.tif",
                 OUTPUT_DIR / f"TR_pos_change_{year}.tif",
                 OUTPUT_DIR / f"TR_eos_change_{year}.tif",
-                OUTPUT_DIR / f"GPP_window_change_{year}.tif",
-                OUTPUT_DIR / f"GPP_fixed_window_{year}.tif",
-                OUTPUT_DIR / f"GPP_pos_change_{year}.tif",
-                OUTPUT_DIR / f"GPP_eos_change_{year}.tif",
-                OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif",
+                OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['window_change'].format(year=year),
+                OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window'].format(year=year),
+                OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['pos_change'].format(year=year),
+                OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['eos_change'].format(year=year),
+                OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_rate'].format(year=year),
             ])
         if all(p.exists() for p in base_outputs + year_outputs):
             print("  ✓ 输出齐全，跳过 Module 03c")
@@ -771,12 +784,12 @@ def main():
     tr_valid = np.any(np.isfinite(tr_daily_av), axis=0)
     tr_cum = np.nancumsum(tr_daily_av, axis=0).astype(np.float32)
 
-    # Load GPP climatology (GPPc_av在Climatology目录)
-    gppc_av_file = CLIMATOLOGY_DIR / "GPPc_av.tif"
+    # Load 日尺度变量气候态 (NDVI/GPP cumulative_av 在Climatology目录)
+    gppc_av_file = CLIMATOLOGY_DIR / OUTPUT_CLIMATOLOGY_FORMAT['cumulative_av']
     if not gppc_av_file.exists():
-        raise FileNotFoundError(f"Missing GPP climatology: {gppc_av_file}")
+        raise FileNotFoundError(f"Missing {MIDDLE_VAR_NAME} climatology: {gppc_av_file}")
     gppc_av, gppc_av_profile, nodata_gppc_av = read_geotiff(gppc_av_file)
-    check_spatial_consistency(profile, gppc_av_file, gppc_av_profile, "GPPc_av")
+    check_spatial_consistency(profile, gppc_av_file, gppc_av_profile, f"{MIDDLE_VAR_NAME}c_av")
     gpp_valid = (gppc_av != NODATA_OUT) & _is_valid_value(gppc_av, nodata_gppc_av)
 
     # Compute TRc_av (固定窗口基线)
@@ -802,7 +815,7 @@ def main():
     # 保存GPP固定窗口长度（与TR相同）
     fixed_gpp_window_length = np.full(pos_av.shape, NODATA_OUT, dtype=np.float32)
     fixed_gpp_window_length[valid_av] = (eos_av_i - pos_av_i + 1)[valid_av]
-    write_geotiff(OUTPUT_DIR / "Fixed_GPPWindow_Length.tif", fixed_gpp_window_length, profile)
+    write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window_length'], fixed_gpp_window_length, profile)
 
     # Decompose each year
     if PARALLEL_BY_YEAR and YEAR_WORKERS > 1:
@@ -811,7 +824,7 @@ def main():
             max_workers=YEAR_WORKERS,
             initializer=_init_worker,
             initargs=(trc_av, pos_av, eos_av, nodata_pos, nodata_eos, mask, tr_valid, profile,
-                      gppc_av, gpp_valid)
+                      gppc_av, gpp_valid, run_cfg)
         ) as executor:
             futures = {executor.submit(_process_year, year): year for year in years}
             for future in tqdm(as_completed(futures), total=len(futures),
@@ -829,11 +842,11 @@ def main():
                     OUTPUT_DIR / f"TR_fixed_window_{year}.tif",
                     OUTPUT_DIR / f"TR_pos_change_{year}.tif",
                     OUTPUT_DIR / f"TR_eos_change_{year}.tif",
-                    OUTPUT_DIR / f"GPP_window_change_{year}.tif",
-                    OUTPUT_DIR / f"GPP_fixed_window_{year}.tif",
-                    OUTPUT_DIR / f"GPP_pos_change_{year}.tif",
-                    OUTPUT_DIR / f"GPP_eos_change_{year}.tif",
-                    OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif",
+                    OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['window_change'].format(year=year),
+                    OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window'].format(year=year),
+                    OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['pos_change'].format(year=year),
+                    OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['eos_change'].format(year=year),
+                    OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_rate'].format(year=year),
                 ]
                 if all(p.exists() for p in outputs):
                     continue
@@ -847,16 +860,16 @@ def main():
             write_geotiff(OUTPUT_DIR / f"TR_fixed_window_{year}.tif", tr_fixed_window, profile)
             write_geotiff(OUTPUT_DIR / f"TR_pos_change_{year}.tif", tr_pos_change, profile)
             write_geotiff(OUTPUT_DIR / f"TR_eos_change_{year}.tif", tr_eos_change, profile)
-            write_geotiff(OUTPUT_DIR / f"GPP_window_change_{year}.tif", gpp_window_change, profile)
-            write_geotiff(OUTPUT_DIR / f"GPP_fixed_window_{year}.tif", gpp_fixed_window, profile)
-            write_geotiff(OUTPUT_DIR / f"GPP_pos_change_{year}.tif", gpp_pos_change, profile)
-            write_geotiff(OUTPUT_DIR / f"GPP_eos_change_{year}.tif", gpp_eos_change, profile)
+            write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['window_change'].format(year=year), gpp_window_change, profile)
+            write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_window'].format(year=year), gpp_fixed_window, profile)
+            write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['pos_change'].format(year=year), gpp_pos_change, profile)
+            write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['eos_change'].format(year=year), gpp_eos_change, profile)
 
             # 计算并保存Fixed_GPPrate
             fixed_gpp_rate = np.full_like(gpp_fixed_window, NODATA_OUT)
             valid_rate = (gpp_fixed_window != NODATA_OUT) & (fixed_gpp_window_length > 0)
             fixed_gpp_rate[valid_rate] = gpp_fixed_window[valid_rate] / fixed_gpp_window_length[valid_rate]
-            write_geotiff(OUTPUT_DIR / f"Fixed_GPPrate_{year}.tif", fixed_gpp_rate, profile)
+            write_geotiff(OUTPUT_DIR / OUTPUT_DECOMP_FORMAT['fixed_rate'].format(year=year), fixed_gpp_rate, profile)
 
     # Quality check
     print("\n[Quality Check]")
@@ -987,4 +1000,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from _config import RUN_CONFIGS_02_06, apply_run_config
+    for cfg in RUN_CONFIGS_02_06:
+        apply_run_config(cfg, globals())
+        # 重置局部别名（apply_run_config已更新基础目录，但别名是导入时的旧值）
+        TRC_DIR = TRC_ANNUAL_DIR
+        CLIM_DIR = CLIMATOLOGY_DIR
+        OUTPUT_DIR = DECOMPOSITION_FIXED_DIR
+        main(run_cfg=cfg)

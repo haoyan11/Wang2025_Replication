@@ -83,6 +83,12 @@ MODULES = [
         'required': False,
         'description': '像元级SEM对比（Ours/Other）',
         'interpreter': 'Rscript'
+    },
+    {
+        'name': 'Module 06: 绘图',
+        'script': '06_plotting.py',
+        'required': False,
+        'description': '生成结果可视化图像（已存在则跳过）'
     }
 ]
 

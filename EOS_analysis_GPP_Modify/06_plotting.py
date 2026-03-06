@@ -26,6 +26,26 @@ import cartopy.feature as cfeature
 from osgeo import gdal
 
 
+# ==================== 运行模式配置 ====================
+# 支持环境变量控制是否覆盖已存在的图片
+# 方式1: 设置 WANG_OVERWRITE=true 强制重新绘制所有图片
+# 方式2: 设置 WANG_RUN_MODE=overwrite (与pipeline保持一致)
+_overwrite_flag = os.getenv("WANG_OVERWRITE", "false").lower() in ("true", "1", "yes")
+_run_mode = os.getenv("WANG_RUN_MODE", "skip").lower()
+OVERWRITE = _overwrite_flag or (_run_mode == "overwrite")
+
+
+def should_plot(out_path):
+    """检查是否应该绘图（如果文件已存在且非覆盖模式则跳过）"""
+    out_path = Path(out_path)
+    if OVERWRITE:
+        return True
+    if out_path.exists():
+        print(f"  [skip] 已存在: {out_path.name}")
+        return False
+    return True
+
+
 # ==================== 路径与全局配置 ====================
 def _pick_existing(paths):
     for p in paths:
@@ -331,6 +351,8 @@ def _make_bright_diverging_cmap():
 
 def plot_corr_style_map(r_file, p_file, out_figure, var_label,
                         cbar_title=None, value_range=None, auto_range=None):
+    if not should_plot(out_figure):
+        return
     if not Path(r_file).exists():
         print(f"相关系数文件不存在，跳过: {r_file}")
         return
@@ -586,6 +608,8 @@ def _build_path(coef_map, lhs, rhs):
 def plot_sem_full_path(param_file, r2_file, out_png, title_text,
                        middle_var, outcome_var, middle_label, outcome_label,
                        bar_direct_label, bar_indirect_label, bar_ylabel):
+    if not should_plot(out_png):
+        return
     if not param_file.exists() or not r2_file.exists():
         print(f"SEM文件缺失，跳过: {param_file}")
         return

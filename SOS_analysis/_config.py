@@ -44,7 +44,7 @@ PHENO_DIR = ROOT / "Phenology_Output_1" / "GPP_phenology"
 LANDCOVER_FILE = ROOT / "Landcover" / "MCD12Q1" / "MCD12Q1_IGBP_2018.tif"
 
 # 输出目录
-OUTPUT_ROOT = ROOT / "Wang2025_Analysis"
+OUTPUT_ROOT = ROOT / "Wang2025_Analysis_SOS"
 TRC_ANNUAL_DIR = OUTPUT_ROOT / "TRc_annual"              # TRc年度输出（02代码）
 CLIMATOLOGY_DIR = OUTPUT_ROOT / "Climatology"            # 气候态数据（02代码）
 DECOMPOSITION_DIR = OUTPUT_ROOT / "Decomposition"        # 分解结果（03a代码）

@@ -521,7 +521,7 @@ def save_climatology_data():
 
     输出文件:
     ---------
-    Wang2025_Analysis/Climatology/
+    Wang2025_Analysis_SOS/Climatology/
         ├── TR_daily_climatology.tif  (365波段，每波段为一个DOY的多年平均TR)
         ├── SOSav.tif                 (多年平均SOS)
         └── POSav.tif                 (多年平均POS)
@@ -901,6 +901,6 @@ if __name__ == "__main__":
         #   - SOSav.tif (多年平均SOS)
         #   - POSav.tif (多年平均POS)
         #
-        # 输出目录：Wang2025_Analysis/Climatology/
+        # 输出目录：Wang2025_Analysis_SOS/Climatology/
         #
         # 注意：此步骤计算密集，预计需要30-60分钟（取决于数据规模）
